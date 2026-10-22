@@ -11,11 +11,15 @@ logger = logging.getLogger("situs.coordinator.relay")
 
 
 class RelayHub:
-    def __init__(self):
+    def __init__(self, registry=None):
+        self.registry = registry
         # Maps worker_id -> WebSocket connection
         self.active_connections: Dict[str, WebSocket] = {}
         # Maps request_id -> asyncio.Queue for streaming generated tokens back to HTTP client
         self.response_streams: Dict[str, asyncio.Queue] = {}
+
+    def set_registry(self, registry):
+        self.registry = registry
 
     async def connect_worker(self, worker_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -47,7 +51,8 @@ class RelayHub:
         """
         Routes an incoming frame:
         - If target is specified, forward to target worker.
-        - If type is NEXT_TOKEN or INFERENCE_FINISH, also notify the HTTP response stream.
+        - If type is NEXT_TOKEN or SPECULATIVE_VERIFIED, push to HTTP response stream
+          AND ensure it is routed directly to the first pipeline stage to continue token generation.
         """
         request_id = frame.payload.get("request_id")
         
@@ -56,7 +61,21 @@ class RelayHub:
             if request_id and request_id in self.response_streams:
                 await self.response_streams[request_id].put(frame)
 
-        # If it has a target worker (e.g. forward activation A -> B, or token B -> A)
+        # For tokens/speculative verification, the recipient MUST be the first stage in the pipeline
+        if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED):
+            target_worker = frame.target
+            if self.registry:
+                try:
+                    pipeline = self.registry.get_pipeline_order()
+                    if pipeline:
+                        target_worker = pipeline[0].worker_id
+                except Exception:
+                    pass
+            if target_worker:
+                await self.send_to_worker(target_worker, frame)
+            return
+
+        # If it has a target worker (e.g. forward activation A -> B)
         if frame.target:
             await self.send_to_worker(frame.target, frame)
 

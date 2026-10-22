@@ -9,7 +9,7 @@ from typing import Optional, List
 class CoordinatorConfig:
     host: str = "0.0.0.0"
     port: int = 8000
-    heartbeat_timeout_s: float = 15.0
+    heartbeat_timeout_s: float = 45.0
     default_model: str = "nvidia/nemotron-mini-4b-instruct"
     relay_buffer_size: int = 64 * 1024 * 1024  # 64 MB
     enable_cors: bool = True
@@ -25,7 +25,7 @@ class WorkerConfig:
     assigned_layer_start: Optional[int] = None
     assigned_layer_end: Optional[int] = None
     compression_dtype: str = "int8"  # 'none', 'fp8', 'int8'
-    heartbeat_interval_s: float = 5.0
+    heartbeat_interval_s: float = 3.0
     enable_speculative: bool = True
     p2p_direct_enabled: bool = True
 

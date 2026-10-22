@@ -24,11 +24,12 @@ class WorkerNode(BaseModel):
     is_last_stage: bool = False
     next_worker_id: Optional[str] = None
     prev_worker_id: Optional[str] = None
+    first_worker_id: Optional[str] = None
     fast_boot: bool = False
 
 
 class WorkerRegistry:
-    def __init__(self, heartbeat_timeout_s: float = 15.0):
+    def __init__(self, heartbeat_timeout_s: float = 45.0):
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self.workers: Dict[str, WorkerNode] = {}
         self.active_model: Optional[str] = None
@@ -128,6 +129,8 @@ class WorkerRegistry:
         assignments: List[AssignLayers] = []
         current_layer = 0
 
+        first_id = alive[0].worker_id if alive else None
+
         for idx, worker in enumerate(alive):
             extra = 1 if idx < remainder else 0
             layer_start = current_layer
@@ -146,6 +149,7 @@ class WorkerRegistry:
             worker.is_last_stage = is_last
             worker.next_worker_id = next_id
             worker.prev_worker_id = prev_id
+            worker.first_worker_id = first_id
             worker.fast_boot = fast_boot
 
             assignments.append(
@@ -159,6 +163,7 @@ class WorkerRegistry:
                     is_last_stage=is_last,
                     next_worker_id=next_id,
                     prev_worker_id=prev_id,
+                    first_worker_id=first_id,
                     progressive=progressive,
                     fast_boot=fast_boot,
                     codec=codec,

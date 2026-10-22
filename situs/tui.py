@@ -388,8 +388,8 @@ def normalize_fast_url(url: str) -> str:
     return url
 
 
-def is_port_open(host: str, port: int, timeout: float = 0.05) -> bool:
-    """Sub-millisecond socket probe checking if a TCP port is open."""
+def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    """Socket probe checking if a TCP port is open."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -398,13 +398,15 @@ def is_port_open(host: str, port: int, timeout: float = 0.05) -> bool:
         return False
 
 
-def is_coordinator_online(url: str, timeout: float = 0.05) -> bool:
-    """Sub-millisecond socket probe checking if the coordinator port is open."""
+def is_coordinator_online(url: str, timeout: Optional[float] = None) -> bool:
+    """Socket probe checking if the coordinator port is open."""
     try:
         normalized = normalize_fast_url(url)
         parsed = urlparse(normalized if "://" in normalized else f"http://{normalized}")
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if timeout is None:
+            timeout = 0.15 if host in ("127.0.0.1", "localhost", "::1") else 0.75
         return is_port_open(host, port, timeout=timeout)
     except Exception:
         return False
@@ -471,7 +473,7 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
 
     # 3. HTTP status fetch
     try:
-        with httpx.Client(timeout=0.6) as client:
+        with httpx.Client(timeout=2.5) as client:
             resp = client.get(f"{normalized}/status")
             if resp.status_code == 200:
                 data = resp.json()
@@ -2075,7 +2077,7 @@ def run_opencode_tui(
                 "stream": True,
             }
             try:
-                with httpx.Client(base_url=normalized, timeout=60.0) as client:
+                with httpx.Client(base_url=normalized, timeout=httpx.Timeout(180.0, connect=15.0, read=120.0)) as client:
                     with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
                         if resp.status_code != 200:
                             err_msg = resp.read().decode("utf-8", errors="replace")

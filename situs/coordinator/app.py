@@ -37,7 +37,7 @@ app.add_middleware(
 
 config = CoordinatorConfig()
 registry = WorkerRegistry(heartbeat_timeout_s=config.heartbeat_timeout_s)
-relay = RelayHub()
+relay = RelayHub(registry=registry)
 
 
 # ==========================================

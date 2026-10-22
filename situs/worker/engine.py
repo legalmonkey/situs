@@ -317,10 +317,11 @@ class StageExecutionEngine:
             )
 
             # Target the first worker (to embed next token) AND Coordinator
+            target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
             return ProtocolFrame(
                 type=MessageType.NEXT_TOKEN,
                 source=self.assignment.worker_id,
-                target=self.assignment.prev_worker_id,  # In a 2-worker ring, prev is Worker A
+                target=target_first,
                 payload=next_token.model_dump(),
             )
 
@@ -341,11 +342,27 @@ class StageExecutionEngine:
                 dtype=torch.float32,
             )
             past_kvs = self.session_kv_caches.get(request_id)
-            logits, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
             self.session_kv_caches[request_id] = new_kvs
         else:
-            logits = [[0.0] * self.stage_model.vocab_size]
+            out = [[0.0] * self.stage_model.vocab_size] if self.is_last_stage() else [[0.0] * self.stage_model.hidden_dim]
 
+        if not self.is_last_stage():
+            # Middle stage: forward intermediate candidate activations down the chain
+            comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
+            b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+            cand_frame.payload_b64 = b64_payload
+            cand_frame.scale = scale
+            cand_frame.shape = list(shape)
+            cand_frame.dtype = self.compression_dtype
+            return ProtocolFrame(
+                type=MessageType.SPECULATIVE_CANDIDATES,
+                source=self.assignment.worker_id,
+                target=self.assignment.next_worker_id,
+                payload=cand_frame.model_dump(),
+            )
+
+        logits = out
         cfg = self.session_configs.get(request_id)
         temp = cfg.temperature if cfg else 0.7
         top_p = cfg.top_p if cfg else 0.9
@@ -378,10 +395,11 @@ class StageExecutionEngine:
             finish_reason="length" if is_finished else None,
         )
 
+        target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
         return ProtocolFrame(
             type=MessageType.SPECULATIVE_VERIFIED,
             source=self.assignment.worker_id,
-            target=self.assignment.prev_worker_id,
+            target=target_first,
             payload=verified.model_dump(),
         )
 
@@ -391,6 +409,14 @@ class StageExecutionEngine:
         Appends verified tokens to history and triggers the next draft/decode step.
         """
         if not self.is_first_stage():
+            first_target = getattr(self.assignment, "first_worker_id", None)
+            if first_target and first_target != self.assignment.worker_id:
+                return ProtocolFrame(
+                    type=MessageType.SPECULATIVE_VERIFIED,
+                    source=self.assignment.worker_id,
+                    target=first_target,
+                    payload=verified_frame.model_dump(),
+                )
             return None
 
         request_id = verified_frame.request_id
@@ -419,6 +445,14 @@ class StageExecutionEngine:
         Worker A embeds the single token and sends intermediate activation to continue the cycle!
         """
         if not self.is_first_stage():
+            first_target = getattr(self.assignment, "first_worker_id", None)
+            if first_target and first_target != self.assignment.worker_id:
+                return ProtocolFrame(
+                    type=MessageType.NEXT_TOKEN,
+                    source=self.assignment.worker_id,
+                    target=first_target,
+                    payload=token_frame.model_dump(),
+                )
             return None
 
         request_id = token_frame.request_id

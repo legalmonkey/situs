@@ -56,6 +56,7 @@ class AssignLayers(BaseModel):
     is_last_stage: bool
     next_worker_id: Optional[str] = None
     prev_worker_id: Optional[str] = None
+    first_worker_id: Optional[str] = None
     progressive: bool = False
     fast_boot: bool = False
     codec: str = "zstd"

@@ -49,6 +49,7 @@ class WorkerDaemon:
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.p2p_node: Optional[P2PDataChannelNode] = None
         self.is_running = True
+        self._cached_hw = None
 
     async def send_signaling_frame(self, msg_dict: dict):
         if self.ws:
@@ -120,16 +121,19 @@ class WorkerDaemon:
     def query_gpu_info(self):
         try:
             from situs.hardware import detect_hardware, get_live_gpu_vram
-            hw = detect_hardware(requested_device=self.config.device)
-            if hw.device != self.config.device and self.config.device.startswith("cuda"):
-                self.config.device = hw.device
-            tot_b, used_b, free_b = get_live_gpu_vram()
-            if tot_b > 0:
-                return hw.device_name, tot_b, free_b, hw.device_type, used_b
-            return hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type, hw.used_memory_bytes
+            if self._cached_hw is None:
+                hw = detect_hardware(requested_device=self.config.device)
+                if hw.device != self.config.device and self.config.device.startswith("cuda"):
+                    self.config.device = hw.device
+                self._cached_hw = (hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type, hw.used_memory_bytes)
+            dev_name, tot_b, free_b, dev_type, used_b = self._cached_hw
+            live_tot, live_used, live_free = get_live_gpu_vram()
+            if live_tot > 0:
+                return dev_name, live_tot, live_free, dev_type, live_used
+            return dev_name, tot_b, free_b, dev_type, used_b
         except Exception as e:
             logger.debug(f"Hardware query exception: {e}")
-            return "CPU Host", 16 * 1024**3, 12 * 1024**3, "cpu", 0
+            return "GPU Compute Node", 8 * 1024**3, 6 * 1024**3, "cuda", 0
 
     async def heartbeat_loop(self):
         while self.is_running and self.ws:
@@ -153,9 +157,12 @@ class WorkerDaemon:
                 )
                 await self.ws.send(frame.model_dump_json())
                 await asyncio.sleep(self.config.heartbeat_interval_s)
-            except Exception as e:
-                logger.warning(f"Heartbeat error: {e}")
+            except websockets.ConnectionClosed:
+                logger.debug("Heartbeat loop: connection closed")
                 break
+            except Exception as e:
+                logger.warning(f"Heartbeat transient error: {e}")
+                await asyncio.sleep(2.0)
 
     async def run(self):
         ws_url = f"{self.config.coordinator_url.rstrip('/')}/{self.worker_id}"
@@ -164,7 +171,7 @@ class WorkerDaemon:
         gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
         logger.info(f"Hardware: {gpu_name} (Used: {used_vram / 1e9:.2f} GB | Free: {free_vram / 1e9:.2f} GB | Total: {total_vram / 1e9:.2f} GB VRAM)")
 
-        async for websocket in websockets.connect(ws_url, ping_interval=20, ping_timeout=20):
+        async for websocket in websockets.connect(ws_url, ping_interval=15, ping_timeout=35):
             self.ws = websocket
             try:
                 # 1. Register with Coordinator
