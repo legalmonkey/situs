@@ -34,8 +34,13 @@ try:
     from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.align import Align
     HAS_RICH = True
-except ImportError:
-    HAS_RICH = False
+except (ImportError, ModuleNotFoundError) as e:
+    sys.stderr.write(f"\n[Situs] Missing required Python dependency: {e}\n\n")
+    sys.stderr.write("To install all dependencies for this device, run in PowerShell:\n")
+    sys.stderr.write("    pip install -e .\n")
+    sys.stderr.write("or:\n")
+    sys.stderr.write("    pip install -r requirements.txt\n\n")
+    sys.exit(1)
 
 from situs.config import CoordinatorConfig, WorkerConfig
 
@@ -130,7 +135,15 @@ def main_callback(
 ):
     """Situs: Distributed GPU Pooling Across the Internet."""
     if ctx.invoked_subcommand is None:
-        from situs.tui import run_opencode_tui
+        try:
+            from situs.tui import run_opencode_tui
+        except (ImportError, ModuleNotFoundError) as e:
+            sys.stderr.write(f"\n[Situs] Cannot launch interactive interface - missing dependency: {e}\n\n")
+            sys.stderr.write("To install all dependencies for this device, run in PowerShell:\n")
+            sys.stderr.write("    pip install -e .\n")
+            sys.stderr.write("or:\n")
+            sys.stderr.write("    pip install -r requirements.txt\n\n")
+            raise typer.Exit(code=1)
         run_opencode_tui(coordinator_url=coordinator, model=model)
 
 
@@ -283,8 +296,16 @@ def start_coordinator(
         console.print(info_panel)
         console.print("\n[white]Press Ctrl+C to stop the Coordinator.[/white]\n")
 
-    import uvicorn
-    from situs.coordinator.app import app as fastapi_app
+    try:
+        import uvicorn
+        from situs.coordinator.app import app as fastapi_app
+    except (ImportError, ModuleNotFoundError) as e:
+        sys.stderr.write(f"\n[Situs] Cannot start coordinator - missing dependency: {e}\n\n")
+        sys.stderr.write("To install all dependencies for this device, run in PowerShell:\n")
+        sys.stderr.write("    pip install -e .\n")
+        sys.stderr.write("or:\n")
+        sys.stderr.write("    pip install -r requirements.txt\n\n")
+        raise typer.Exit(code=1)
     uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
 
 
@@ -360,8 +381,16 @@ def join_cluster(
         p2p_direct_enabled=p2p,
     )
 
-    from situs.worker.client import WorkerDaemon
-    daemon = WorkerDaemon(cfg)
+    try:
+        from situs.worker.client import WorkerDaemon
+        daemon = WorkerDaemon(cfg)
+    except (ImportError, ModuleNotFoundError) as e:
+        sys.stderr.write(f"\n[Situs] Cannot start worker node - missing dependency: {e}\n\n")
+        sys.stderr.write("To install all dependencies for this device, run in PowerShell:\n")
+        sys.stderr.write("    pip install -e .\n")
+        sys.stderr.write("or:\n")
+        sys.stderr.write("    pip install -r requirements.txt\n\n")
+        raise typer.Exit(code=1)
     try:
         asyncio.run(daemon.run())
     except KeyboardInterrupt:
@@ -488,7 +517,15 @@ def interactive_chat(
     system: str = typer.Option("You are a helpful AI assistant running on a distributed GPU cluster.", "--system", "-s", help="System prompt"),
 ):
     """Launch the OpenCode interactive streaming terminal interface."""
-    from situs.tui import run_opencode_tui
+    try:
+        from situs.tui import run_opencode_tui
+    except (ImportError, ModuleNotFoundError) as e:
+        sys.stderr.write(f"\n[Situs] Cannot launch chat interface - missing dependency: {e}\n\n")
+        sys.stderr.write("To install all dependencies for this device, run in PowerShell:\n")
+        sys.stderr.write("    pip install -e .\n")
+        sys.stderr.write("or:\n")
+        sys.stderr.write("    pip install -r requirements.txt\n\n")
+        raise typer.Exit(code=1)
     base_url = normalize_http_url(coordinator)
     run_opencode_tui(coordinator_url=base_url, model=model, temperature=temperature, system_prompt=system)
 

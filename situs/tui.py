@@ -1018,7 +1018,23 @@ def execute_slash_command(
         vram_gb = total_b / (1024**3)
         actual_dev = custom_device or ("cuda:0" if dev_type == "cuda" else "cpu")
         actual_id = custom_worker_id or (msg.split()[1] if len(msg.split()) > 1 else f"worker-{len(_bg_workers)}")
-        session_state["workers_count"] = max(1, session_state.get("workers_count", 0) + 1)
+
+        # Update session coordinator_url so this TUI also communicates directly with the cluster!
+        http_coord = target_addr.strip()
+        if not http_coord.startswith("http://") and not http_coord.startswith("https://"):
+            if http_coord.startswith("ws://"):
+                http_coord = "http://" + http_coord[5:]
+            elif http_coord.startswith("wss://"):
+                http_coord = "https://" + http_coord[6:]
+            else:
+                http_coord = f"http://{http_coord}"
+        if "/ws" in http_coord:
+            http_coord = http_coord.split("/ws")[0]
+        session_state["coordinator_url"] = http_coord
+
+        m = fetch_cluster_metadata(http_coord, ttl=0.0)
+        session_state["workers_count"] = m.get("active_workers_count", session_state.get("workers_count", 1))
+        session_state["coord_status"] = m.get("status", "online")
 
         ok_panel = Panel(
             f"[bold green]✓ Worker Node '{actual_id}' Connected to Cluster[/bold green]\n\n"

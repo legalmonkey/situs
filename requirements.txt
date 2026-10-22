@@ -1,0 +1,17 @@
+torch
+transformers
+accelerate
+safetensors
+fastapi
+uvicorn
+websockets
+sse-starlette
+pydantic>=2.0
+numpy
+rich
+typer
+prompt_toolkit>=3.0
+zstandard>=0.20.0
+httpx
+pytest
+pytest-asyncio
