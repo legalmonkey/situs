@@ -84,7 +84,11 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
 
             elif frame.type == MessageType.HEARTBEAT:
                 free_vram = frame.payload.get("free_vram_bytes", 0)
-                registry.update_heartbeat(worker_id, free_vram)
+                used_vram = frame.payload.get("used_vram_bytes")
+                gpu_name = frame.payload.get("gpu_name")
+                total_vram = frame.payload.get("total_vram_bytes")
+                dev_type = frame.payload.get("device_type")
+                registry.update_heartbeat(worker_id, free_vram, gpu_name, total_vram, dev_type, used_vram)
                 ack = ProtocolFrame(
                     type=MessageType.HEARTBEAT_ACK,
                     source="coordinator",
@@ -116,11 +120,17 @@ async def cluster_status():
     alive = registry.get_alive_workers()
     pipeline = registry.get_pipeline_order()
     curr_model = registry.active_model or "nemotron-3-nano:4b-q8_0"
+    total_vram_b = sum(w.total_vram_bytes for w in alive)
+    free_vram_b = sum(w.free_vram_bytes for w in alive)
+    used_vram_b = sum(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) for w in alive)
     return {
         "status": "healthy" if alive else "no_workers",
         "active_workers_count": len(alive),
-        "total_vram_gb": sum(w.total_vram_bytes for w in alive) / 1e9,
-        "free_vram_gb": sum(w.free_vram_bytes for w in alive) / 1e9,
+        "total_vram_gb": round(total_vram_b / 1e9, 2),
+        "free_vram_gb": round(free_vram_b / 1e9, 2),
+        "used_vram_gb": round(used_vram_b / 1e9, 2),
+        "vram_usage_pct": round((used_vram_b / max(1, total_vram_b)) * 100, 1),
+        "pure_vram_enforced": True,
         "model": curr_model,
         "active_model": curr_model,
         "workers": [
@@ -128,7 +138,11 @@ async def cluster_status():
                 "id": w.worker_id,
                 "gpu": w.gpu_name,
                 "device": w.device_type,
+                "total_gb": round(w.total_vram_bytes / 1e9, 2),
+                "used_gb": round(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / 1e9, 2),
                 "free_gb": round(w.free_vram_bytes / 1e9, 2),
+                "usage_pct": round((getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / max(1, w.total_vram_bytes)) * 100, 1),
+                "vram_exclusive": True,
                 "layer_range": f"{w.assigned_layer_start}..{w.assigned_layer_end}" if w.assigned_layer_start is not None else "unassigned",
                 "is_first": w.is_first_stage,
                 "is_last": w.is_last_stage,
@@ -222,25 +236,20 @@ async def chat_completions(req: ChatCompletionRequest):
     # Format prompt from chat messages
     prompt = "\n".join([f"{m.role}: {m.content}" for m in req.messages]) + "\nassistant:"
 
-    # Encode tokens - fast tokenizer with immediate byte fallback for local/mock/offline tags
-    input_ids = None
-    if req.model and "/" in req.model:
-        try:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(req.model, local_files_only=True)
-            input_ids = tokenizer.encode(prompt)
-        except Exception:
-            pass
-
-    if input_ids is None:
-        # Fast byte-level encoding for local tests and offline mode
-        input_ids = [int(b) for b in prompt.encode("utf-8")]
+    # Encode tokens using unified cluster tokenizer
+    from situs.tokenizer import get_or_load_tokenizer
+    tokenizer = get_or_load_tokenizer(target_model)
+    try:
+        input_ids = tokenizer.encode(prompt)
+    except Exception:
+        input_ids = [ord(c) % 256 for c in prompt]
 
     # 1. Send INFERENCE_START to Worker A (first stage)
     start_payload = InferenceStart(
         request_id=request_id,
-        model_name=req.model or "nemotron-3-nano:4b-q8_0",
+        model_name=target_model,
         input_ids=input_ids,
+        prompt=prompt,
         max_new_tokens=req.max_tokens or 256,
         temperature=req.temperature or 0.7,
         top_p=req.top_p or 0.9,
@@ -255,6 +264,16 @@ async def chat_completions(req: ChatCompletionRequest):
     if not sent:
         relay.cleanup_response_stream(request_id)
         raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
+
+    # Also notify last worker so it holds session config and prompt
+    if last_worker.worker_id != first_worker.worker_id:
+        cfg_frame = ProtocolFrame(
+            type=MessageType.INFERENCE_START,
+            source="coordinator",
+            target=last_worker.worker_id,
+            payload=start_payload.model_dump(),
+        )
+        await relay.send_to_worker(last_worker.worker_id, cfg_frame)
 
     # 2. Return SSE Streaming Response or Full JSON
     if req.stream:

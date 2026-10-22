@@ -56,6 +56,8 @@ def test_tui_slash_completer():
     all_completions = list(completer.get_completions(doc_slash, None))
     all_cmds = [c.text for c in all_completions]
     assert "/status" in all_cmds
+    assert "/vram" in all_cmds
+    assert "/gpu" in all_cmds
     assert "/partition" in all_cmds
     assert "/nodes" in all_cmds
     assert "/doctor" in all_cmds
@@ -78,12 +80,13 @@ def test_tui_slash_completer():
     assert "/partition" in p_completions
     assert "/p2p" in p_completions
 
-    # 4. Test typing '/model ' returns curated 6GB-10GB model choices
+    # 4. Test typing '/model ' returns curated distributed model choices (including 15GB models)
     doc_m = Document(text="/model ", cursor_position=7)
     m_completions = list(completer.get_completions(doc_m, None))
-    assert len(m_completions) == 8
+    assert len(m_completions) >= 8
     assert m_completions[0].text == "/model 1"
     assert "Qwen 2.5 7B" in m_completions[0].display_text
+    assert any("14B" in c.display_text for c in m_completions)
 
     # 5. Test typing '/join ' suggests custom worker IDs
     doc_j = Document(text="/join ", cursor_position=6)
@@ -112,8 +115,14 @@ def test_tui_execute_slash_commands():
     logs.clear()
     assert execute_slash_command("/models", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
     titles = [t for t, _ in logs]
-    assert any("Curated 6GB - 10GB" in t for t in titles)
+    assert any("Curated" in t for t in titles)
     assert "Select Model" in titles
+
+    # Test /vram
+    logs.clear()
+    assert execute_slash_command("/vram", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    titles = [t for t, _ in logs]
+    assert any("Live GPU VRAM Monitor" in t for t in titles)
 
     # Test /model 1 selects Qwen 2.5 7B
     logs.clear()
@@ -264,6 +273,10 @@ def test_hardware_detection_and_safe_join():
     assert hw_auto.device_type in ("cuda", "mps", "cpu")
     assert hw_auto.device_name != ""
     assert hw_auto.status_message != ""
+    if hw_auto.physical_gpu_detected:
+        assert hw_auto.gpu_available is True
+        assert hw_auto.memory_type == "VRAM"
+        assert hw_auto.total_memory_gb <= 12.0  # Real GPU VRAM, not host RAM!
 
     # 3. Test DistributedStageModel safe fallback: requesting cuda:0 on cpu-only torch should not crash
     stage = load_hf_stage_model(

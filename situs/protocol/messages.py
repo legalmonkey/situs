@@ -41,6 +41,7 @@ class WorkerRegister(BaseModel):
     gpu_name: str
     total_vram_bytes: int
     free_vram_bytes: int
+    used_vram_bytes: Optional[int] = None
     device_type: str = "cuda"  # 'cuda' or 'cpu'
     supported_models: List[str] = Field(default_factory=list)
 
@@ -64,6 +65,10 @@ class Heartbeat(BaseModel):
     worker_id: str
     timestamp: float
     free_vram_bytes: int
+    used_vram_bytes: Optional[int] = None
+    gpu_name: Optional[str] = None
+    total_vram_bytes: Optional[int] = None
+    device_type: Optional[str] = None
     active_sessions: int = 0
 
 
@@ -71,6 +76,7 @@ class InferenceStart(BaseModel):
     request_id: str
     model_name: str
     input_ids: List[int]
+    prompt: Optional[str] = None
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9

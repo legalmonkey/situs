@@ -142,6 +142,30 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
         self.to(self.device)
 
+    def verify_vram_residency(self) -> Dict[str, Any]:
+        """
+        Verifies that model parameters and tensors reside exclusively in GPU VRAM
+        with 0% host CPU RAM offload.
+        """
+        if not HAS_TORCH:
+            return {"pure_vram": False, "devices": ["cpu"], "cpu_offload_bytes": 0, "vram_bytes": 0}
+
+        devices = {p.device.type for p in self.parameters()}
+        for b in self.buffers():
+            devices.add(b.device.type)
+
+        is_pure_vram = ("cuda" in devices) and ("cpu" not in devices)
+        cpu_bytes = sum(p.numel() * p.element_size() for p in self.parameters() if p.device.type == "cpu")
+        vram_bytes = sum(p.numel() * p.element_size() for p in self.parameters() if p.device.type == "cuda")
+
+        return {
+            "pure_vram": is_pure_vram,
+            "devices": list(devices),
+            "vram_bytes": vram_bytes,
+            "cpu_offload_bytes": cpu_bytes,
+            "cpu_offload_pct": 0.0 if (vram_bytes + cpu_bytes == 0) else round((cpu_bytes / (vram_bytes + cpu_bytes)) * 100, 2),
+        }
+
     def hot_swap_layer(self, layer_index: int, weights: Optional[Any] = None, new_block: Optional[Any] = None):
         """
         Dynamically hot-swaps a fast-boot draft layer with a full-fidelity transformer block in-memory
@@ -197,6 +221,11 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if not self.is_first_stage:
             raise RuntimeError("Called forward_first_stage on a non-first stage worker")
 
+        if self.embed_tokens is not None and HAS_TORCH and isinstance(input_ids, torch.Tensor):
+            max_idx = self.embed_tokens.num_embeddings - 1
+            if (input_ids > max_idx).any() or (input_ids < 0).any():
+                input_ids = torch.clamp(input_ids, 0, max_idx)
+
         h = self.embed_tokens(input_ids)
         new_kvs = []
         for i, layer in enumerate(self.layers):
@@ -245,13 +274,13 @@ def load_hf_stage_model(
     Supports Strategy 3 fast-boot skeleton initialization with progressive background streaming.
     """
     hidden_dim = 2048
-    vocab_size = 32000
+    vocab_size = 152064
     if "/" in model_name:
         try:
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(model_name, local_files_only=True)
             hidden_dim = getattr(config, "hidden_size", 2048)
-            vocab_size = getattr(config, "vocab_size", 32000)
+            vocab_size = getattr(config, "vocab_size", 152064)
         except Exception as e:
             logger.debug(f"Using default architecture for {model_name}: {e}")
 

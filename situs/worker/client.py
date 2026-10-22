@@ -119,23 +119,30 @@ class WorkerDaemon:
 
     def query_gpu_info(self):
         try:
-            from situs.hardware import detect_hardware
+            from situs.hardware import detect_hardware, get_live_gpu_vram
             hw = detect_hardware(requested_device=self.config.device)
             if hw.device != self.config.device and self.config.device.startswith("cuda"):
                 self.config.device = hw.device
-            return hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type
+            tot_b, used_b, free_b = get_live_gpu_vram()
+            if tot_b > 0:
+                return hw.device_name, tot_b, free_b, hw.device_type, used_b
+            return hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type, hw.used_memory_bytes
         except Exception as e:
             logger.debug(f"Hardware query exception: {e}")
-            return "CPU Host", 16 * 1024**3, 12 * 1024**3, "cpu"
+            return "CPU Host", 16 * 1024**3, 12 * 1024**3, "cpu", 0
 
     async def heartbeat_loop(self):
         while self.is_running and self.ws:
             try:
-                _, _, free_b, _ = self.query_gpu_info()
+                gpu_name, total_b, free_b, dev_type, used_b = self.query_gpu_info()
                 hb = Heartbeat(
                     worker_id=self.worker_id,
                     timestamp=time.time(),
                     free_vram_bytes=free_b,
+                    used_vram_bytes=used_b,
+                    gpu_name=gpu_name,
+                    total_vram_bytes=total_b,
+                    device_type=dev_type,
                     active_sessions=len(self.engine.session_kv_caches) if self.engine else 0,
                 )
                 frame = ProtocolFrame(
@@ -154,8 +161,8 @@ class WorkerDaemon:
         ws_url = f"{self.config.coordinator_url.rstrip('/')}/{self.worker_id}"
         logger.info(f"Connecting outbound to Coordinator Relay: {ws_url}")
 
-        gpu_name, total_vram, free_vram, dev_type = self.query_gpu_info()
-        logger.info(f"Hardware: {gpu_name} ({free_vram / 1e9:.2f} GB free)")
+        gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
+        logger.info(f"Hardware: {gpu_name} (Used: {used_vram / 1e9:.2f} GB | Free: {free_vram / 1e9:.2f} GB | Total: {total_vram / 1e9:.2f} GB VRAM)")
 
         async for websocket in websockets.connect(ws_url, ping_interval=20, ping_timeout=20):
             self.ws = websocket
@@ -166,6 +173,7 @@ class WorkerDaemon:
                     gpu_name=gpu_name,
                     total_vram_bytes=total_vram,
                     free_vram_bytes=free_vram,
+                    used_vram_bytes=used_vram,
                     device_type=dev_type,
                     supported_models=[self.config.model_name],
                 )
@@ -202,10 +210,13 @@ class WorkerDaemon:
                             progressive=assign.progressive,
                             fast_boot=assign.fast_boot,
                         )
+                        from situs.tokenizer import get_or_load_tokenizer
+                        tok = get_or_load_tokenizer(assign.model_name)
                         self.engine = StageExecutionEngine(
                             stage_model=stage_model,
                             assignment=assign,
                             compression_dtype=self.config.compression_dtype,
+                            tokenizer=tok,
                         )
 
                         # Initialize WebRTC direct P2P connection to partner worker
@@ -227,8 +238,21 @@ class WorkerDaemon:
                     elif frame.type == MessageType.INFERENCE_START:
                         if self.engine:
                             start_msg = InferenceStart.model_validate(frame.payload)
-                            out_frame = self.engine.start_inference(start_msg)
-                            await self.send_frame_out(out_frame)
+                            if self.engine.is_first_stage():
+                                out_frame = self.engine.start_inference(start_msg)
+                                if out_frame:
+                                    await self.send_frame_out(out_frame)
+                            else:
+                                self.engine.session_configs[start_msg.request_id] = start_msg
+                                self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
+                                if hasattr(self.engine, "init_fast_boot_sequence"):
+                                    prompt_str = getattr(start_msg, "prompt", "") or ""
+                                    if not prompt_str and self.engine.sampler.tokenizer:
+                                        try:
+                                            prompt_str = self.engine.sampler.tokenizer.decode(start_msg.input_ids)
+                                        except Exception:
+                                            prompt_str = ""
+                                    self.engine.init_fast_boot_sequence(start_msg.request_id, prompt_str, start_msg.model_name)
 
                     elif frame.type == MessageType.FORWARD_ACTIVATION:
                         if self.engine:

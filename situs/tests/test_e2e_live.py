@@ -46,7 +46,10 @@ async def test_live_websocket_cluster_e2e():
         worker_tasks.append(asyncio.create_task(daemon_b.run()))
 
         # Await WebSocket registrations
-        await asyncio.sleep(1.0)
+        for _ in range(30):
+            if len(registry.get_alive_workers()) >= 2:
+                break
+            await asyncio.sleep(0.1)
 
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10.0) as client:
             # 3. Check /status

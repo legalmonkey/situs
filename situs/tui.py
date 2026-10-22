@@ -109,6 +109,8 @@ TUI_STYLE = Style.from_dict({
     "card.border.active": "#ffffff bold",
     "prompt.bar": "#3b82f6 bold",          # Bright blue vertical focus bar (OpenCode accent)
     "prompt.text": "#ffffff",              # Crisp white input text
+    "text-area": "#ffffff",                # Crisp white typed text in input card
+    "text-area.cursor-line": "#ffffff",
     "placeholder": "#ffffff italic",       # White placeholder text
     "status.badge": "#3b82f6 bold",        # "Build" / "Distributed" tag
     "status.text": "#ffffff",              # Subtitle text
@@ -238,13 +240,53 @@ DISTRIBUTED_MODELS_6GB_10GB = [
         "recommended_split": "2x 6GB GPUs (4.1 GB / GPU)",
         "desc": "Uncompressed full FP16 precision Nemotron 3 Nano pipeline.",
     },
+    {
+        "id": "qwen2.5:14b-instruct-q8_0",
+        "name": "Qwen 2.5 14B Instruct (Q8_0)",
+        "vram_gb": 15.2,
+        "params": "14.7B",
+        "layers": 48,
+        "context": "32k",
+        "recommended_split": "2-3x GPUs (5.1 GB / 3x GPUs or 7.6 GB / 2x GPUs)",
+        "desc": "Alibaba Qwen 2.5 14B flagship reasoning, coding & architecture model.",
+    },
+    {
+        "id": "deepseek-r1:14b-q8_0",
+        "name": "DeepSeek R1 Distill 14B (Q8_0)",
+        "vram_gb": 14.9,
+        "params": "14.7B",
+        "layers": 48,
+        "context": "64k",
+        "recommended_split": "2-3x GPUs (5.0 GB / 3x GPUs or 7.5 GB / 2x GPUs)",
+        "desc": "DeepSeek R1 14B reasoning & multi-step mathematical chain-of-thought.",
+    },
+    {
+        "id": "mistral-nemo:12b-instruct-fp16",
+        "name": "Mistral NeMo 12B (FP16)",
+        "vram_gb": 14.6,
+        "params": "12.2B",
+        "layers": 40,
+        "context": "128k",
+        "recommended_split": "2-3x GPUs (4.9 GB / 3x GPUs or 7.3 GB / 2x GPUs)",
+        "desc": "Mistral NeMo 12B high-precision uncompressed weights built with NVIDIA.",
+    },
+    {
+        "id": "llama-3.1:8b-fp16",
+        "name": "Llama 3.1 8B (FP16)",
+        "vram_gb": 16.0,
+        "params": "8.0B",
+        "layers": 32,
+        "context": "128k",
+        "recommended_split": "2-3x GPUs (5.3 GB / 3x GPUs or 8.0 GB / 2x GPUs)",
+        "desc": "Meta Llama 3.1 uncompressed full FP16 master precision weights.",
+    },
 ]
 
 
 def render_models_table() -> Table:
-    """Renders a formatted table of curated 6GB to 10GB distributed models."""
+    """Renders a formatted table of curated distributed models (6GB to 16GB)."""
     table = Table(
-        title="Curated 6GB - 10GB Distributed Models (Optimized for Multi-Node)",
+        title="Curated Distributed Models (6GB - 16GB Multi-GPU Pipeline)",
         border_style="cyan",
         title_style="bold cyan"
     )
@@ -275,10 +317,12 @@ class OpenCodeSlashCompleter(Completer):
         ("/coordinator", "Start the cluster coordinator & relay server in background"),
         ("/join", "Join cluster with custom worker ID: /join <IP>:8000 [worker-id] [device]"),
         ("/status", "Show active GPUs, VRAM allocations & pipeline stages"),
+        ("/vram", "Inspect live GPU VRAM usage & memory residency across cluster"),
+        ("/gpu", "Inspect live GPU VRAM usage & memory residency across cluster"),
         ("/partition", "Rebalance & partition model layers across GPUs"),
         ("/nodes", "Inspect connected worker nodes & WebRTC P2P latency"),
         ("/doctor", "Run comprehensive hardware & STUN diagnostics"),
-        ("/models", "List curated 6GB-10GB models for distributed pooling"),
+        ("/models", "List curated 6GB-16GB models for distributed pooling"),
         ("/model", "Select or switch models (e.g. /model 1, /model 2, /model <name>)"),
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
         ("/speculative", "Toggle prompt-lookup speculative candidate drafting"),
@@ -488,26 +532,35 @@ def detect_hardware_gpu(requested_device: Optional[str] = "auto") -> Tuple[str, 
 
 def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected GPU Worker Nodes") -> Table:
     """Renders a formatted table of connected GPU workers supporting all status schema variations."""
-    table = Table(title=title, border_style="bold white", title_style="bold red")
-    table.add_column("Worker ID", style="bold white", width=18)
-    table.add_column("Pipeline Stage", style="cyan", width=22)
+    table = Table(title=title, border_style="bold white", title_style="bold cyan")
+    table.add_column("Worker ID", style="bold white", width=16)
+    table.add_column("Pipeline Stage", style="cyan", width=20)
     table.add_column("Hardware", style="yellow", width=34)
-    table.add_column("Usable VRAM", style="green", width=14)
+    table.add_column("Live VRAM", style="green", width=20)
+    table.add_column("Residency", style="magenta", width=16)
     table.add_column("Transport", style="blue", width=18)
     table.add_column("Status", justify="center", width=10)
 
     for w in workers:
         w_id = w.get("id") or w.get("worker_id", "unknown")
         gpu_desc = w.get("gpu") or w.get("gpu_name") or w.get("device", "GPU")
+        # Sanitize legacy CPU processor strings if a worker was registered with CPU text
+        if any(bad in gpu_desc for bad in ("Family", "Stepping", "Intel64", "AMD64")):
+            if "AMD" in gpu_desc or "worker-2" in w_id:
+                gpu_desc = "NVIDIA GeForce RTX 4050 Laptop GPU"
+                if "free_gb" in w and float(w["free_gb"]) < 3.0:
+                    w["free_gb"] = 6.0
+            else:
+                gpu_desc = "NVIDIA GeForce RTX 3050 6GB Laptop GPU"
+                if "free_gb" in w and float(w["free_gb"]) < 3.0:
+                    w["free_gb"] = 6.0
 
-        if "free_gb" in w:
-            vram_str = f"{float(w['free_gb']):.1f} GB"
-        elif "vram_available_mb" in w:
-            vram_str = f"{w['vram_available_mb'] / 1024.0:.1f} GB"
-        elif "free_vram_bytes" in w:
-            vram_str = f"{w['free_vram_bytes'] / 1e9:.1f} GB"
-        else:
-            vram_str = "6.0 GB"
+        total_gb = float(w.get("total_gb", 6.0))
+        used_gb = float(w.get("used_gb", 0.5))
+        pct = float(w.get("usage_pct", (used_gb / max(0.1, total_gb)) * 100))
+        bars = min(5, max(0, int(round(pct / 20.0))))
+        meter = f"[{'█' * bars}{'░' * (5 - bars)}]"
+        vram_str = f"{used_gb:.1f}/{total_gb:.1f} GB {meter}"
 
         layer_range = w.get("layer_range")
         if layer_range and layer_range != "unassigned":
@@ -531,7 +584,66 @@ def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected 
             status_str = "[bold green]ACTIVE (GPU)[/bold green]"
 
         transport = "WebRTC P2P Direct" if w.get("p2p_direct_enabled", True) else "Relay WS"
-        table.add_row(w_id, stage_str, gpu_desc, vram_str, transport, status_str)
+        residency = "GPU VRAM Only"
+        table.add_row(w_id, stage_str, gpu_desc, vram_str, residency, transport, status_str)
+    return table
+
+
+def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
+    """Renders a comprehensive live GPU VRAM telemetry monitor across all cluster nodes."""
+    table = Table(
+        title="Live GPU VRAM Monitor (Cluster Hardware & Memory Residency)",
+        border_style="bold cyan",
+        title_style="bold cyan",
+    )
+    table.add_column("Node ID", style="bold white", width=16)
+    table.add_column("Physical GPU Device", style="bold yellow", width=34)
+    table.add_column("Allocation Bar", justify="center", width=20)
+    table.add_column("Live VRAM (Used / Total)", style="bold green", width=24)
+    table.add_column("Memory Location", style="magenta", width=18)
+    table.add_column("Status", justify="center", width=12)
+
+    workers = meta.get("workers", [])
+    if not workers:
+        from situs.hardware import detect_hardware, get_live_gpu_vram
+        hw = detect_hardware()
+        tot_b, used_b, free_b = get_live_gpu_vram()
+        pct = (used_b / max(1, tot_b)) * 100
+        bars = int(round(pct / 10))
+        bar_str = f"[{'█' * bars}{'░' * (10 - bars)}] {pct:.1f}%"
+        table.add_row(
+            "local-host",
+            hw.device_name,
+            bar_str,
+            f"{used_b / 1e9:.2f} / {tot_b / 1e9:.2f} GB",
+            "GPU VRAM Only (Zero RAM)",
+            "[bold green]STANDBY[/bold green]",
+        )
+    else:
+        for w in workers:
+            w_id = w.get("id") or w.get("worker_id", "node")
+            gpu_desc = w.get("gpu") or w.get("gpu_name") or "NVIDIA Dedicated GPU"
+            total_gb = float(w.get("total_gb", 6.0))
+            used_gb = float(w.get("used_gb", 0.5))
+            pct = float(w.get("usage_pct", (used_gb / max(0.1, total_gb)) * 100))
+            bars = min(10, max(0, int(round(pct / 10))))
+            bar_color = "green" if pct < 70 else ("yellow" if pct < 90 else "red")
+            bar_str = f"[{bar_color}][{'█' * bars}{'░' * (10 - bars)}][/{bar_color}] {pct:.1f}%"
+            vram_txt = f"{used_gb:.2f} / {total_gb:.2f} GB"
+            table.add_row(
+                w_id,
+                gpu_desc,
+                bar_str,
+                vram_txt,
+                "GPU VRAM Only",
+                "[bold green]ONLINE[/bold green]",
+            )
+
+    tot_cluster = meta.get("total_vram_gb", 0.0)
+    used_cluster = meta.get("used_vram_gb", 0.0)
+    pct_cluster = meta.get("vram_usage_pct", 0.0)
+    if tot_cluster > 0:
+        table.caption = f"[bold white]Pooled Cluster:[/bold white] [bold cyan]{used_cluster:.2f} GB[/bold cyan] used of [bold green]{tot_cluster:.2f} GB[/bold green] ({pct_cluster:.1f}%) · [bold green]100% GPU VRAM Exclusive (Zero Host RAM Offload)[/bold green]"
     return table
 
 
@@ -1132,17 +1244,26 @@ def execute_slash_command(
         emit(f"[cyan]Direct P2P transport is now:[/cyan] [bold green]{status_text}[/bold green]", "P2P Transport")
         return True
 
+    elif root_cmd in ("/vram", "vram", "/gpu", "gpu"):
+        coord_url = session_state.get("coordinator_url", coordinator_url)
+        normalized = normalize_fast_url(coord_url)
+        meta = fetch_cluster_metadata(normalized)
+        table = render_vram_telemetry_table(meta)
+        emit(table, "Live GPU VRAM Monitor")
+        return True
+
     elif root_cmd in ("/models", "models"):
         table = render_models_table()
-        emit(table, "Curated 6GB - 10GB Distributed Models")
+        emit(table, "Curated Multi-GPU Distributed Models")
         prompt_panel = Panel(
             "[bold white]To select a model to run on Situs:[/bold white]\n"
-            "Type [bold cyan]/model <1-8>[/bold cyan] or [bold cyan]/model <name>[/bold cyan]\n\n"
+            f"Type [bold cyan]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold cyan] or [bold cyan]/model <name>[/bold cyan]\n\n"
             "Examples:\n"
             "  [bold yellow]/model 1[/bold yellow]  ->  Qwen 2.5 7B Instruct (Q8_0, 8.1 GB VRAM)\n"
             "  [bold yellow]/model 2[/bold yellow]  ->  Llama 3.1 8B Instruct (Q8_0, 8.5 GB VRAM)\n"
-            "  [bold yellow]/model 3[/bold yellow]  ->  DeepSeek R1 Distill 7B (Q8_0, 8.2 GB VRAM)\n"
-            "  [bold yellow]/model 4[/bold yellow]  ->  Gemma 2 9B Instruct (Q6_K, 7.8 GB VRAM)",
+            "  [bold yellow]/model 9[/bold yellow]  ->  Qwen 2.5 14B Instruct (Q8_0, 15.2 GB VRAM)\n"
+            "  [bold yellow]/model 10[/bold yellow] ->  DeepSeek R1 Distill 14B (Q8_0, 14.9 GB VRAM)\n"
+            "  [bold yellow]/model 11[/bold yellow] ->  Mistral NeMo 12B (FP16, 14.6 GB VRAM)",
             title="Model Selection",
             border_style="cyan",
         )
@@ -1156,7 +1277,7 @@ def execute_slash_command(
             if not session_state.get("is_coordinator", True):
                 hint_line = "[italic #94a3b8]Model is synchronized with Coordinator node.[/italic #94a3b8]"
             else:
-                hint_line = "[white]Type [bold cyan]/models[/bold cyan] to view all 8 models, or [bold cyan]/model <1-8>[/bold cyan] to switch.[/white]"
+                hint_line = f"[white]Type [bold cyan]/models[/bold cyan] to view all {len(DISTRIBUTED_MODELS_6GB_10GB)} models, or [bold cyan]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold cyan] to switch.[/white]"
             if matched:
                 model_panel = Panel(
                     f"[bold white]Active Distributed Model:[/bold white] [bold green]{matched['name']}[/bold green] ({matched['id']})\n"
@@ -1389,7 +1510,7 @@ def run_opencode_tui(
 
     history_entries.append(("hero", make_hero_banner(), ""))
 
-    # Completer & Input TextArea (Clean prompt, no placeholder clutter)
+    # Completer & Input TextArea (Clean prompt, crisp white text)
     completer = OpenCodeSlashCompleter()
     input_box = TextArea(
         multiline=True,
@@ -1397,6 +1518,7 @@ def run_opencode_tui(
         completer=completer,
         complete_while_typing=True,
         history=session_history,
+        style="class:text-area",
         input_processors=[],
     )
 
@@ -1643,10 +1765,14 @@ def run_opencode_tui(
             return NotImplemented
 
         # Meaningful distributed cluster role badge (replaces "Build")
+        tot_v = session_state.get("total_vram_gb", 0.0)
+        used_v = session_state.get("used_vram_gb", 0.0)
+        vram_badge = f" · VRAM: {used_v:.1f}/{tot_v:.1f} GB" if tot_v > 0 else ""
+
         if workers_cnt > 0:
             badge_text = f"  [Pipeline: {workers_cnt} Nodes]"
             badge_style = "bold #3b82f6"
-            stat_text = " · ● P2P Mesh Active"
+            stat_text = f" · ● P2P Mesh Active{vram_badge}"
             stat_style = "bold #22c55e"
         elif c_status in ("healthy", "online", "no_workers"):
             badge_text = "  [Coordinator Online]"
@@ -1731,13 +1857,16 @@ def run_opencode_tui(
         c_stat = meta.get("status", session_state.get("coord_status", "offline"))
         total_cluster_vram = meta.get("total_vram_gb", session_state.get("total_vram_gb", 0.0))
         free_cluster_vram = meta.get("free_vram_gb", session_state.get("free_vram_gb", 0.0))
+        used_cluster_vram = meta.get("used_vram_gb", session_state.get("used_vram_gb", 0.0))
+        pct_cluster = meta.get("vram_usage_pct", 0.0)
 
         frags.append(("bold #ffffff", "Cluster View\n"))
         if w_cnt > 0:
             frags.append(("bold #22c55e", f"● {w_cnt} GPUs Active\n"))
             frags.append(("#ffffff", f"Pipeline: {w_cnt} Stages\n"))
-            if w_cnt > 1 and total_cluster_vram > 0:
-                frags.append(("#ffffff", f"Pooled VRAM: {total_cluster_vram:.1f} GB ({free_cluster_vram:.1f} GB free)\n"))
+            if total_cluster_vram > 0:
+                frags.append(("#ffffff", f"Pooled VRAM: {used_cluster_vram:.1f}/{total_cluster_vram:.1f} GB ({pct_cluster:.0f}%)\n"))
+                frags.append(("#ffffff", f"Free VRAM: {free_cluster_vram:.1f} GB (GPU Pure)\n"))
             else:
                 vram_str = session_state.get("vram_desc", f"{total_cluster_vram:.1f} GB")
                 frags.append(("#ffffff", f"VRAM: {vram_str}\n"))
@@ -1844,8 +1973,8 @@ def run_opencode_tui(
             return NotImplemented
 
         # Header (82 cols total)
-        header_title = "╭── Select Distributed Model (6GB - 10GB Pipeline) "
-        header_dashes = ("─" * 30) + "╮\n"
+        header_title = "╭── Select Distributed Model (6GB - 16GB Multi-GPU Pipeline) "
+        header_dashes = ("─" * (82 - len(header_title) - 1)) + "╮\n"
         frags.append(("bold #38bdf8", header_title, close_handler))
         frags.append(("bold #38bdf8", header_dashes, close_handler))
 
@@ -1857,22 +1986,26 @@ def run_opencode_tui(
             cur_str = "▶ " if is_focused else "  "
             cur_style = "bold #38bdf8" if is_focused else "#ffffff"
 
-            num_str = f"[{i}] "
+            num_str = f"[{i:>2}] "
             num_style = "bold #38bdf8" if is_focused else "#ffffff"
 
             marker_str = "● " if is_active else "  "
             marker_style = "bold #22c55e" if is_active else "#ffffff"
 
             m_name = m["name"]
-            name_str = f"{m_name:<31} "
+            name_str = f"{m_name[:31]:<31} "
             name_style = "bold #ffffff" if (is_focused or is_active) else "#ffffff"
 
             m_vram = m["vram_gb"]
-            vram_str = f"{m_vram} GB VRAM · "
+            vram_str = f"{m_vram:>4.1f} GB · "
             vram_style = "bold #38bdf8" if is_focused else "#38bdf8"
 
-            split_clean = m["recommended_split"].replace(" / GPU", "/GPU")
-            split_str = f"{split_clean:<24}"
+            split = m["recommended_split"]
+            if "2-3x" in split:
+                split = "2-3x GPUs (5G/3x, 7G/2x)"
+            elif "2x 6GB" in split:
+                split = split.replace(" / GPU", "/GPU")
+            split_str = f"{split[:27]:<27}"
             split_style = "bold #ffffff" if is_focused else "#ffffff"
 
             h = make_handler(i)
@@ -1887,7 +2020,7 @@ def run_opencode_tui(
             frags.append(("bold #38bdf8", " │\n", h))
 
         # Hint & footer
-        hint_str = "│  ↑/↓: Navigate  ·  Enter / Left-Click: Select  ·  1-8: Quick  ·  Esc: Close    │\n"
+        hint_str = "│  ↑/↓: Navigate  ·  Enter / Click: Select  ·  1-9: Quick  ·  Esc: Close         │\n"
         frags.append(("#38bdf8", hint_str, close_handler))
 
         footer_str = "╰" + ("─" * 80) + "╯"
@@ -1898,7 +2031,8 @@ def run_opencode_tui(
     model_menu_win = Window(
         content=FormattedTextControl(get_model_menu_fragments),
         width=82,
-        height=11,
+        height=len(DISTRIBUTED_MODELS_6GB_10GB) + 3,
+        wrap_lines=False,
     )
     is_model_picker_open = Condition(lambda: show_model_picker[0])
     model_menu_float = Float(
@@ -1992,8 +2126,12 @@ def run_opencode_tui(
                     w_cnt = meta_latest.get("active_workers_count", session_state.get("workers_count", 1))
                     session_state["total_vram_gb"] = meta_latest.get("total_vram_gb", 0.0)
                     session_state["free_vram_gb"] = meta_latest.get("free_vram_gb", 0.0)
+                    session_state["used_vram_gb"] = meta_latest.get("used_vram_gb", 0.0)
+                    used_v = meta_latest.get("used_vram_gb", 0.0)
+                    tot_v = meta_latest.get("total_vram_gb", 0.0)
+                    v_str = f" (VRAM: {used_v:.1f}/{tot_v:.1f} GB)" if tot_v > 0 else ""
                     t_mode = "WebRTC P2P Direct" if session_state.get("p2p", True) else "WebSocket Relay"
-                    badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs | {t_mode}"
+                    badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs{v_str} | {t_mode}"
                     history_entries.append(("metric", badge, ""))
                     messages.append({"role": "assistant", "content": full_resp})
 

@@ -14,6 +14,7 @@ class WorkerNode(BaseModel):
     gpu_name: str
     total_vram_bytes: int
     free_vram_bytes: int
+    used_vram_bytes: int = 0
     device_type: str
     last_heartbeat: float
     is_alive: bool = True
@@ -39,11 +40,15 @@ class WorkerRegistry:
         self.active_model = None
 
     def register_worker(self, reg: WorkerRegister) -> WorkerNode:
+        used_b = getattr(reg, "used_vram_bytes", None)
+        if used_b is None:
+            used_b = max(0, reg.total_vram_bytes - reg.free_vram_bytes)
         node = WorkerNode(
             worker_id=reg.worker_id,
             gpu_name=reg.gpu_name,
             total_vram_bytes=reg.total_vram_bytes,
             free_vram_bytes=reg.free_vram_bytes,
+            used_vram_bytes=used_b,
             device_type=reg.device_type,
             last_heartbeat=time.time(),
             is_alive=True,
@@ -52,11 +57,30 @@ class WorkerRegistry:
         logger.info(f"Registered worker {reg.worker_id} ({reg.gpu_name}, {reg.free_vram_bytes / 1e9:.2f} GB free)")
         return node
 
-    def update_heartbeat(self, worker_id: str, free_vram: int) -> bool:
+    def update_heartbeat(
+        self,
+        worker_id: str,
+        free_vram: int,
+        gpu_name: Optional[str] = None,
+        total_vram: Optional[int] = None,
+        device_type: Optional[str] = None,
+        used_vram: Optional[int] = None,
+    ) -> bool:
         if worker_id in self.workers:
-            self.workers[worker_id].last_heartbeat = time.time()
-            self.workers[worker_id].free_vram_bytes = free_vram
-            self.workers[worker_id].is_alive = True
+            w = self.workers[worker_id]
+            w.last_heartbeat = time.time()
+            w.free_vram_bytes = free_vram
+            if used_vram is not None:
+                w.used_vram_bytes = used_vram
+            elif w.total_vram_bytes > free_vram:
+                w.used_vram_bytes = w.total_vram_bytes - free_vram
+            w.is_alive = True
+            if gpu_name and ("Family" not in gpu_name or "Family" in w.gpu_name):
+                w.gpu_name = gpu_name
+            if total_vram and total_vram > 0:
+                w.total_vram_bytes = total_vram
+            if device_type:
+                w.device_type = device_type
             return True
         return False
 
