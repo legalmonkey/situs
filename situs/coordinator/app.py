@@ -115,11 +115,14 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
 async def cluster_status():
     alive = registry.get_alive_workers()
     pipeline = registry.get_pipeline_order()
+    curr_model = registry.active_model or "nemotron-3-nano:4b-q8_0"
     return {
         "status": "healthy" if alive else "no_workers",
         "active_workers_count": len(alive),
         "total_vram_gb": sum(w.total_vram_bytes for w in alive) / 1e9,
         "free_vram_gb": sum(w.free_vram_bytes for w in alive) / 1e9,
+        "model": curr_model,
+        "active_model": curr_model,
         "workers": [
             {
                 "id": w.worker_id,
@@ -184,13 +187,14 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     pipeline = registry.get_pipeline_order()
-    if len(pipeline) < 2:
+    target_model = req.model or registry.active_model or "nemotron-3-nano:4b-q8_0"
+    repartition_needed = len(pipeline) < 2 or (registry.active_model is not None and registry.active_model != target_model)
+    if repartition_needed:
         alive = registry.get_alive_workers()
         if len(alive) >= 2:
             # Auto-partition layers across available workers with fast-boot & wire compression
-            model_target = req.model or "nemotron-3-nano:4b-q8_0"
             assignments = registry.partition_model(
-                model_target, total_layers=32, fast_boot=True, progressive=True, codec="zstd"
+                target_model, total_layers=32, fast_boot=True, progressive=True, codec="zstd"
             )
             for assign in assignments:
                 frame = ProtocolFrame(
@@ -201,7 +205,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 )
                 await relay.send_to_worker(assign.worker_id, frame)
             # Give workers a brief moment to instantiate stage layers
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
             pipeline = registry.get_pipeline_order()
 
     if len(pipeline) < 2:

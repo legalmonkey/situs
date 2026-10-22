@@ -89,7 +89,12 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         self.is_last_stage = is_last_stage
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
-        self.device = device
+        # Verify target device is available in PyTorch, fall back safely if not
+        safe_device = device
+        if safe_device.startswith("cuda") and not (HAS_TORCH and torch.cuda.is_available()):
+            logger.warning(f"CUDA device '{device}' requested but PyTorch CUDA runtime is not available. Safely falling back to CPU.")
+            safe_device = "cpu"
+        self.device = safe_device
         self.progressive = progressive
         self.fast_boot = fast_boot
         self.fast_boot_active = fast_boot
@@ -135,7 +140,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             self.norm = None
             self.lm_head = None
 
-        self.to(device)
+        self.to(self.device)
 
     def hot_swap_layer(self, layer_index: int, weights: Optional[Any] = None, new_block: Optional[Any] = None):
         """

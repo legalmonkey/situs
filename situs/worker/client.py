@@ -99,50 +99,34 @@ class WorkerDaemon:
     async def send_frame_out(self, out_frame: ProtocolFrame):
         """Sends frame via direct WebRTC UDP DataChannel if open, otherwise falls back to WebSocket relay."""
         frame_json = out_frame.model_dump_json()
+        sent_p2p = False
         if self.p2p_node and self.p2p_node.is_connected and out_frame.target == self.p2p_node.target_worker_id:
-            sent = self.p2p_node.send_frame(frame_json)
-            if sent:
-                return
-        if self.ws:
-            await self.ws.send(frame_json)
+            sent_p2p = self.p2p_node.send_frame(frame_json)
+
+        # Token emissions MUST always reach Coordinator WebSocket to stream SSE chunks to user
+        if out_frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED, MessageType.INFERENCE_FINISH, MessageType.ERROR):
+            if self.ws:
+                try:
+                    await self.ws.send(frame_json)
+                except Exception:
+                    pass
+        elif not sent_p2p:
+            if self.ws:
+                try:
+                    await self.ws.send(frame_json)
+                except Exception:
+                    pass
 
     def query_gpu_info(self):
-        # 1. Direct PyTorch CUDA query
-        if HAS_TORCH and torch.cuda.is_available() and "cuda" in self.config.device:
-            try:
-                dev_idx = 0
-                if ":" in self.config.device:
-                    dev_idx = int(self.config.device.split(":")[1])
-                gpu_name = torch.cuda.get_device_name(dev_idx)
-                free_b, total_b = torch.cuda.mem_get_info(dev_idx)
-                return gpu_name, total_b, free_b, "cuda"
-            except Exception:
-                pass
-
-        # 2. Hardware NVIDIA-SMI fallback (detects physical RTX 3050 even if PyTorch is CPU-only)
-        if shutil.which("nvidia-smi"):
-            try:
-                res = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1.0,
-                    check=True,
-                )
-                output = res.stdout.strip()
-                if output:
-                    line = output.splitlines()[0]
-                    parts = [p.strip() for p in line.split(",")]
-                    gpu_name = parts[0]
-                    total_mb = float(parts[1]) if len(parts) > 1 else 6144.0
-                    free_mb = float(parts[2]) if len(parts) > 2 else total_mb
-                    total_b = int(total_mb * 1024 * 1024)
-                    free_b = int(free_mb * 1024 * 1024)
-                    return gpu_name, total_b, free_b, "cuda"
-            except Exception:
-                pass
-
-        return "CPU Host", 16 * 1024**3, 12 * 1024**3, "cpu"
+        try:
+            from situs.hardware import detect_hardware
+            hw = detect_hardware(requested_device=self.config.device)
+            if hw.device != self.config.device and self.config.device.startswith("cuda"):
+                self.config.device = hw.device
+            return hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type
+        except Exception as e:
+            logger.debug(f"Hardware query exception: {e}")
+            return "CPU Host", 16 * 1024**3, 12 * 1024**3, "cpu"
 
     async def heartbeat_loop(self):
         while self.is_running and self.ws:

@@ -244,3 +244,47 @@ def test_opencode_persistent_tui_pipe():
         )
         assert res == "/exit"
 
+
+def test_hardware_detection_and_safe_join():
+    from situs.hardware import detect_hardware
+    from situs.worker.loader import load_hf_stage_model
+    from situs.tui import execute_slash_command
+
+    # 1. Test CPU detection
+    hw_cpu = detect_hardware(requested_device="cpu", bypass_cache=True)
+    assert hw_cpu.gpu_available is False
+    assert hw_cpu.device == "cpu"
+    assert hw_cpu.device_type == "cpu"
+    assert hw_cpu.total_memory_bytes > 0
+    assert hw_cpu.free_memory_bytes > 0
+
+    # 2. Test auto detection
+    hw_auto = detect_hardware(requested_device="auto", bypass_cache=True)
+    assert hw_auto.device in ("cuda:0", "mps", "cpu")
+    assert hw_auto.device_type in ("cuda", "mps", "cpu")
+    assert hw_auto.device_name != ""
+    assert hw_auto.status_message != ""
+
+    # 3. Test DistributedStageModel safe fallback: requesting cuda:0 on cpu-only torch should not crash
+    stage = load_hf_stage_model(
+        model_name="nemotron",
+        layer_start=0,
+        layer_end=2,
+        total_layers=4,
+        is_first_stage=True,
+        is_last_stage=False,
+        device="cuda:0",
+    )
+    assert stage.device in ("cuda:0", "cpu")
+
+    # 4. Test /join with auto device in TUI
+    messages = []
+    session_state = {"model": "nemotron", "is_coordinator": True}
+    captured = []
+    def log_capture(title, renderable):
+        captured.append((title, str(renderable)))
+
+    assert execute_slash_command("/join 127.0.0.1:8000 worker-hw-test", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert any("Worker Joined" in t or "Worker" in t for t, _ in captured)
+
+

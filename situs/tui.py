@@ -479,49 +479,11 @@ def start_in_process_coordinator(host: str = "0.0.0.0", port: int = 8000) -> Tup
         return False, f"Failed to start Coordinator: {e}"
 
 
-_gpu_hardware_cache: Optional[Tuple[str, int, int, str]] = None
-
-
-def detect_hardware_gpu() -> Tuple[str, int, int, str]:
-    """Detects physical GPU hardware via PyTorch CUDA or nvidia-smi with accurate VRAM."""
-    global _gpu_hardware_cache
-    if _gpu_hardware_cache is not None:
-        return _gpu_hardware_cache
-
-    if HAS_TORCH and torch.cuda.is_available():
-        try:
-            name = torch.cuda.get_device_name(0)
-            free_b, total_b = torch.cuda.mem_get_info(0)
-            _gpu_hardware_cache = (name, total_b, free_b, "cuda")
-            return _gpu_hardware_cache
-        except Exception:
-            pass
-
-    if shutil.which("nvidia-smi"):
-        try:
-            res = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
-                capture_output=True,
-                text=True,
-                timeout=1.0,
-                check=True,
-            )
-            output = res.stdout.strip()
-            if output:
-                line = output.splitlines()[0]
-                parts = [p.strip() for p in line.split(",")]
-                gpu_name = parts[0]
-                total_mb = float(parts[1]) if len(parts) > 1 else 6144.0
-                free_mb = float(parts[2]) if len(parts) > 2 else total_mb
-                total_b = int(total_mb * 1024 * 1024)
-                free_b = int(free_mb * 1024 * 1024)
-                _gpu_hardware_cache = (gpu_name, total_b, free_b, "cuda")
-                return _gpu_hardware_cache
-        except Exception:
-            pass
-
-    _gpu_hardware_cache = ("CPU Host", 16 * 1024**3, 12 * 1024**3, "cpu")
-    return _gpu_hardware_cache
+def detect_hardware_gpu(requested_device: Optional[str] = "auto") -> Tuple[str, int, int, str]:
+    """Detects physical GPU/CPU hardware and returns (name, total_b, free_b, dev_type)."""
+    from situs.hardware import detect_hardware
+    hw = detect_hardware(requested_device=requested_device)
+    return hw.as_tuple()
 
 
 def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected GPU Worker Nodes") -> Table:
@@ -559,11 +521,14 @@ def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected 
             stage_str += " (Embed)"
         if w.get("is_last") or w.get("is_last_stage"):
             stage_str += " (Head)"
+        dev_label = (w.get("device") or "gpu").lower()
         if w.get("fast_boot"):
             stage_str += " [⚡ Fast-Boot]"
             status_str = "[bold yellow]FAST-BOOT[/bold yellow]"
+        elif "cpu" in dev_label:
+            status_str = "[bold yellow]ACTIVE (CPU)[/bold yellow]"
         else:
-            status_str = "[bold green]ACTIVE[/bold green]"
+            status_str = "[bold green]ACTIVE (GPU)[/bold green]"
 
         transport = "WebRTC P2P Direct" if w.get("p2p_direct_enabled", True) else "Relay WS"
         table.add_row(w_id, stage_str, gpu_desc, vram_str, transport, status_str)
@@ -590,11 +555,13 @@ def start_in_process_worker(
         if not addr.endswith("/ws/worker"):
             addr = addr.rstrip("/") + "/ws/worker"
 
-        gpu_name, total_b, free_b, dev_type = detect_hardware_gpu()
-        if device:
-            dev = device
-        else:
-            dev = "cuda:0" if dev_type == "cuda" and (HAS_TORCH and torch.cuda.is_available()) else "cpu"
+        from situs.hardware import detect_hardware
+        hw = detect_hardware(requested_device=device or "auto")
+        dev = hw.device
+        gpu_name = hw.device_name
+        total_b = hw.total_memory_bytes
+        free_b = hw.free_memory_bytes
+        dev_type = hw.device_type
 
         if not worker_id:
             base_id = f"worker-{socket.gethostname().lower()}"
@@ -1014,10 +981,15 @@ def execute_slash_command(
             emit(err_panel, "Worker Connection Error")
             return True
 
-        gpu_name, total_b, free_b, dev_type = detect_hardware_gpu()
-        vram_gb = total_b / (1024**3)
-        actual_dev = custom_device or ("cuda:0" if dev_type == "cuda" else "cpu")
+        from situs.hardware import detect_hardware
+        hw = detect_hardware(requested_device=custom_device or "auto")
+        actual_dev = hw.device
         actual_id = custom_worker_id or (msg.split()[1] if len(msg.split()) > 1 else f"worker-{len(_bg_workers)}")
+
+        # Update local session hardware telemetry
+        session_state["gpu_name"] = hw.device_name
+        mem_tag = "VRAM" if hw.gpu_available else "RAM"
+        session_state["vram_desc"] = f"{hw.total_memory_gb:.1f} GB {mem_tag} ({hw.free_memory_gb:.1f} GB free)"
 
         # Update session coordinator_url so this TUI also communicates directly with the cluster!
         http_coord = target_addr.strip()
@@ -1031,23 +1003,44 @@ def execute_slash_command(
         if "/ws" in http_coord:
             http_coord = http_coord.split("/ws")[0]
         session_state["coordinator_url"] = http_coord
+        if "127.0.0.1" not in http_coord and "localhost" not in http_coord:
+            session_state["is_coordinator"] = False
 
         m = fetch_cluster_metadata(http_coord, ttl=0.0)
         session_state["workers_count"] = m.get("active_workers_count", session_state.get("workers_count", 1))
         session_state["coord_status"] = m.get("status", "online")
+        session_state["total_vram_gb"] = m.get("total_vram_gb", 0.0)
+        session_state["free_vram_gb"] = m.get("free_vram_gb", 0.0)
+        if m.get("model"):
+            session_state["model"] = m.get("model")
+
+        if hw.gpu_available:
+            mode_badge = f"[bold green]CUDA GPU Acceleration ({actual_dev.upper()})[/bold green]"
+            detect_title = f"[bold green]✓ GPU Detected — Proceeding with CUDA Acceleration[/bold green]"
+            border_col = "green"
+        elif hw.physical_gpu_detected:
+            mode_badge = f"[bold yellow]CPU Execution (Physical GPU: {hw.physical_gpu_name})[/bold yellow]"
+            detect_title = f"[bold yellow]! Physical GPU Detected (PyTorch CUDA Missing) — Proceeding on CPU[/bold yellow]"
+            border_col = "yellow"
+        else:
+            mode_badge = f"[bold cyan]CPU Compute Mode ({actual_dev.upper()})[/bold cyan]"
+            detect_title = f"[bold cyan]! No CUDA GPU Detected — Proceeding with CPU Compute[/bold cyan]"
+            border_col = "cyan"
 
         ok_panel = Panel(
+            f"{detect_title}\n"
             f"[bold green]✓ Worker Node '{actual_id}' Connected to Cluster[/bold green]\n\n"
             f"[bold cyan]• Target Relay:[/bold cyan]    {target_addr}\n"
             f"[bold cyan]• Worker ID:[/bold cyan]       {actual_id}\n"
-            f"[bold cyan]• Compute Device:[/bold cyan]  {actual_dev.upper()}\n"
-            f"[bold cyan]• Hardware:[/bold cyan]        {gpu_name} ({vram_gb:.1f} GB VRAM)\n"
+            f"[bold cyan]• Compute Engine:[/bold cyan]  {mode_badge}\n"
+            f"[bold cyan]• Hardware:[/bold cyan]        {hw.device_name} ({hw.total_memory_gb:.1f} GB {hw.memory_type})\n"
+            f"[bold cyan]• Diagnostics:[/bold cyan]     {hw.status_message}\n"
             f"[bold cyan]• Transport:[/bold cyan]       WebRTC P2P Direct + Relay Fallback\n"
             f"[bold cyan]• Speculative:[/bold cyan]     Enabled (Prompt-Lookup)\n"
             f"[bold cyan]• Compression:[/bold cyan]     INT8 Dynamic Quantization\n\n"
             f"[white]Run [bold cyan]/status[/bold cyan] or press [bold cyan]Tab[/bold cyan] to see registered cluster GPUs.[/white]",
             title="Situs Worker Joined",
-            border_style="cyan",
+            border_style=border_col,
         )
         emit(ok_panel, "Situs Worker Joined")
         return True
@@ -1105,18 +1098,19 @@ def execute_slash_command(
 
     elif root_cmd in ("/doctor", "doctor", "/setup", "setup"):
         if log_output_fn is not None:
-            gpu_name, total_b, free_b, dev_type = detect_hardware_gpu()
-            vram_gb = total_b / (1024**3)
+            from situs.hardware import detect_hardware
+            hw = detect_hardware()
             doc_panel = Panel(
-                f"[bold green]✓ Hardware & Network Diagnostics Passed[/bold green]\n\n"
-                f"[bold cyan]• GPU Hardware:[/bold cyan]   {gpu_name} ({vram_gb:.1f} GB)\n"
-                f"[bold cyan]• Compute Dev:[/bold cyan]    {dev_type.upper()}\n"
+                f"[bold green]✓ Hardware & Network Diagnostics[/bold green]\n\n"
+                f"[bold cyan]• Hardware:[/bold cyan]       {hw.device_name} ({hw.total_memory_gb:.1f} GB {hw.memory_type})\n"
+                f"[bold cyan]• Compute Dev:[/bold cyan]    {hw.device.upper()} ({'CUDA GPU Acceleration' if hw.gpu_available else 'CPU Compute'})\n"
+                f"[bold cyan]• Diagnostics:[/bold cyan]    {hw.status_message}\n"
                 f"[bold cyan]• LAN Network:[/bold cyan]    {get_local_ip()}\n"
                 f"[bold cyan]• NAT / STUN:[/bold cyan]     Interactive STUN Direct P2P Ready\n"
                 f"[bold cyan]• OS Platform:[/bold cyan]    {sys.platform}\n"
                 f"[bold cyan]• Python:[/bold cyan]         {sys.version.split()[0]}",
                 title="Situs Device Diagnostics",
-                border_style="cyan"
+                border_style="green" if hw.gpu_available else "cyan"
             )
             emit(doc_panel, "Device Diagnostics")
         else:
@@ -1159,6 +1153,10 @@ def execute_slash_command(
         if len(parts) == 1:
             curr_model = session_state.get("model", model)
             matched = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == curr_model.lower()), None)
+            if not session_state.get("is_coordinator", True):
+                hint_line = "[italic #94a3b8]Model is synchronized with Coordinator node.[/italic #94a3b8]"
+            else:
+                hint_line = "[white]Type [bold cyan]/models[/bold cyan] to view all 8 models, or [bold cyan]/model <1-8>[/bold cyan] to switch.[/white]"
             if matched:
                 model_panel = Panel(
                     f"[bold white]Active Distributed Model:[/bold white] [bold green]{matched['name']}[/bold green] ({matched['id']})\n"
@@ -1168,7 +1166,7 @@ def execute_slash_command(
                     f"[bold cyan]• Context Window:[/bold cyan]     {matched['context']}\n"
                     f"[bold cyan]• Recommended Split:[/bold cyan]  {matched['recommended_split']}\n"
                     f"[bold cyan]• Description:[/bold cyan]        {matched['desc']}\n\n"
-                    f"[white]Type [bold cyan]/models[/bold cyan] to view all 8 models, or [bold cyan]/model <1-8>[/bold cyan] to switch.[/white]",
+                    f"{hint_line}",
                     title="Active Model Status",
                     border_style="cyan"
                 )
@@ -1179,7 +1177,7 @@ def execute_slash_command(
                     f"[bold cyan]• Layers:[/bold cyan] 32 Transformer Blocks\n"
                     f"[bold cyan]• Hidden Size:[/bold cyan] 2048\n"
                     f"[bold cyan]• Architecture:[/bold cyan] Decoder-only Causal LM with Pipeline Parallelism\n\n"
-                    f"[white]Type [bold cyan]/models[/bold cyan] to view curated 6GB-10GB models, or [bold cyan]/model <1-8>[/bold cyan] to switch.[/white]",
+                    f"{hint_line}",
                     title="Active Model Status",
                     border_style="cyan"
                 )
@@ -1187,6 +1185,9 @@ def execute_slash_command(
             return True
 
         target_arg = parts[1].strip()
+        if not session_state.get("is_coordinator", True):
+            emit("[yellow]Only the Coordinator node can switch models for the cluster.[/yellow]", "Model Selection")
+            return True
         matched = None
         if target_arg.isdigit():
             idx = int(target_arg)
@@ -1337,6 +1338,7 @@ def run_opencode_tui(
     free_gb = free_b / (1024**3)
 
     # State tracking
+    is_init_coord = (_bg_coordinator_server is not None or "127.0.0.1" in coordinator_url or "localhost" in coordinator_url)
     session_state: Dict[str, Any] = {
         "speculative": True,
         "p2p": True,
@@ -1350,12 +1352,17 @@ def run_opencode_tui(
         "vram_desc": f"{total_gb:.1f} GB ({free_gb:.1f} GB free)" if dev_type == "cuda" else "16.0 GB (CPU)",
         "gpu_name": gpu_name,
         "is_generating": False,
+        "is_coordinator": is_init_coord,
     }
 
     # Initial cluster probe
     meta = fetch_cluster_metadata(coordinator_url, ttl=0.0)
     session_state["workers_count"] = meta.get("active_workers_count", 0)
     session_state["coord_status"] = meta.get("status", "offline")
+    session_state["total_vram_gb"] = meta.get("total_vram_gb", 0.0)
+    session_state["free_vram_gb"] = meta.get("free_vram_gb", 0.0)
+    if not is_init_coord and meta.get("model"):
+        session_state["model"] = meta.get("model")
 
     messages = [{"role": "system", "content": system_prompt}]
     session_history = InMemoryHistory()
@@ -1433,6 +1440,13 @@ def run_opencode_tui(
                 app_instance[0].invalidate()
 
     def toggle_model_menu():
+        if not session_state.get("is_coordinator", True):
+            history_entries.append(("system", "Only the Coordinator can switch models for the cluster.", "Model Selection"))
+            cached_history_frags.clear()
+            cached_history_len[0] = 0
+            if app_instance[0]:
+                app_instance[0].invalidate()
+            return
         show_model_picker[0] = not show_model_picker[0]
         if show_model_picker[0]:
             curr_m = session_state.get("model", model).lower()
@@ -1645,11 +1659,22 @@ def run_opencode_tui(
             stat_text = " · Start with /coordinator"
             stat_style = "#ffffff"
 
+        is_coord = session_state.get("is_coordinator", True)
+        if is_coord:
+            model_parts = [
+                ("bold underline #38bdf8", f"{disp_name}", on_model_click),
+                ("bold #38bdf8", " [switch ▾]", on_model_click),
+            ]
+        else:
+            model_parts = [
+                ("bold #38bdf8", f"{disp_name}"),
+                ("bold #64748b", " [Synced]"),
+            ]
+
         return [
             (badge_style, badge_text),
             ("", " · "),
-            ("bold underline #38bdf8", f"{disp_name}", on_model_click),
-            ("bold #38bdf8", " [switch ▾]", on_model_click),
+            *model_parts,
             (stat_style, stat_text),
         ]
 
@@ -1674,12 +1699,14 @@ def run_opencode_tui(
                 '  <style color="#eab308"><b>↓ Streaming tokens below</b></style> '
                 '<style color="#ffffff">· press <b>End</b> or scroll down to follow</style>'
             ))
+        is_coord = session_state.get("is_coordinator", True)
+        f2_part = '<style color="#38bdf8"><b>f2</b></style> <style color="#ffffff">models</style>   ' if is_coord else ''
         return to_formatted_text(HTML(
-            '  <style color="#38bdf8"><b>tab</b></style> <style color="#ffffff">nodes</style>   '
-            '<style color="#38bdf8"><b>f2</b></style> <style color="#ffffff">models</style>   '
-            '<style color="#38bdf8"><b>/</b></style> <style color="#ffffff">commands</style>   '
-            '<style color="#38bdf8"><b>pgup/dn</b></style> <style color="#ffffff">scroll</style>   '
-            '<style color="#38bdf8"><b>ctrl+c</b></style> <style color="#ffffff">exit</style>'
+            f'  <style color="#38bdf8"><b>tab</b></style> <style color="#ffffff">nodes</style>   '
+            f'{f2_part}'
+            f'<style color="#38bdf8"><b>/</b></style> <style color="#ffffff">commands</style>   '
+            f'<style color="#38bdf8"><b>pgup/dn</b></style> <style color="#ffffff">scroll</style>   '
+            f'<style color="#38bdf8"><b>ctrl+c</b></style> <style color="#ffffff">exit</style>'
         ))
 
     shortcuts_line = Window(
@@ -1698,28 +1725,48 @@ def run_opencode_tui(
         frags.append(("bold #38bdf8", "SITUS SWARM\n"))
         frags.append(("#ffffff", f"{session_start_iso}\n\n"))
 
+        active_c = session_state.get("coordinator_url", coordinator_url)
+        meta = fetch_cluster_metadata(active_c, ttl=1.0)
+        w_cnt = meta.get("active_workers_count", session_state.get("workers_count", 0))
+        c_stat = meta.get("status", session_state.get("coord_status", "offline"))
+        total_cluster_vram = meta.get("total_vram_gb", session_state.get("total_vram_gb", 0.0))
+        free_cluster_vram = meta.get("free_vram_gb", session_state.get("free_vram_gb", 0.0))
+
         frags.append(("bold #ffffff", "Cluster View\n"))
-        w_cnt = session_state.get("workers_count", 0)
-        c_stat = session_state.get("coord_status", "offline")
         if w_cnt > 0:
             frags.append(("bold #22c55e", f"● {w_cnt} GPUs Active\n"))
             frags.append(("#ffffff", f"Pipeline: {w_cnt} Stages\n"))
+            if w_cnt > 1 and total_cluster_vram > 0:
+                frags.append(("#ffffff", f"Pooled VRAM: {total_cluster_vram:.1f} GB ({free_cluster_vram:.1f} GB free)\n"))
+            else:
+                vram_str = session_state.get("vram_desc", f"{total_cluster_vram:.1f} GB")
+                frags.append(("#ffffff", f"VRAM: {vram_str}\n"))
         elif c_stat in ("healthy", "online", "no_workers"):
             frags.append(("bold #eab308", "● Coordinator Ready\n"))
             frags.append(("#ffffff", "Waiting for /join\n"))
+            vram_str = session_state.get("vram_desc", "8.0 GB")
+            frags.append(("#ffffff", f"Local VRAM: {vram_str}\n"))
         else:
             frags.append(("#ffffff", "○ Cluster Offline\n"))
             frags.append(("#ffffff", "Start with /coordinator\n"))
-
-        vram_str = session_state.get("vram_desc", "8.0 GB")
-        frags.append(("#ffffff", f"VRAM: {vram_str}\n"))
+            vram_str = session_state.get("vram_desc", "8.0 GB")
+            frags.append(("#ffffff", f"Local VRAM: {vram_str}\n"))
         trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
         frags.append(("#ffffff", f"{trans_name}\n"))
         frags.append(("#ffffff", "Wire: Zstd Wire Decoupled\n\n"))
 
+        is_coord = session_state.get("is_coordinator", True)
+        if not is_coord:
+            coord_m = meta.get("model") or meta.get("active_model")
+            if coord_m:
+                session_state["model"] = coord_m
+
         def on_sidebar_model_click(mouse_event: MouseEvent) -> Any:
             if mouse_event.event_type == MouseEventType.MOUSE_UP and mouse_event.button == MouseButton.LEFT:
-                toggle_model_menu()
+                if not session_state.get("is_coordinator", True):
+                    show_temporary_notice("Model is controlled by Coordinator", duration=2.5)
+                else:
+                    toggle_model_menu()
                 return None
             return NotImplemented
 
@@ -1728,18 +1775,27 @@ def run_opencode_tui(
         m_info = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == curr_m.lower() or m["name"].lower() == curr_m.lower() or curr_m.lower().startswith(m["id"].split(":")[0])), None)
         if m_info:
             disp_title = m_info["name"] if len(m_info["name"]) <= 32 else m_info["name"][:30] + ".."
-            frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
+            if is_coord:
+                frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
+            else:
+                frags.append(("bold #38bdf8", f"{disp_title}\n"))
             frags.append(("#ffffff", f"{m_info['params']} · {m_info['layers']} Layers\n"))
             frags.append(("#ffffff", f"VRAM: {m_info['vram_gb']} GB\n"))
             frags.append(("#ffffff", f"{m_info['recommended_split']}\n"))
         else:
             disp_title = curr_m if len(curr_m) <= 32 else curr_m[:30] + ".."
-            frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
+            if is_coord:
+                frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
+            else:
+                frags.append(("bold #38bdf8", f"{disp_title}\n"))
             frags.append(("#ffffff", "32 Layers · FP16/INT8\n"))
 
         spec_text = "Fast-Boot + Speculative" if session_state.get("speculative", True) else "Disabled"
         frags.append(("#ffffff", f"Accel: {spec_text}\n\n"))
-        frags.append(("bold underline #38bdf8", "[Click Model or F2 to Switch]\n", on_sidebar_model_click))
+        if is_coord:
+            frags.append(("bold underline #38bdf8", "[Click Model or F2 to Switch]\n", on_sidebar_model_click))
+        else:
+            frags.append(("italic #94a3b8", "[Managed by Coordinator]\n"))
         return frags
 
     def get_sidebar_footer() -> Any:
@@ -1934,6 +1990,8 @@ def run_opencode_tui(
                 if not cancel_event.is_set() and tok_cnt > 0:
                     meta_latest = fetch_cluster_metadata(normalized)
                     w_cnt = meta_latest.get("active_workers_count", session_state.get("workers_count", 1))
+                    session_state["total_vram_gb"] = meta_latest.get("total_vram_gb", 0.0)
+                    session_state["free_vram_gb"] = meta_latest.get("free_vram_gb", 0.0)
                     t_mode = "WebRTC P2P Direct" if session_state.get("p2p", True) else "WebSocket Relay"
                     badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs | {t_mode}"
                     history_entries.append(("metric", badge, ""))
@@ -2023,6 +2081,8 @@ def run_opencode_tui(
                 m = fetch_cluster_metadata(active_c, ttl=0.0)
                 session_state["workers_count"] = m.get("active_workers_count", 0)
                 session_state["coord_status"] = m.get("status", "offline")
+                session_state["total_vram_gb"] = m.get("total_vram_gb", 0.0)
+                session_state["free_vram_gb"] = m.get("free_vram_gb", 0.0)
 
                 if not keep_running:
                     event.app.exit(result="/exit")
@@ -2268,34 +2328,78 @@ def run_opencode_tui(
     is_fs = full_screen if full_screen is not None else (app_input is None)
     safe_out = create_safe_output(app_output)
 
+    stop_bg_sync = threading.Event()
+
+    def _bg_cluster_sync_loop():
+        while not stop_bg_sync.is_set():
+            time.sleep(1.0)
+            if stop_bg_sync.is_set():
+                break
+            try:
+                active_c = session_state.get("coordinator_url", coordinator_url)
+                meta = fetch_cluster_metadata(active_c, ttl=0.8)
+                changed = False
+                w_cnt = meta.get("active_workers_count", 0)
+                if w_cnt != session_state.get("workers_count"):
+                    session_state["workers_count"] = w_cnt
+                    changed = True
+
+                c_stat = meta.get("status", "offline")
+                if c_stat != session_state.get("coord_status"):
+                    session_state["coord_status"] = c_stat
+                    changed = True
+
+                tot_vram = meta.get("total_vram_gb", 0.0)
+                if abs(tot_vram - session_state.get("total_vram_gb", 0.0)) > 0.05:
+                    session_state["total_vram_gb"] = tot_vram
+                    session_state["free_vram_gb"] = meta.get("free_vram_gb", 0.0)
+                    changed = True
+
+                coord_model = meta.get("model") or meta.get("active_model")
+                if not session_state.get("is_coordinator", True) and coord_model:
+                    if coord_model.lower() != session_state.get("model", "").lower():
+                        session_state["model"] = coord_model
+                        changed = True
+
+                if changed and app_instance[0]:
+                    app_instance[0].invalidate()
+            except Exception:
+                pass
+
+    sync_thread = threading.Thread(target=_bg_cluster_sync_loop, daemon=True)
+    sync_thread.start()
+
     try:
-        app = Application(
-            layout=Layout(root),
-            key_bindings=kb,
-            style=TUI_STYLE,
-            full_screen=is_fs,
-            input=app_input,
-            output=safe_out,
-            mouse_support=True,
-        )
-        app_instance[0] = app
-        return app.run() or ""
-    except Exception as e:
         try:
             app = Application(
                 layout=Layout(root),
                 key_bindings=kb,
                 style=TUI_STYLE,
-                full_screen=False,
+                full_screen=is_fs,
                 input=app_input,
                 output=safe_out,
                 mouse_support=True,
             )
             app_instance[0] = app
             return app.run() or ""
-        except Exception:
-            sys.stderr.write(f"\nSitus TUI runtime error: {e}\n")
-            return ""
+        except Exception as e:
+            try:
+                app = Application(
+                    layout=Layout(root),
+                    key_bindings=kb,
+                    style=TUI_STYLE,
+                    full_screen=False,
+                    input=app_input,
+                    output=safe_out,
+                    mouse_support=True,
+                )
+                app_instance[0] = app
+                return app.run() or ""
+            except Exception:
+                sys.stderr.write(f"\nSitus TUI runtime error: {e}\n")
+                return ""
+    finally:
+        stop_bg_sync.set()
 
 
 

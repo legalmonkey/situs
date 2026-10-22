@@ -325,13 +325,10 @@ def join_cluster(
     """Join a Situs cluster as a GPU/CPU inference worker daemon."""
     normalized_ws = normalize_ws_url(coordinator)
 
-    # Auto-detect device
-    if device == "auto":
-        try:
-            import torch
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            device = "cpu"
+    # Detect hardware and verify GPU availability
+    from situs.hardware import detect_hardware
+    hw = detect_hardware(requested_device=device)
+    actual_device = hw.device
 
     if not worker_id:
         base_id = f"worker-{socket.gethostname().lower()}"
@@ -356,17 +353,36 @@ def join_cluster(
 
     print_banner()
     if console:
+        if hw.gpu_available:
+            dev_badge = f"[bold green]CUDA GPU Acceleration ({actual_device.upper()})[/bold green]"
+            hw_desc = f"{hw.device_name} ({hw.total_memory_gb:.1f} GB VRAM)"
+            detect_title = "[bold green]✓ GPU Detected — Proceeding with CUDA Acceleration[/bold green]"
+            border_col = "green"
+        elif hw.physical_gpu_detected:
+            dev_badge = f"[bold yellow]CPU Compute Mode (Physical GPU: {hw.physical_gpu_name})[/bold yellow]"
+            hw_desc = f"{hw.device_name} ({hw.total_memory_gb:.1f} GB RAM)"
+            detect_title = "[bold yellow]! Physical GPU Detected (PyTorch CUDA Missing) — Proceeding on CPU[/bold yellow]"
+            border_col = "yellow"
+        else:
+            dev_badge = f"[bold cyan]CPU Compute Mode ({actual_device.upper()})[/bold cyan]"
+            hw_desc = f"{hw.device_name} ({hw.total_memory_gb:.1f} GB RAM)"
+            detect_title = "[bold cyan]! No CUDA GPU Detected — Proceeding with CPU Compute[/bold cyan]"
+            border_col = "cyan"
+
         info_panel = Panel(
+            f"{detect_title}\n"
             f"[bold white]Worker Node Connecting[/bold white]\n\n"
             f"[bold cyan]• Worker ID:[/bold cyan]      {worker_id}\n"
             f"[bold cyan]• Target Relay:[/bold cyan]   {normalized_ws}\n"
-            f"[bold cyan]• Device:[/bold cyan]         {device}\n"
+            f"[bold cyan]• Compute Engine:[/bold cyan] {dev_badge}\n"
+            f"[bold cyan]• Hardware:[/bold cyan]       {hw_desc}\n"
+            f"[bold cyan]• Diagnostics:[/bold cyan]    {hw.status_message}\n"
             f"[bold cyan]• Model:[/bold cyan]          {model}\n"
             f"[bold cyan]• Speculative:[/bold cyan]    {'Enabled (Prompt-Lookup)' if speculative else 'Disabled'}\n"
             f"[bold cyan]• Transport:[/bold cyan]      {'WebRTC P2P Direct + Relay Fallback' if p2p else 'WebSocket Relay Only'}\n"
             f"[bold cyan]• Compression:[/bold cyan]    {compression.upper()} Dynamic Quantization",
             title="Situs Worker Daemon",
-            border_style="cyan",
+            border_style=border_col,
         )
         console.print(info_panel)
         console.print("\n[white]Outbound duplex connection established. Waiting for pipeline partition...[/white]\n")
@@ -374,7 +390,7 @@ def join_cluster(
     cfg = WorkerConfig(
         coordinator_url=normalized_ws,
         worker_id=worker_id,
-        device=device,
+        device=actual_device,
         model_name=model,
         compression_dtype=compression,
         enable_speculative=speculative,
