@@ -78,6 +78,7 @@ class InferenceStart(BaseModel):
     model_name: str
     input_ids: List[int]
     prompt: Optional[str] = None
+    real_response: Optional[str] = None
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9

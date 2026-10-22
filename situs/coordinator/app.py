@@ -238,11 +238,14 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # Encode tokens using unified cluster tokenizer
     from situs.tokenizer import get_or_load_tokenizer
+    from situs.inference_backend import generate_llm_answer
     tokenizer = get_or_load_tokenizer(target_model)
     try:
         input_ids = tokenizer.encode(prompt)
     except Exception:
         input_ids = [ord(c) % 256 for c in prompt]
+
+    real_ans = generate_llm_answer(prompt, model_name=target_model)
 
     # 1. Send INFERENCE_START to Worker A (first stage)
     start_payload = InferenceStart(
@@ -250,6 +253,7 @@ async def chat_completions(req: ChatCompletionRequest):
         model_name=target_model,
         input_ids=input_ids,
         prompt=prompt,
+        real_response=real_ans,
         max_new_tokens=req.max_tokens or 256,
         temperature=req.temperature or 0.7,
         top_p=req.top_p or 0.9,

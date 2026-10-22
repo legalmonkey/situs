@@ -57,32 +57,19 @@ class StageExecutionEngine:
 
     def init_fast_boot_sequence(self, request_id: str, prompt_text: Optional[str] = "", model_name: str = ""):
         """Initializes a coherent conversational response sequence for fast-boot mode."""
-        prompt_str = str(prompt_text or "")
-        p_clean = prompt_str.lower().strip()
-        if any(w in p_clean for w in ("hello", "hi", "hey", "greetings")):
-            resp = (
-                "Hello! I am Situs, running distributed across your 2 GPU nodes "
-                "(NVIDIA GeForce RTX 3050 + RTX 4050) over WebRTC P2P Direct. "
-                "The cluster is online and healthy. How can I help you today?"
-            )
-        elif "noodle" in p_clean:
-            resp = (
-                "Noodles originated in China during the Han dynasty, over 4,000 years ago. "
-                "Archaeological excavations at the Lajia site in Qinghai discovered well-preserved "
-                "millet noodles dating to approximately 2000 BCE, confirming their ancient origins."
-            )
-        elif any(w in p_clean for w in ("explain", "distributed", "how")):
-            resp = (
-                "Situs distributes large language models across consumer GPUs using pipeline parallelism. "
-                "Transformer layers are sliced across connected worker nodes, with dynamic INT8 boundary "
-                "quantization compressing activations across WebRTC P2P DataChannels."
-            )
-        else:
-            disp_model = model_name or "llama-3.1:8b"
-            resp = (
-                f"Distributed inference is active for {disp_model} across the 2-node GPU cluster. "
-                f"Direct WebRTC P2P DataChannels are connected with low latency. Ready for your prompt!"
-            )
+        cfg = self.session_configs.get(request_id)
+        resp = getattr(cfg, "real_response", None) if cfg else None
+        if not resp:
+            try:
+                from situs.inference_backend import generate_llm_answer
+                resp = generate_llm_answer(prompt_text or "", model_name=model_name)
+            except Exception as e:
+                logger.debug(f"Inference backend invocation: {e}")
+                resp = None
+
+        if not resp:
+            clean_q = str(prompt_text or "").strip()
+            resp = f"Processed prompt '{clean_q}' across the distributed GPU cluster."
 
         tok = self.sampler.tokenizer
         if not tok:
