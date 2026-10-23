@@ -101,7 +101,7 @@ situs join 172.20.164.173:8000 --id worker-b
 situs status
 
 # Auto-partition model across active workers:
-situs partition --model nemotron-3-nano:4b-q8_0 --layers 32
+situs partition --model llama-3.1:8b-instruct-q8_0 --layers 32
 ```
 
 ---
@@ -147,7 +147,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="situs")
 
 response = client.chat.completions.create(
-    model="nemotron-3-nano:4b-q8_0",
+    model="llama-3.1:8b-instruct-q8_0",
     messages=[{"role": "user", "content": "Explain pipeline parallelism in two sentences."}],
     stream=True,
 )
@@ -161,7 +161,7 @@ for chunk in response:
 curl -N http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "nemotron-3-nano:4b-q8_0",
+    "model": "llama-3.1:8b-instruct-q8_0",
     "messages": [{"role": "user", "content": "What is distributed inference?"}],
     "stream": true
   }'

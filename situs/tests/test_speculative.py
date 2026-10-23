@@ -79,3 +79,25 @@ def test_speculative_verifier_acceptance():
         assert accepted == [5, 8]
     except ImportError:
         pytest.skip("PyTorch not installed")
+
+
+def test_prompt_lookup_drafter_breaks_repetition_loop():
+    drafter = PromptLookupDrafter(ngram_size=2, max_draft_tokens=3)
+    # Repeated cycle [15, 74, 352, 15, 74, 352] (representing repeating "0kay")
+    looping_history = [15, 74, 352, 15, 74, 352]
+    candidates = drafter.draft_candidates(looping_history)
+    # Must reject candidates to break the runaway speculative loop!
+    assert candidates == []
+
+    # Monotonous repeating single token [5, 5, 5, 5]
+    single_repeat = [1, 2, 5, 5, 5, 5]
+    assert drafter.draft_candidates(single_repeat) == []
+
+
+def test_speculative_verifier_rejects_without_torch():
+    sampler = TokenSampler()
+    verifier = SpeculativeVerifier(sampler)
+    # With non-tensor or mock logits, must safely reject rather than unconditionally accepting
+    accepted, bonus = verifier.verify_candidates([10, 20, 30], None)
+    assert accepted == []
+    assert bonus is None

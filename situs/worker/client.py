@@ -104,14 +104,19 @@ class WorkerDaemon:
         if self.p2p_node and self.p2p_node.is_connected and out_frame.target == self.p2p_node.target_worker_id:
             sent_p2p = self.p2p_node.send_frame(frame_json)
 
-        # Token emissions MUST always reach Coordinator WebSocket to stream SSE chunks to user
-        if out_frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED, MessageType.INFERENCE_FINISH, MessageType.ERROR):
-            if self.ws:
-                try:
-                    await self.ws.send(frame_json)
-                except Exception:
-                    pass
-        elif not sent_p2p:
+        # Token emissions MUST reach Coordinator WebSocket for HTTP SSE streaming,
+        # but if already delivered via direct P2P, mark target="coordinator" so the
+        # Coordinator RelayHub does NOT re-route or reflect the frame back to the worker!
+        if sent_p2p:
+            if out_frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED, MessageType.INFERENCE_FINISH, MessageType.ERROR):
+                coord_frame = out_frame.model_copy()
+                coord_frame.target = "coordinator"
+                if self.ws:
+                    try:
+                        await self.ws.send(coord_frame.model_dump_json())
+                    except Exception:
+                        pass
+        else:
             if self.ws:
                 try:
                     await self.ws.send(frame_json)
@@ -309,7 +314,7 @@ def main():
     parser.add_argument("--coordinator", default="ws://127.0.0.1:8000/ws/worker", help="Coordinator WebSocket URL")
     parser.add_argument("--id", default=None, help="Worker ID (auto-generated if omitted)")
     parser.add_argument("--device", default="cuda:0" if HAS_TORCH and torch.cuda.is_available() else "cpu", help="PyTorch compute device")
-    parser.add_argument("--model", default="nemotron-3-nano:4b-q8_0", help="Model identifier")
+    parser.add_argument("--model", default="llama-3.1:8b-instruct-q8_0", help="Model identifier")
     parser.add_argument("--compression", default="int8", choices=["none", "fp16", "int8"], help="Activation compression dtype")
     args = parser.parse_args()
 

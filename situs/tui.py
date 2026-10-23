@@ -157,19 +157,11 @@ class PlaceholderProcessor(Processor):
         return Transformation(ti.fragments)
 
 
-# Curated 6GB to 10GB models - The optimal sweet spot for distributed multi-node inference.
+DEFAULT_MODEL = "llama-3.1:8b-instruct-q8_0"
+
+# Curated 6GB to 16GB models - The optimal sweet spot for distributed multi-node inference.
 # Single 6GB GPUs (like RTX 3050) cannot fit these models alone, but pooling 2+ nodes fits them with high performance.
 DISTRIBUTED_MODELS_6GB_10GB = [
-    {
-        "id": "qwen2.5:7b-instruct-q8_0",
-        "name": "Qwen 2.5 7B Instruct (Q8_0)",
-        "vram_gb": 8.1,
-        "params": "7.6B",
-        "layers": 28,
-        "context": "32k",
-        "recommended_split": "2x 6GB GPUs (4.1 GB / GPU)",
-        "desc": "Alibaba Qwen 2.5 - SOTA coding, mathematics & multi-step reasoning.",
-    },
     {
         "id": "llama-3.1:8b-instruct-q8_0",
         "name": "Llama 3.1 8B Instruct (Q8_0)",
@@ -179,6 +171,16 @@ DISTRIBUTED_MODELS_6GB_10GB = [
         "context": "128k",
         "recommended_split": "2x 6GB GPUs (4.3 GB / GPU)",
         "desc": "Meta Llama 3.1 flagship 8B high-precision 8-bit quantized weights.",
+    },
+    {
+        "id": "qwen2.5:7b-instruct-q8_0",
+        "name": "Qwen 2.5 7B Instruct (Q8_0)",
+        "vram_gb": 8.1,
+        "params": "7.6B",
+        "layers": 28,
+        "context": "32k",
+        "recommended_split": "2x 6GB GPUs (4.1 GB / GPU)",
+        "desc": "Alibaba Qwen 2.5 - SOTA coding, mathematics & multi-step reasoning.",
     },
     {
         "id": "deepseek-r1:7b-q8_0",
@@ -199,6 +201,16 @@ DISTRIBUTED_MODELS_6GB_10GB = [
         "context": "8k",
         "recommended_split": "2x 6GB GPUs (3.9 GB / GPU)",
         "desc": "Google Gemma 2 high-density transformer blocks with sliding window attention.",
+    },
+    {
+        "id": "gemma3:4b",
+        "name": "Google Gemma 3 4B (Installed · Local CUDA GPU)",
+        "vram_gb": 3.4,
+        "params": "4.0B",
+        "layers": 28,
+        "context": "8k",
+        "recommended_split": "1-2x GPUs (Installed · Ready on RTX 3050 VRAM)",
+        "desc": "Google Gemma 3 - Verified and pre-loaded in local NVIDIA GPU VRAM.",
     },
     {
         "id": "mistral:7b-instruct-v0.3-q8_0",
@@ -231,14 +243,14 @@ DISTRIBUTED_MODELS_6GB_10GB = [
         "desc": "BigCode StarCoder 2 code assistant trained on 600+ programming languages.",
     },
     {
-        "id": "nemotron-3-nano:4b-fp16",
-        "name": "Nemotron 3 Nano (FP16)",
-        "vram_gb": 8.2,
-        "params": "4.0B",
-        "layers": 32,
-        "context": "4k",
-        "recommended_split": "2x 6GB GPUs (4.1 GB / GPU)",
-        "desc": "Uncompressed full FP16 precision Nemotron 3 Nano pipeline.",
+        "id": "llama-3.2:3b-instruct-q8_0",
+        "name": "Llama 3.2 3B Instruct (Q8_0)",
+        "vram_gb": 3.8,
+        "params": "3.2B",
+        "layers": 28,
+        "context": "128k",
+        "recommended_split": "1-2x GPUs (1.9 GB / GPU)",
+        "desc": "Meta Llama 3.2 edge-optimized lightweight instruct model.",
     },
     {
         "id": "qwen2.5:14b-instruct-q8_0",
@@ -465,7 +477,7 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
         fallback = {
             "status": "offline",
             "active_workers_count": 0,
-            "model": "nemotron-3-nano:4b-q8_0",
+            "model": DEFAULT_MODEL,
             "is_partitioned": False,
         }
         _metadata_cache[normalized] = (now, fallback)
@@ -485,7 +497,7 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
     fallback = {
         "status": "offline",
         "active_workers_count": 0,
-        "model": "nemotron-3-nano:4b-q8_0",
+        "model": DEFAULT_MODEL,
         "is_partitioned": False,
     }
     _metadata_cache[normalized] = (now, fallback)
@@ -651,7 +663,7 @@ def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
 
 def start_in_process_worker(
     coordinator_addr: str = "127.0.0.1:8000",
-    model: str = "nemotron-3-nano:4b-q8_0",
+    model: str = DEFAULT_MODEL,
     worker_id: Optional[str] = None,
     device: Optional[str] = None,
 ) -> Tuple[bool, str]:
@@ -747,7 +759,7 @@ def prompt_in_centered_box(
     Renders an exact 1:1 replica of the OpenCode / ZenCode interface:
     - Centered red Situs logo + bold tagline
     - Sleek rounded card with bright blue focus prompt bar (│ )
-    - Status badge: 'Pipeline: 2 Nodes · nemotron-3-nano:4b-q8_0 · Ready'
+    - Status badge: 'Pipeline: 2 Nodes · Llama 3.1 8B Instruct · Ready'
     - Lower shortcuts: 'tab nodes   / commands   ctrl+c exit'
     - Pinned bottom toolbar: '~:main    1.18.23'
     """
@@ -766,7 +778,7 @@ def prompt_in_centered_box(
     )
 
     workers_cnt = cluster_meta.get("active_workers_count", 0)
-    model_name = cluster_meta.get("model", "nemotron-3-nano:4b-q8_0")
+    model_name = cluster_meta.get("model", DEFAULT_MODEL)
     coord_status = cluster_meta.get("status", "offline")
 
     if workers_cnt > 0:
@@ -1004,15 +1016,15 @@ def execute_slash_command(
             "Models in the 6GB–10GB range cannot fit standalone in 6GB VRAM GPUs (like RTX 3050), but run with blazing "
             "throughput when pooled across 2+ laptops (or 1 GPU + 1 CPU node) using pipeline parallelism.\n\n"
             "[bold cyan]Selection Commands:[/bold cyan]\n"
-            "  [bold yellow]/models[/bold yellow]             View full table of 8 curated models with VRAM, parameter & split specs\n"
-            "  [bold yellow]/model 1[/bold yellow]            Select [bold white]Qwen 2.5 7B Instruct[/bold white] (Q8_0, 8.1 GB VRAM)\n"
-            "  [bold yellow]/model 2[/bold yellow]            Select [bold white]Llama 3.1 8B Instruct[/bold white] (Q8_0, 8.5 GB VRAM)\n"
+            "  [bold yellow]/models[/bold yellow]             View full table of curated models with VRAM, parameter & split specs\n"
+            "  [bold yellow]/model 1[/bold yellow]            Select [bold white]Llama 3.1 8B Instruct[/bold white] (Q8_0, 8.5 GB VRAM)\n"
+            "  [bold yellow]/model 2[/bold yellow]            Select [bold white]Qwen 2.5 7B Instruct[/bold white] (Q8_0, 8.1 GB VRAM)\n"
             "  [bold yellow]/model 3[/bold yellow]            Select [bold white]DeepSeek R1 Distill 7B[/bold white] (Q8_0, 8.2 GB VRAM)\n"
             "  [bold yellow]/model 4[/bold yellow]            Select [bold white]Gemma 2 9B Instruct[/bold white] (Q6_K, 7.8 GB VRAM)\n"
             "  [bold yellow]/model 5[/bold yellow]            Select [bold white]Mistral 7B Instruct v0.3[/bold white] (Q8_0, 7.7 GB VRAM)\n"
             "  [bold yellow]/model 6[/bold yellow]            Select [bold white]Qwen 2.5 Coder 7B[/bold white] (Q8_0, 8.1 GB VRAM)\n"
             "  [bold yellow]/model 7[/bold yellow]            Select [bold white]StarCoder 2 7B[/bold white] (Q8_0, 7.6 GB VRAM)\n"
-            "  [bold yellow]/model 8[/bold yellow]            Select [bold white]Nemotron 3 Nano FP16[/bold white] (FP16, 8.2 GB VRAM)\n"
+            "  [bold yellow]/model 8[/bold yellow]            Select [bold white]Llama 3.2 3B Instruct[/bold white] (Q8_0, 3.8 GB VRAM)\n"
             "  [bold yellow]/model <name>[/bold yellow]       Select any custom model by ID or name",
             title="Curated 6GB-10GB Models",
             border_style="magenta",
@@ -1261,11 +1273,11 @@ def execute_slash_command(
             "[bold white]To select a model to run on Situs:[/bold white]\n"
             f"Type [bold cyan]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold cyan] or [bold cyan]/model <name>[/bold cyan]\n\n"
             "Examples:\n"
-            "  [bold yellow]/model 1[/bold yellow]  ->  Qwen 2.5 7B Instruct (Q8_0, 8.1 GB VRAM)\n"
-            "  [bold yellow]/model 2[/bold yellow]  ->  Llama 3.1 8B Instruct (Q8_0, 8.5 GB VRAM)\n"
-            "  [bold yellow]/model 9[/bold yellow]  ->  Qwen 2.5 14B Instruct (Q8_0, 15.2 GB VRAM)\n"
-            "  [bold yellow]/model 10[/bold yellow] ->  DeepSeek R1 Distill 14B (Q8_0, 14.9 GB VRAM)\n"
-            "  [bold yellow]/model 11[/bold yellow] ->  Mistral NeMo 12B (FP16, 14.6 GB VRAM)",
+            "  [bold yellow]/model 1[/bold yellow]  ->  Llama 3.1 8B Instruct (Q8_0, 8.5 GB VRAM)\n"
+            "  [bold yellow]/model 2[/bold yellow]  ->  Qwen 2.5 7B Instruct (Q8_0, 8.1 GB VRAM)\n"
+            "  [bold yellow]/model 5[/bold yellow]  ->  Google Gemma 3 4B (Installed · Local CUDA GPU)\n"
+            "  [bold yellow]/model 10[/bold yellow] ->  Qwen 2.5 14B Instruct (15.2 GB VRAM · 15GB model)\n"
+            "  [bold yellow]/model 11[/bold yellow] ->  DeepSeek R1 Distill 14B (14.9 GB VRAM · 15GB model)",
             title="Model Selection",
             border_style="cyan",
         )
@@ -1353,9 +1365,20 @@ def execute_slash_command(
             emit(switched_panel, "Model Selected")
         else:
             session_state["model"] = target_arg
+            coord_url = session_state.get("coordinator_url", coordinator_url)
+            repartition_msg = ""
+            if is_coordinator_online(coord_url):
+                try:
+                    with httpx.Client(timeout=2.0) as client:
+                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={target_arg}&total_layers=32&fast_boot=true&codec=zstd")
+                        if resp.status_code == 200:
+                            repartition_msg = "\n[bold green]✓ Coordinator pipeline automatically rebalanced across connected workers![/bold green]"
+                except Exception:
+                    pass
             custom_panel = Panel(
                 f"[bold green]✓ Active Model Set to Custom Model:[/bold green] [bold white]{target_arg}[/bold white]\n\n"
-                f"[white]Type [bold cyan]/models[/bold cyan] to see the curated 6GB-10GB distributed models.[/white]",
+                f"[white]Type [bold cyan]/models[/bold cyan] to see the curated 6GB-16GB distributed models.[/white]"
+                f"{repartition_msg}",
                 title="Custom Model Selected",
                 border_style="green",
             )
@@ -1413,7 +1436,7 @@ def show_nodes_view(coordinator_url: str, log_output_fn: Optional[Callable[[str,
 
 def run_opencode_tui(
     coordinator_url: str = "http://localhost:8000",
-    model: str = "nemotron-3-nano:4b-q8_0",
+    model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
     system_prompt: str = "You are a helpful AI assistant running on a distributed GPU cluster.",
     app_input: Optional[Any] = None,

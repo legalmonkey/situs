@@ -29,9 +29,17 @@ class PromptLookupDrafter:
         """
         Scans past token history for matches of the last `ngram_size` tokens
         and extracts subsequent tokens as speculative candidates.
+        Includes cycle breaking to prevent infinite n-gram repetition loops.
         """
         if len(token_history) < self.ngram_size + 1:
             return []
+
+        # Anti-repetition check: break runaway loops immediately
+        if len(token_history) >= 3 and token_history[-1] == token_history[-2] == token_history[-3]:
+            return []
+        for period in (2, 3, 4):
+            if len(token_history) >= period * 2 and token_history[-period:] == token_history[-period * 2 : -period]:
+                return []
 
         pattern = token_history[-self.ngram_size:]
         search_window = token_history[:-1]
@@ -41,6 +49,9 @@ class PromptLookupDrafter:
             if search_window[i : i + self.ngram_size] == pattern:
                 start_idx = i + self.ngram_size
                 candidates = search_window[start_idx : start_idx + self.max_draft_tokens]
+                # Reject candidates that immediately recreate the repeating loop
+                if candidates and candidates[:self.ngram_size] == pattern:
+                    continue
                 if candidates:
                     return candidates
 
@@ -90,8 +101,8 @@ class SpeculativeVerifier:
         num_candidates = len(candidate_tokens)
 
         if not HAS_TORCH or not isinstance(logits_sequence, torch.Tensor):
-            # Fallback mock verification for unit tests: accept candidates
-            return candidate_tokens, None
+            # No valid torch logits available: safely reject candidates to prevent runaway loops
+            return [], None
 
         # logits_sequence shape: [1, num_candidates, vocab_size]
         for idx in range(num_candidates):

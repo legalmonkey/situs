@@ -32,6 +32,16 @@ def test_generate_llm_answer_noodles():
     assert "Hello! I am Situs" not in answer
 
 
+def test_generate_llm_answer_butter_paneer():
+    prompt = "user: give me a recipe for butter paneer\nassistant:"
+    answer = generate_llm_answer(prompt, model_name="gemma3:4b")
+    assert "paneer" in answer.lower()
+    assert any(w in answer.lower() for w in ("butter", "cream", "masala", "tomato"))
+    # Verify no runaway hallucination loop
+    assert len(answer) < 3000
+    assert "Okay0kay" not in answer
+
+
 def test_stage_engine_uses_real_answer_across_turns():
     tok = get_or_load_tokenizer()
     total_layers = 4
@@ -72,13 +82,13 @@ def test_stage_engine_uses_real_answer_across_turns():
     )
     start_msg = InferenceStart(
         request_id="req-lightbulb",
-        model_name="test-model",
+        model_name="gemma3:4b",
         input_ids=[1, 2, 3],
         prompt=prompt,
         max_new_tokens=15,
     )
     engine_b.session_configs["req-lightbulb"] = start_msg
-    engine_b.init_fast_boot_sequence("req-lightbulb", prompt, "test-model")
+    engine_b.init_fast_boot_sequence("req-lightbulb", prompt, "gemma3:4b")
 
     # Worker A forward
     frame_a = engine_a.start_inference(start_msg)

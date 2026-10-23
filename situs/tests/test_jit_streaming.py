@@ -26,7 +26,7 @@ from situs.worker.jit_streamer import (
 
 
 def test_jit_streamer_chunking_and_priority():
-    streamer = ProgressiveJITStreamer(model_name="nemotron-test", chunk_size=32 * 1024)
+    streamer = ProgressiveJITStreamer(model_name="llama-test", chunk_size=32 * 1024)
 
     # Test chunk creation for layer 16 (mock layer default 128 KB -> 4 chunks)
     chunks = streamer.create_layer_chunks(layer_index=16, total_stage_layers=8)
@@ -52,7 +52,7 @@ def test_jit_streamer_chunking_and_priority():
 
 @pytest.mark.asyncio
 async def test_jit_async_streamer():
-    streamer = ProgressiveJITStreamer(model_name="nemotron-test", chunk_size=64 * 1024)
+    streamer = ProgressiveJITStreamer(model_name="llama-test", chunk_size=64 * 1024)
     chunks = []
     async for chunk in streamer.stream_stage_layers_async(layer_start=8, layer_end=10):
         chunks.append(chunk)

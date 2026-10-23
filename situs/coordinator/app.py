@@ -50,7 +50,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = "nemotron-3-nano:4b-q8_0"
+    model: Optional[str] = "llama-3.1:8b-instruct-q8_0"
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
@@ -119,7 +119,7 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
 async def cluster_status():
     alive = registry.get_alive_workers()
     pipeline = registry.get_pipeline_order()
-    curr_model = registry.active_model or "nemotron-3-nano:4b-q8_0"
+    curr_model = registry.active_model or "llama-3.1:8b-instruct-q8_0"
     total_vram_b = sum(w.total_vram_bytes for w in alive)
     free_vram_b = sum(w.free_vram_bytes for w in alive)
     used_vram_b = sum(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) for w in alive)
@@ -156,7 +156,7 @@ async def cluster_status():
 
 @app.post("/admin/partition")
 async def trigger_partition(
-    model_name: str = "nemotron-3-nano:4b-q8_0",
+    model_name: str = "llama-3.1:8b-instruct-q8_0",
     total_layers: int = 32,
     progressive: bool = False,
     fast_boot: bool = False,
@@ -185,23 +185,33 @@ async def trigger_partition(
 
 @app.get("/v1/models")
 async def list_models():
+    from situs.tui import DISTRIBUTED_MODELS_6GB_10GB
+    model_list = [
+        {
+            "id": m["id"],
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "situs-cluster",
+        }
+        for m in DISTRIBUTED_MODELS_6GB_10GB
+    ]
+    if registry.active_model and not any(m["id"] == registry.active_model for m in model_list):
+        model_list.insert(0, {
+            "id": registry.active_model,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "situs-cluster",
+        })
     return {
         "object": "list",
-        "data": [
-            {
-                "id": "nemotron-3-nano:4b-q8_0",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "situs-cluster",
-            }
-        ],
+        "data": model_list,
     }
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     pipeline = registry.get_pipeline_order()
-    target_model = req.model or registry.active_model or "nemotron-3-nano:4b-q8_0"
+    target_model = req.model or registry.active_model or "llama-3.1:8b-instruct-q8_0"
     repartition_needed = len(pipeline) < 2 or (registry.active_model is not None and registry.active_model != target_model)
     if repartition_needed:
         alive = registry.get_alive_workers()
@@ -245,7 +255,7 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception:
         input_ids = [ord(c) % 256 for c in prompt]
 
-    real_ans = generate_llm_answer(prompt, model_name=target_model)
+    real_ans = await asyncio.to_thread(generate_llm_answer, prompt, model_name=target_model)
 
     # 1. Send INFERENCE_START to Worker A (first stage)
     start_payload = InferenceStart(
@@ -292,7 +302,7 @@ async def chat_completions(req: ChatCompletionRequest):
                             "id": request_id,
                             "object": "chat.completion.chunk",
                             "created": created_ts,
-                            "model": req.model,
+                            "model": target_model,
                             "choices": [
                                 {
                                     "index": 0,
@@ -311,7 +321,7 @@ async def chat_completions(req: ChatCompletionRequest):
                                 "id": request_id,
                                 "object": "chat.completion.chunk",
                                 "created": created_ts,
-                                "model": req.model,
+                                "model": target_model,
                                 "choices": [
                                     {
                                         "index": 0,

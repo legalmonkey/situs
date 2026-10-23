@@ -85,7 +85,7 @@ def test_tui_slash_completer():
     m_completions = list(completer.get_completions(doc_m, None))
     assert len(m_completions) >= 8
     assert m_completions[0].text == "/model 1"
-    assert "Qwen 2.5 7B" in m_completions[0].display_text
+    assert "Llama 3.1 8B" in m_completions[0].display_text
     assert any("14B" in c.display_text for c in m_completions)
 
     # 5. Test typing '/join ' suggests custom worker IDs
@@ -105,7 +105,7 @@ def test_tui_execute_slash_commands():
     def log_capture(title, renderable):
         logs.append((title, renderable))
 
-    assert execute_slash_command("/help", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/help", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
     titles = [t for t, _ in logs]
     assert "Help Commands" in titles
     assert "Worker ID Guide" in titles
@@ -113,57 +113,57 @@ def test_tui_execute_slash_commands():
 
     # Test /models
     logs.clear()
-    assert execute_slash_command("/models", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/models", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
     titles = [t for t, _ in logs]
     assert any("Curated" in t for t in titles)
     assert "Select Model" in titles
 
     # Test /vram
     logs.clear()
-    assert execute_slash_command("/vram", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/vram", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
     titles = [t for t, _ in logs]
     assert any("Live GPU VRAM Monitor" in t for t in titles)
 
-    # Test /model 1 selects Qwen 2.5 7B
+    # Test /model 1 selects Llama 3.1 8B
     logs.clear()
-    assert execute_slash_command("/model 1", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
-    assert session_state["model"] == "qwen2.5:7b-instruct-q8_0"
-
-    # Test /model 2 selects Llama 3.1 8B
-    assert execute_slash_command("/model 2", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/model 1", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
     assert session_state["model"] == "llama-3.1:8b-instruct-q8_0"
+
+    # Test /model 2 selects Qwen 2.5 7B
+    assert execute_slash_command("/model 2", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+    assert session_state["model"] == "qwen2.5:7b-instruct-q8_0"
 
     # Test /model with no args inspects the active model
     logs.clear()
-    assert execute_slash_command("/model", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/model", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
     assert any("Active Model" in t for t, _ in logs)
 
     # Test /join parsing with custom worker-id and device
-    assert execute_slash_command("/join 127.0.0.1:8000 worker-2 cpu", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
-    assert execute_slash_command("/join 127.0.0.1:8000 --worker-id worker-test --device cpu", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/join 127.0.0.1:8000 worker-2 cpu", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/join 127.0.0.1:8000 --worker-id worker-test --device cpu", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
 
     # Test /speculative toggle
-    assert execute_slash_command("/speculative", "http://localhost:8000", "nemotron", messages, session_state) is True
+    assert execute_slash_command("/speculative", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
     assert session_state["speculative"] is False
-    assert execute_slash_command("/speculative", "http://localhost:8000", "nemotron", messages, session_state) is True
+    assert execute_slash_command("/speculative", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
     assert session_state["speculative"] is True
 
     # Test /p2p toggle
-    assert execute_slash_command("/p2p", "http://localhost:8000", "nemotron", messages, session_state) is True
+    assert execute_slash_command("/p2p", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
     assert session_state["p2p"] is False
 
     # Test /clear
-    assert execute_slash_command("/clear", "http://localhost:8000", "nemotron", messages, session_state) is True
+    assert execute_slash_command("/clear", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
     assert len(messages) == 1
 
     # Test in-interface coordinator and join commands
-    assert execute_slash_command("situs coordinator", "http://localhost:8000", "nemotron", messages, session_state) is True
-    assert execute_slash_command("/coordinator", "http://localhost:8000", "nemotron", messages, session_state) is True
-    assert execute_slash_command("situs status", "http://localhost:8000", "nemotron", messages, session_state) is True
-    assert execute_slash_command("help", "http://localhost:8000", "nemotron", messages, session_state) is True
+    assert execute_slash_command("situs coordinator", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
+    assert execute_slash_command("/coordinator", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
+    assert execute_slash_command("situs status", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
+    assert execute_slash_command("help", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
 
     # Test /exit
-    assert execute_slash_command("/exit", "http://localhost:8000", "nemotron", messages, session_state) is False
+    assert execute_slash_command("/exit", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is False
 
     # Test metadata and git branch
     meta = fetch_cluster_metadata("http://localhost:9999")
@@ -207,7 +207,7 @@ def test_prompt_in_centered_box_pipe():
         fake_out = Vt100_Output(io.StringIO(), lambda: Size(24, 80))
         result = prompt_in_centered_box(
             "http://localhost:8000",
-            {"active_workers_count": 2, "model": "nemotron-3-nano:4b-q8_0"},
+            {"active_workers_count": 2, "model": "llama-3.1:8b-instruct-q8_0"},
             app_input=pipe,
             app_output=fake_out,
         )
@@ -227,7 +227,7 @@ def test_prompt_in_centered_box_tab_shows_nodes():
         fake_out = Vt100_Output(io.StringIO(), lambda: Size(24, 80))
         result = prompt_in_centered_box(
             "http://localhost:8000",
-            {"active_workers_count": 0, "model": "nemotron"},
+            {"active_workers_count": 0, "model": "llama-3.1:8b-instruct-q8_0"},
             app_input=pipe,
             app_output=fake_out,
         )
@@ -246,7 +246,7 @@ def test_opencode_persistent_tui_pipe():
         fake_out = Vt100_Output(io.StringIO(), lambda: Size(30, 100))
         res = run_opencode_tui(
             coordinator_url="http://127.0.0.1:8000",
-            model="nemotron-3-nano:4b-q8_0",
+            model="llama-3.1:8b-instruct-q8_0",
             app_input=pipe,
             app_output=fake_out,
             full_screen=False,
@@ -280,7 +280,7 @@ def test_hardware_detection_and_safe_join():
 
     # 3. Test DistributedStageModel safe fallback: requesting cuda:0 on cpu-only torch should not crash
     stage = load_hf_stage_model(
-        model_name="nemotron",
+        model_name="llama-3.1:8b-instruct-q8_0",
         layer_start=0,
         layer_end=2,
         total_layers=4,
@@ -292,12 +292,12 @@ def test_hardware_detection_and_safe_join():
 
     # 4. Test /join with auto device in TUI
     messages = []
-    session_state = {"model": "nemotron", "is_coordinator": True}
+    session_state = {"model": "llama-3.1:8b-instruct-q8_0", "is_coordinator": True}
     captured = []
     def log_capture(title, renderable):
         captured.append((title, str(renderable)))
 
-    assert execute_slash_command("/join 127.0.0.1:8000 worker-hw-test", "http://localhost:8000", "nemotron", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/join 127.0.0.1:8000 worker-hw-test", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
     assert any("Worker Joined" in t or "Worker" in t for t, _ in captured)
 
 

@@ -28,14 +28,14 @@ async def test_live_websocket_cluster_e2e():
             coordinator_url=f"ws://127.0.0.1:{port}/ws/worker",
             worker_id="worker-live-a",
             device="cpu",
-            model_name="nemotron-3-nano:4b-q8_0",
+            model_name="gemma3:4b",
             compression_dtype="int8",
         )
         cfg_b = WorkerConfig(
             coordinator_url=f"ws://127.0.0.1:{port}/ws/worker",
             worker_id="worker-live-b",
             device="cpu",
-            model_name="nemotron-3-nano:4b-q8_0",
+            model_name="gemma3:4b",
             compression_dtype="int8",
         )
 
@@ -61,7 +61,7 @@ async def test_live_websocket_cluster_e2e():
             assert "worker-live-b" in registry.workers
 
             # 4. Partition model across the two live workers
-            part_resp = await client.post("/admin/partition?model_name=nemotron-3-nano:4b-q8_0&total_layers=8")
+            part_resp = await client.post("/admin/partition?model_name=gemma3:4b&total_layers=8")
             assert part_resp.status_code == 200
 
             # Allow workers to initialize stage engines
@@ -69,7 +69,7 @@ async def test_live_websocket_cluster_e2e():
 
             # 5. Send an OpenAI Chat Completion request
             chat_payload = {
-                "model": "nemotron-3-nano:4b-q8_0",
+                "model": "gemma3:4b",
                 "messages": [{"role": "user", "content": "Hi!"}],
                 "max_tokens": 4,
                 "stream": True,

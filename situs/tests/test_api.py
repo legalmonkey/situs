@@ -27,13 +27,13 @@ def test_list_models_openai(client):
     data = response.json()
     assert data["object"] == "list"
     assert len(data["data"]) >= 1
-    assert data["data"][0]["id"] == "nemotron-3-nano:4b-q8_0"
+    assert data["data"][0]["id"] == "llama-3.1:8b-instruct-q8_0"
 
 
 def test_chat_completions_requires_minimum_workers(client):
     # When 0 workers are connected, completions should return 503
     payload = {
-        "model": "nemotron-3-nano:4b-q8_0",
+        "model": "llama-3.1:8b-instruct-q8_0",
         "messages": [{"role": "user", "content": "Hello!"}],
         "stream": False,
     }

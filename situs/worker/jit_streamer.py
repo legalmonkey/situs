@@ -87,7 +87,7 @@ class ProgressiveJITStreamer:
 
     def __init__(
         self,
-        model_name: str = "nemotron-3-nano:4b-q8_0",
+        model_name: str = "llama-3.1:8b-instruct-q8_0",
         chunk_size: int = 64 * 1024,  # 64 KB per chunk
         cache_dir: Optional[pathlib.Path] = None,
         codec: str = "zstd",

@@ -61,8 +61,10 @@ class RelayHub:
             if request_id and request_id in self.response_streams:
                 await self.response_streams[request_id].put(frame)
 
-        # For tokens/speculative verification, the recipient MUST be the first stage in the pipeline
+        # For tokens/speculative verification, route to worker ONLY if not already delivered via direct P2P
         if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED):
+            if frame.target == "coordinator":
+                return  # Delivered for HTTP SSE client streaming only; do not reflect back into pipeline ring
             target_worker = frame.target
             if self.registry:
                 try:
@@ -76,7 +78,7 @@ class RelayHub:
             return
 
         # If it has a target worker (e.g. forward activation A -> B)
-        if frame.target:
+        if frame.target and frame.target != "coordinator":
             await self.send_to_worker(frame.target, frame)
 
     def register_response_stream(self, request_id: str) -> asyncio.Queue:

@@ -54,6 +54,8 @@ class StageExecutionEngine:
         self.layer_chunk_buffers: Dict[int, Dict[int, str]] = {}
         # Pre-computed conversational sequences for fast-boot skeleton mode
         self.session_fast_boot_sequences: Dict[str, List[int]] = {}
+        # Completed sessions to prevent stale in-flight duplicate frames from reviving finished generations
+        self.finished_sessions: set = set()
 
     def init_fast_boot_sequence(self, request_id: str, prompt_text: Optional[str] = "", model_name: str = ""):
         """Initializes a coherent conversational response sequence for fast-boot mode."""
@@ -68,8 +70,7 @@ class StageExecutionEngine:
                 resp = None
 
         if not resp:
-            clean_q = str(prompt_text or "").strip()
-            resp = f"Processed prompt '{clean_q}' across the distributed GPU cluster."
+            resp = f"[Situs Worker Engine: Unable to generate neural response from model '{model_name}'. Check Ollama and GPU.]"
 
         tok = self.sampler.tokenizer
         if not tok:
@@ -181,6 +182,7 @@ class StageExecutionEngine:
             raise RuntimeError("start_inference called on a non-first stage worker")
 
         request_id = start_msg.request_id
+        self.finished_sessions.discard(request_id)
         self.session_configs[request_id] = start_msg
         self.session_token_histories[request_id] = list(start_msg.input_ids)
 
@@ -217,6 +219,9 @@ class StageExecutionEngine:
         Invoked on middle and last stages when activations arrive from previous stage.
         """
         request_id = act_frame.request_id
+        if request_id in self.finished_sessions:
+            return None
+
         comp_bytes = base64.b64decode(act_frame.payload_b64)
 
         if HAS_TORCH:
@@ -293,6 +298,7 @@ class StageExecutionEngine:
                 self.session_kv_caches.pop(request_id, None)
                 self.session_configs.pop(request_id, None)
                 self.session_fast_boot_sequences.pop(request_id, None)
+                self.finished_sessions.add(request_id)
 
             next_token = NextToken(
                 request_id=request_id,
@@ -317,6 +323,9 @@ class StageExecutionEngine:
         Invoked on Worker B to verify a drafted multi-token candidate batch in a single forward pass.
         """
         request_id = cand_frame.request_id
+        if request_id in self.finished_sessions:
+            return None
+
         comp_bytes = base64.b64decode(cand_frame.payload_b64)
 
         if HAS_TORCH:
@@ -353,33 +362,70 @@ class StageExecutionEngine:
         cfg = self.session_configs.get(request_id)
         temp = cfg.temperature if cfg else 0.7
         top_p = cfg.top_p if cfg else 0.9
+        max_tokens = cfg.max_new_tokens if cfg else 256
+        is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or getattr(self.stage_model, "fast_boot", False)
 
-        accepted_tokens, correction = self.verifier.verify_candidates(
-            cand_frame.candidate_tokens,
-            logits,
-            temperature=temp,
-            top_p=top_p,
-        )
-        if correction is not None:
-            accepted_tokens.append(correction)
+        if is_fast_boot:
+            seq = self.session_fast_boot_sequences.get(request_id)
+            if seq is None:
+                prompt_txt = getattr(cfg, "prompt", "hello") if cfg else "hello"
+                m_name = getattr(cfg, "model_name", self.assignment.model_name) if cfg else self.assignment.model_name
+                self.init_fast_boot_sequence(request_id, prompt_txt, m_name)
+                seq = self.session_fast_boot_sequences.get(request_id, [])
+
+            step_idx = cand_frame.step_index
+            accepted_tokens = []
+            correction = None
+            for idx, cand_tok in enumerate(cand_frame.candidate_tokens):
+                expected_idx = step_idx + idx
+                if expected_idx < len(seq):
+                    if cand_tok == seq[expected_idx]:
+                        accepted_tokens.append(cand_tok)
+                    else:
+                        correction = seq[expected_idx]
+                        break
+                else:
+                    break
+
+            if correction is not None:
+                accepted_tokens.append(correction)
+            elif not accepted_tokens and step_idx < len(seq):
+                accepted_tokens.append(seq[step_idx])
+
+            new_step_idx = cand_frame.step_index + len(accepted_tokens)
+            is_eos = (new_step_idx >= len(seq)) if seq else False
+        else:
+            accepted_tokens, correction = self.verifier.verify_candidates(
+                cand_frame.candidate_tokens,
+                logits,
+                temperature=temp,
+                top_p=top_p,
+            )
+            if correction is not None:
+                accepted_tokens.append(correction)
+            elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
+                sampled_tok = self.sampler.sample_next_token(logits[0, 0, :], temperature=temp, top_p=top_p)
+                accepted_tokens.append(sampled_tok)
+
+            new_step_idx = cand_frame.step_index + len(accepted_tokens)
+            is_eos = False
 
         accepted_texts = [self.sampler.decode_token(t) for t in accepted_tokens]
-        step_idx = cand_frame.step_index + len(accepted_tokens)
-
-        max_tokens = cfg.max_new_tokens if cfg else 256
-        is_finished = (step_idx >= max_tokens)
+        is_finished = is_eos or (new_step_idx >= max_tokens)
 
         if is_finished:
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
+            self.session_fast_boot_sequences.pop(request_id, None)
+            self.finished_sessions.add(request_id)
 
         verified = SpeculativeVerified(
             request_id=request_id,
-            step_index=step_idx,
+            step_index=new_step_idx,
             accepted_tokens=accepted_tokens,
             accepted_texts=accepted_texts,
             is_finished=is_finished,
-            finish_reason="length" if is_finished else None,
+            finish_reason="stop" if is_eos else ("length" if is_finished else None),
         )
 
         target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
@@ -407,10 +453,14 @@ class StageExecutionEngine:
             return None
 
         request_id = verified_frame.request_id
+        if request_id in self.finished_sessions:
+            return None
+
         if verified_frame.is_finished:
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
             self.session_token_histories.pop(request_id, None)
+            self.finished_sessions.add(request_id)
             return None
 
         # Append accepted tokens to history
@@ -443,11 +493,15 @@ class StageExecutionEngine:
             return None
 
         request_id = token_frame.request_id
+        if request_id in self.finished_sessions:
+            return None
+
         if token_frame.is_finished:
             # Generation finished, clean up local KV cache
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
             self.session_token_histories.pop(request_id, None)
+            self.finished_sessions.add(request_id)
             return None
 
         # Track history

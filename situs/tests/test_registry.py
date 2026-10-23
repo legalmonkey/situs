@@ -33,8 +33,8 @@ def test_registry_registration_and_partitioning():
 
     assert len(registry.get_alive_workers()) == 2
 
-    # Partition 32 layers for nemotron-3-nano across the 2 workers
-    assignments = registry.partition_model("nemotron-3-nano:4b-q8_0", total_layers=32)
+    # Partition 32 layers for llama-3.1 across the 2 workers
+    assignments = registry.partition_model("llama-3.1:8b-instruct-q8_0", total_layers=32)
 
     assert len(assignments) == 2
     # First stage (Worker A)

@@ -131,7 +131,7 @@ def normalize_http_url(url: str) -> str:
 def main_callback(
     ctx: typer.Context,
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("nemotron-3-nano:4b-q8_0", "--model", "-m", help="Target model identifier"),
+    model: str = typer.Option("llama-3.1:8b-instruct-q8_0", "--model", "-m", help="Target model identifier"),
 ):
     """Situs: Distributed GPU Pooling Across the Internet."""
     if ctx.invoked_subcommand is None:
@@ -317,7 +317,7 @@ def join_cluster(
     ),
     worker_id: Optional[str] = typer.Option(None, "--worker-id", "--id", "-i", help="Unique custom ID for this worker (e.g. worker-2)"),
     device: str = typer.Option("auto", "--device", "-d", help="Execution device ('cuda:0', 'cpu', or 'auto')"),
-    model: str = typer.Option("nemotron-3-nano:4b-q8_0", "--model", "-m", help="Target model identifier"),
+    model: str = typer.Option("llama-3.1:8b-instruct-q8_0", "--model", "-m", help="Target model identifier"),
     speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
     compression: str = typer.Option("int8", "--compression", "-c", help="Activation compression ('int8', 'fp16', 'none')"),
@@ -484,7 +484,7 @@ def cluster_status(
 @app.command("partition")
 def partition_model(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("nemotron-3-nano:4b-q8_0", "--model", "-m", help="Model name"),
+    model: str = typer.Option("llama-3.1:8b-instruct-q8_0", "--model", "-m", help="Model name"),
     layers: int = typer.Option(32, "--layers", "-l", help="Total transformer layers in model"),
 ):
     """Trigger automated pipeline layer partitioning across registered workers."""
@@ -528,7 +528,7 @@ def partition_model(
 @app.command("chat")
 def interactive_chat(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("nemotron-3-nano:4b-q8_0", "--model", "-m", help="Model name"),
+    model: str = typer.Option("llama-3.1:8b-instruct-q8_0", "--model", "-m", help="Model name"),
     temperature: float = typer.Option(0.7, "--temp", "-t", help="Sampling temperature"),
     system: str = typer.Option("You are a helpful AI assistant running on a distributed GPU cluster.", "--system", "-s", help="System prompt"),
 ):
@@ -550,7 +550,7 @@ def interactive_chat(
 def one_shot_run(
     prompt: str = typer.Argument(..., help="Prompt to execute across the cluster"),
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("nemotron-3-nano:4b-q8_0", "--model", "-m", help="Model name"),
+    model: str = typer.Option("llama-3.1:8b-instruct-q8_0", "--model", "-m", help="Model name"),
 ):
     """Run a single prompt and stream tokens to stdout (for piping in PowerShell scripts)."""
     import httpx
