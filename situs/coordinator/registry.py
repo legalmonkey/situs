@@ -101,15 +101,21 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                 arch = model_info.get("general.architecture", "llama")
 
                 if block_count and block_count > 0:
-                    return {
-                        "total_layers": block_count,
-                        "hidden_dim": hidden_dim or 2048,
-                        "intermediate_size": intermediate or (hidden_dim * 4 if hidden_dim else 8192),
-                        "vocab_size": vocab_size or 32000,
-                        "num_heads": heads or 16,
-                        "num_kv_heads": kv_heads or heads or 16,
-                        "architecture": arch,
-                    }
+                    if hidden_dim is None or hidden_dim <= 0:
+                        logger.warning(
+                            f"Ollama returned block_count={block_count} but no hidden_dim for '{model_name}'; "
+                            "cannot derive reliable metadata."
+                        )
+                    else:
+                        return {
+                            "total_layers": block_count,
+                            "hidden_dim": hidden_dim,
+                            "intermediate_size": intermediate if intermediate else (hidden_dim * 4),
+                            "vocab_size": vocab_size if vocab_size else 32000,
+                            "num_heads": heads if heads else max(1, hidden_dim // 128),
+                            "num_kv_heads": kv_heads if kv_heads else heads if heads else max(1, hidden_dim // 128),
+                            "architecture": arch,
+                        }
     except Exception as e:
         logger.debug(f"Ollama metadata query failed: {e}")
 
@@ -118,27 +124,31 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
         try:
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(model_name, local_files_only=True)
+            num_layers = getattr(config, "num_hidden_layers", None) or getattr(config, "n_layer", None)
+            hidden = getattr(config, "hidden_size", None) or getattr(config, "n_embd", None)
+            if num_layers is None or hidden is None:
+                raise ValueError(
+                    f"HuggingFace AutoConfig for '{model_name}' is missing required fields "
+                    f"(num_hidden_layers={num_layers}, hidden_size={hidden})."
+                )
             return {
-                "total_layers": getattr(config, "num_hidden_layers", getattr(config, "n_layer", 32)),
-                "hidden_dim": getattr(config, "hidden_size", getattr(config, "n_embd", 2048)),
-                "intermediate_size": getattr(config, "intermediate_size", 8192),
+                "total_layers": num_layers,
+                "hidden_dim": hidden,
+                "intermediate_size": getattr(config, "intermediate_size", hidden * 4),
                 "vocab_size": getattr(config, "vocab_size", 32000),
-                "num_heads": getattr(config, "num_attention_heads", getattr(config, "n_head", 16)),
-                "num_kv_heads": getattr(config, "num_key_value_heads", getattr(config, "num_attention_heads", 16)),
-                "architecture": getattr(config, "model_type", "llama"),
+                "num_heads": getattr(config, "num_attention_heads", getattr(config, "n_head", max(1, hidden // 128))),
+                "num_kv_heads": getattr(config, "num_key_value_heads", getattr(config, "num_attention_heads", max(1, hidden // 128))),
+                "architecture": getattr(config, "model_type", "unknown"),
             }
         except Exception:
             pass
 
-    return {
-        "total_layers": 32,
-        "hidden_dim": 2048,
-        "intermediate_size": 8192,
-        "vocab_size": 32000,
-        "num_heads": 16,
-        "num_kv_heads": 16,
-        "architecture": "llama",
-    }
+    raise RuntimeError(
+        f"Cannot resolve model metadata for '{model_name}'. "
+        f"Model is not in the known families list, Ollama daemon is unreachable, "
+        f"and HuggingFace AutoConfig lookup failed. "
+        f"Please ensure the model is available locally or specify a supported model."
+    )
 
 
 def optimal_heterogeneous_partition(

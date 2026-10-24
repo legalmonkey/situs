@@ -582,7 +582,7 @@ def load_hf_stage_model(
     """
     meta = resolve_model_metadata(model_name)
     hidden_dim = meta.get("hidden_dim", 2048)
-    vocab_size = min(meta.get("vocab_size", 32000), 32000)
+    vocab_size = meta.get("vocab_size", 32000)
     num_heads = meta.get("num_heads", 16)
     num_kv_heads = meta.get("num_kv_heads", num_heads)
     intermediate_size = meta.get("intermediate_size", hidden_dim * 4)

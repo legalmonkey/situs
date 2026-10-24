@@ -14,7 +14,7 @@ class CoordinatorConfig:
     relay_buffer_size: int = 64 * 1024 * 1024  # 64 MB
     enable_cors: bool = True
     worker_auth_token: Optional[str] = field(
-        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", "situs-cluster-secret")
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN")
     )
     api_key: Optional[str] = field(default_factory=lambda: os.getenv("SITUS_API_KEY", None))
     admin_key: Optional[str] = field(default_factory=lambda: os.getenv("SITUS_ADMIN_KEY", None))
@@ -48,7 +48,7 @@ class WorkerConfig:
     enable_speculative: bool = True
     p2p_direct_enabled: bool = True
     auth_token: Optional[str] = field(
-        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", "situs-cluster-secret")
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN")
     )
 
 

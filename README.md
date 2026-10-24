@@ -60,7 +60,7 @@ Situs comes with a streamlined terminal interface like OpenCode and Claude Code.
 ### 1. Installation & Environment Check
 
 ```powershell
-git clone https://github.com/situs/situs.git
+git clone https://github.com/legalmonkey/situs.git
 cd situs
 pip install -e .
 
