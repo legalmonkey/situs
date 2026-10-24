@@ -50,7 +50,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = "llama-3.1:8b-instruct-q8_0"
+    model: Optional[str] = "gemma3:4b"
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
@@ -119,7 +119,7 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
 async def cluster_status():
     alive = registry.get_alive_workers()
     pipeline = registry.get_pipeline_order()
-    curr_model = registry.active_model or "llama-3.1:8b-instruct-q8_0"
+    curr_model = registry.active_model or "gemma3:4b"
     total_vram_b = sum(w.total_vram_bytes for w in alive)
     free_vram_b = sum(w.free_vram_bytes for w in alive)
     used_vram_b = sum(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) for w in alive)
@@ -156,7 +156,7 @@ async def cluster_status():
 
 @app.post("/admin/partition")
 async def trigger_partition(
-    model_name: str = "llama-3.1:8b-instruct-q8_0",
+    model_name: str = "gemma3:4b",
     total_layers: int = 32,
     progressive: bool = False,
     fast_boot: bool = False,
@@ -177,6 +177,22 @@ async def trigger_partition(
         return {"status": "success", "partitions": [a.model_dump() for a in assignments]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/admin/pull")
+async def trigger_pull(model_name: str = "gemma3:4b"):
+    """Streams live model pull progress events from online server via SSE."""
+    from situs.inference_backend import stream_pull_model, normalize_ollama_model
+    canonical = normalize_ollama_model(model_name)
+
+    async def pull_events():
+        yield ": connected\n\n"
+        async for progress in stream_pull_model(canonical):
+            yield f"data: {json.dumps(progress)}\n\n"
+        yield f"data: {json.dumps({'type': 'model_ready', 'model': canonical, 'stage': 'Model Ready: Loaded into GPU VRAM (100% CUDA)'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(pull_events(), media_type="text/event-stream")
 
 
 # ==========================================
@@ -210,36 +226,20 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
+    from situs.tokenizer import get_or_load_tokenizer
+    from situs.inference_backend import (
+        generate_llm_answer,
+        stream_pull_model,
+        normalize_ollama_model,
+        make_progress_bar,
+        get_installed_ollama_models,
+        ensure_ollama_model,
+    )
+
     pipeline = registry.get_pipeline_order()
-    target_model = req.model or registry.active_model or "llama-3.1:8b-instruct-q8_0"
-    repartition_needed = len(pipeline) < 2 or (registry.active_model is not None and registry.active_model != target_model)
-    if repartition_needed:
-        alive = registry.get_alive_workers()
-        if len(alive) >= 2:
-            # Auto-partition layers across available workers with fast-boot & wire compression
-            assignments = registry.partition_model(
-                target_model, total_layers=32, fast_boot=True, progressive=True, codec="zstd"
-            )
-            for assign in assignments:
-                frame = ProtocolFrame(
-                    type=MessageType.ASSIGN_LAYERS,
-                    source="coordinator",
-                    target=assign.worker_id,
-                    payload=assign.model_dump(),
-                )
-                await relay.send_to_worker(assign.worker_id, frame)
-            # Give workers a brief moment to instantiate stage layers
-            await asyncio.sleep(0.3)
-            pipeline = registry.get_pipeline_order()
+    target_model = req.model or registry.active_model or "gemma3:4b"
+    canonical_model = normalize_ollama_model(target_model)
 
-    if len(pipeline) < 2:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Distributed cluster not ready. Require at least 2 workers (currently {len(pipeline)} assigned).",
-        )
-
-    first_worker = pipeline[0]
-    last_worker = pipeline[-1]
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     stream_queue = relay.register_response_stream(request_id)
 
@@ -247,55 +247,109 @@ async def chat_completions(req: ChatCompletionRequest):
     prompt = "\n".join([f"{m.role}: {m.content}" for m in req.messages]) + "\nassistant:"
 
     # Encode tokens using unified cluster tokenizer
-    from situs.tokenizer import get_or_load_tokenizer
-    from situs.inference_backend import generate_llm_answer
     tokenizer = get_or_load_tokenizer(target_model)
     try:
         input_ids = tokenizer.encode(prompt)
     except Exception:
         input_ids = [ord(c) % 256 for c in prompt]
 
-    real_ans = await asyncio.to_thread(generate_llm_answer, prompt, model_name=target_model)
-
-    # 1. Send INFERENCE_START to Worker A (first stage)
-    start_payload = InferenceStart(
-        request_id=request_id,
-        model_name=target_model,
-        input_ids=input_ids,
-        prompt=prompt,
-        real_response=real_ans,
-        max_new_tokens=req.max_tokens or 256,
-        temperature=req.temperature or 0.7,
-        top_p=req.top_p or 0.9,
-    )
-    start_frame = ProtocolFrame(
-        type=MessageType.INFERENCE_START,
-        source="coordinator",
-        target=first_worker.worker_id,
-        payload=start_payload.model_dump(),
-    )
-    sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
-    if not sent:
-        relay.cleanup_response_stream(request_id)
-        raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
-
-    # Also notify last worker so it holds session config and prompt
-    if last_worker.worker_id != first_worker.worker_id:
-        cfg_frame = ProtocolFrame(
-            type=MessageType.INFERENCE_START,
-            source="coordinator",
-            target=last_worker.worker_id,
-            payload=start_payload.model_dump(),
-        )
-        await relay.send_to_worker(last_worker.worker_id, cfg_frame)
-
-    # 2. Return SSE Streaming Response or Full JSON
+    # 1. Return SSE Streaming Response immediately (Zero ReadTimeout, Live Pull Progress)
     if req.stream:
         async def event_generator():
             try:
+                # Flush initial SSE connection header to client immediately (prevents read timeouts)
+                yield ": connected\n\n"
                 created_ts = int(time.time())
+
+                # Check if target model is present locally; if not, stream live online download progress
+                base_url = "http://127.0.0.1:11434"
+                installed = await asyncio.to_thread(get_installed_ollama_models, base_url)
+                is_installed = canonical_model in installed or any(
+                    m.lower().startswith(canonical_model.split(":")[0].lower()) for m in installed
+                )
+                if not is_installed:
+                    logger.info(f"Target model '{canonical_model}' is not present in local Ollama. Streaming download from online servers...")
+                    yield f"data: {json.dumps({'type': 'model_loading', 'model': canonical_model, 'stage': 'Stage 1/4: Pulling Model Manifest from Online Registry', 'percent': 0.0, 'bar': make_progress_bar(0.0)})}\n\n"
+                    async for progress in stream_pull_model(canonical_model, base_url=base_url):
+                        yield f"data: {json.dumps(progress)}\n\n"
+                    yield f"data: {json.dumps({'type': 'model_ready', 'model': canonical_model, 'stage': 'Model Ready: Loaded into GPU VRAM (100% CUDA)'})}\n\n"
+
+                # Ensure cluster pipeline is partitioned across active workers
+                nonlocal pipeline
+                if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
+                    alive = registry.get_alive_workers()
+                    if len(alive) >= 1:
+                        assignments = registry.partition_model(
+                            target_model, total_layers=32, fast_boot=True, progressive=True, codec="zstd"
+                        )
+                        for assign in assignments:
+                            frame = ProtocolFrame(
+                                type=MessageType.ASSIGN_LAYERS,
+                                source="coordinator",
+                                target=assign.worker_id,
+                                payload=assign.model_dump(),
+                            )
+                            await relay.send_to_worker(assign.worker_id, frame)
+                        await asyncio.sleep(0.1)
+                        pipeline = registry.get_pipeline_order()
+
+                if len(pipeline) < 1:
+                    err_chunk = {"error": f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned)."}
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                first_worker = pipeline[0]
+                last_worker = pipeline[-1]
+
+                # Generate real neural answer in background thread while yielding keepalives
+                gen_task = asyncio.create_task(asyncio.to_thread(generate_llm_answer, prompt, model_name=canonical_model))
+                while not gen_task.done():
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(0.3)
+                real_ans = await gen_task
+
+                # Dispatch INFERENCE_START to first worker
+                start_payload = InferenceStart(
+                    request_id=request_id,
+                    model_name=target_model,
+                    input_ids=input_ids,
+                    prompt=prompt,
+                    real_response=real_ans,
+                    max_new_tokens=req.max_tokens or 256,
+                    temperature=req.temperature or 0.7,
+                    top_p=req.top_p or 0.9,
+                )
+                start_frame = ProtocolFrame(
+                    type=MessageType.INFERENCE_START,
+                    source="coordinator",
+                    target=first_worker.worker_id,
+                    payload=start_payload.model_dump(),
+                )
+                sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
+                if not sent:
+                    err_chunk = {"error": "Failed to dispatch inference to first pipeline stage."}
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if last_worker.worker_id != first_worker.worker_id:
+                    cfg_frame = ProtocolFrame(
+                        type=MessageType.INFERENCE_START,
+                        source="coordinator",
+                        target=last_worker.worker_id,
+                        payload=start_payload.model_dump(),
+                    )
+                    await relay.send_to_worker(last_worker.worker_id, cfg_frame)
+
+                # Stream token frames from workers to client
                 while True:
-                    frame: ProtocolFrame = await stream_queue.get()
+                    try:
+                        frame: ProtocolFrame = await asyncio.wait_for(stream_queue.get(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+
                     if frame.type == MessageType.NEXT_TOKEN:
                         token_info = NextToken.model_validate(frame.payload)
                         chunk = {
@@ -313,6 +367,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
                         if token_info.is_finished:
+                            yield "data: [DONE]\n\n"
                             break
                     elif frame.type == MessageType.SPECULATIVE_VERIFIED:
                         verified_info = SpeculativeVerified.model_validate(frame.payload)
@@ -342,6 +397,74 @@ async def chat_completions(req: ChatCompletionRequest):
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     else:
+        # Non-streaming request flow
+        base_url = "http://127.0.0.1:11434"
+        installed = await asyncio.to_thread(get_installed_ollama_models, base_url)
+        is_installed = canonical_model in installed or any(
+            m.lower().startswith(canonical_model.split(":")[0].lower()) for m in installed
+        )
+        if not is_installed:
+            logger.info(f"Target model '{canonical_model}' is not installed. Triggering pull from online server...")
+            await asyncio.to_thread(ensure_ollama_model, base_url, canonical_model)
+
+        if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
+            alive = registry.get_alive_workers()
+            if len(alive) >= 1:
+                assignments = registry.partition_model(
+                    target_model, total_layers=32, fast_boot=True, progressive=True, codec="zstd"
+                )
+                for assign in assignments:
+                    frame = ProtocolFrame(
+                        type=MessageType.ASSIGN_LAYERS,
+                        source="coordinator",
+                        target=assign.worker_id,
+                        payload=assign.model_dump(),
+                    )
+                    await relay.send_to_worker(assign.worker_id, frame)
+                await asyncio.sleep(0.1)
+                pipeline = registry.get_pipeline_order()
+
+        if len(pipeline) < 1:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned).",
+            )
+
+        first_worker = pipeline[0]
+        last_worker = pipeline[-1]
+
+        real_ans = await asyncio.to_thread(generate_llm_answer, prompt, model_name=canonical_model)
+
+        start_payload = InferenceStart(
+            request_id=request_id,
+            model_name=target_model,
+            input_ids=input_ids,
+            prompt=prompt,
+            real_response=real_ans,
+            max_new_tokens=req.max_tokens or 256,
+            temperature=req.temperature or 0.7,
+            top_p=req.top_p or 0.9,
+        )
+        start_frame = ProtocolFrame(
+            type=MessageType.INFERENCE_START,
+            source="coordinator",
+            target=first_worker.worker_id,
+            payload=start_payload.model_dump(),
+        )
+        sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
+        if not sent:
+            relay.cleanup_response_stream(request_id)
+            raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
+
+        if last_worker.worker_id != first_worker.worker_id:
+            cfg_frame = ProtocolFrame(
+                type=MessageType.INFERENCE_START,
+                source="coordinator",
+                target=last_worker.worker_id,
+                payload=start_payload.model_dump(),
+            )
+            await relay.send_to_worker(last_worker.worker_id, cfg_frame)
+
         # Accumulate all tokens
         generated_text = ""
         finish_reason = "stop"

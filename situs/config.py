@@ -10,7 +10,7 @@ class CoordinatorConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     heartbeat_timeout_s: float = 45.0
-    default_model: str = "llama-3.1:8b-instruct-q8_0"
+    default_model: str = "gemma3:4b"
     relay_buffer_size: int = 64 * 1024 * 1024  # 64 MB
     enable_cors: bool = True
 
@@ -20,7 +20,7 @@ class WorkerConfig:
     coordinator_url: str = "ws://localhost:8000/ws/worker"
     worker_id: Optional[str] = None
     device: str = "cuda:0"  # or 'cpu'
-    model_name: str = "llama-3.1:8b-instruct-q8_0"
+    model_name: str = "gemma3:4b"
     vram_budget_gb: Optional[float] = None
     assigned_layer_start: Optional[int] = None
     assigned_layer_end: Optional[int] = None

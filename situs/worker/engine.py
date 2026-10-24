@@ -207,6 +207,10 @@ class StageExecutionEngine:
             payload_b64=b64_payload,
         )
 
+        if self.is_last_stage():
+            # Single worker: worker holds all stages, process activation directly to emit first token
+            return self.process_forward_activation(forward_act)
+
         return ProtocolFrame(
             type=MessageType.FORWARD_ACTIVATION,
             source=self.assignment.worker_id,
@@ -556,6 +560,10 @@ class StageExecutionEngine:
             scale=scale,
             payload_b64=b64_payload,
         )
+
+        if self.is_last_stage():
+            # Single worker: worker holds all stages, process activation directly
+            return self.process_forward_activation(forward_act)
 
         return ProtocolFrame(
             type=MessageType.FORWARD_ACTIVATION,

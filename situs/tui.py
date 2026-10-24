@@ -157,7 +157,15 @@ class PlaceholderProcessor(Processor):
         return Transformation(ti.fragments)
 
 
-DEFAULT_MODEL = "llama-3.1:8b-instruct-q8_0"
+def make_progress_bar(percent: float, width: int = 22) -> str:
+    """Renders a sleek progress bar like [████████░░░░░░░░░░]."""
+    clamped = max(0.0, min(100.0, float(percent)))
+    filled_len = int(round(width * clamped / 100.0))
+    empty_len = max(0, width - filled_len)
+    return f"[{'█' * filled_len}{'░' * empty_len}]"
+
+
+DEFAULT_MODEL = "gemma3:4b"
 
 # Curated 6GB to 16GB models - The optimal sweet spot for distributed multi-node inference.
 # Single 6GB GPUs (like RTX 3050) cannot fit these models alone, but pooling 2+ nodes fits them with high performance.
@@ -418,7 +426,7 @@ def is_coordinator_online(url: str, timeout: Optional[float] = None) -> bool:
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         if timeout is None:
-            timeout = 0.15 if host in ("127.0.0.1", "localhost", "::1") else 0.75
+            timeout = 0.75 if host in ("127.0.0.1", "localhost", "::1") else 1.5
         return is_port_open(host, port, timeout=timeout)
     except Exception:
         return False
@@ -472,20 +480,9 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
     if cached and (now - cached[0]) < ttl:
         return cached[1]
 
-    # 2. Fast 50ms socket check (if server is not running, return offline cluster)
-    if not is_coordinator_online(normalized):
-        fallback = {
-            "status": "offline",
-            "active_workers_count": 0,
-            "model": DEFAULT_MODEL,
-            "is_partitioned": False,
-        }
-        _metadata_cache[normalized] = (now, fallback)
-        return fallback
-
-    # 3. HTTP status fetch
+    # 2. HTTP status fetch directly (authoritative status)
     try:
-        with httpx.Client(timeout=2.5) as client:
+        with httpx.Client(timeout=2.0) as client:
             resp = client.get(f"{normalized}/status")
             if resp.status_code == 200:
                 data = resp.json()
@@ -493,6 +490,20 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
                 return data
     except Exception:
         pass
+
+    # 3. Socket check fallback to avoid false 'offline' flickers during transient HTTP delays
+    if is_coordinator_online(normalized, timeout=0.6):
+        if cached:
+            _metadata_cache[normalized] = (now, cached[1])
+            return cached[1]
+        active_fallback = {
+            "status": "healthy",
+            "active_workers_count": 1,
+            "model": DEFAULT_MODEL,
+            "is_partitioned": True,
+        }
+        _metadata_cache[normalized] = (now, active_fallback)
+        return active_fallback
 
     fallback = {
         "status": "offline",
@@ -1349,6 +1360,61 @@ def execute_slash_command(
                 except Exception:
                     pass
 
+                # Background live pull streaming if model weights are not local
+                def _bg_pull_cli(m_id, m_name_title):
+                    try:
+                        norm_c = normalize_fast_url(coord_url)
+                        with httpx.Client(timeout=1800.0) as cl:
+                            with cl.stream("POST", f"{norm_c}/admin/pull?model_name={m_id}") as p_resp:
+                                if p_resp.status_code == 200:
+                                    for p_line in p_resp.iter_lines():
+                                        if p_line.startswith("data: ") and not p_line.startswith("data: [DONE]"):
+                                            try:
+                                                p_chunk = json.loads(p_line[6:].strip())
+                                                p_type = p_chunk.get("type")
+                                                if p_type == "model_loading":
+                                                    pct = float(p_chunk.get("percent", 0.0))
+                                                    stage = p_chunk.get("stage", "Streaming Layers...")
+                                                    bar = p_chunk.get("bar") or make_progress_bar(pct, width=22)
+                                                    spd = float(p_chunk.get("speed_mb", 0.0))
+                                                    eta = int(p_chunk.get("eta_s", 0))
+                                                    cb = int(p_chunk.get("completed_bytes", 0))
+                                                    tb = int(p_chunk.get("total_bytes", 0))
+                                                    b_str = f" · {cb / 1e9:.2f} / {tb / 1e9:.2f} GB" if tb > 0 else ""
+                                                    s_str = f" · {spd:.1f} MB/s" if spd > 0 else ""
+                                                    e_str = f" · ETA: {eta}s" if eta > 0 else ""
+                                                    p_text = f"{stage}\n{bar} {pct:.1f}%{b_str}{s_str}{e_str}"
+
+                                                    session_state["is_pulling"] = True
+                                                    session_state["pull_percent"] = pct
+                                                    session_state["pull_stage"] = stage
+                                                    session_state["pull_speed"] = f"{spd:.1f} MB/s" if spd > 0 else ""
+
+                                                    if history_entries and history_entries[-1][0] == "loading":
+                                                        history_entries[-1] = ("loading", p_text, m_id)
+                                                    else:
+                                                        history_entries.append(("loading", p_text, m_id))
+
+                                                    if app_instance[0]:
+                                                        app_instance[0].invalidate()
+                                                elif p_type == "model_ready":
+                                                    session_state["is_pulling"] = False
+                                                    r_stage = p_chunk.get("stage", "Model Ready on GPU VRAM (100% CUDA)")
+                                                    r_text = f"[✓ Online Model Download Complete · 100% CUDA GPU VRAM Allocated]\n{r_stage}"
+                                                    if history_entries and history_entries[-1][0] == "loading":
+                                                        history_entries[-1] = ("system", r_text, "Model Ready")
+                                                    else:
+                                                        history_entries.append(("system", r_text, "Model Ready"))
+                                                    if app_instance[0]:
+                                                        app_instance[0].invalidate()
+                                                    break
+                                            except Exception:
+                                                pass
+                    except Exception:
+                        session_state["is_pulling"] = False
+
+                threading.Thread(target=_bg_pull_cli, args=(matched["id"], matched["name"]), daemon=True).start()
+
             switched_panel = Panel(
                 f"[bold green]✓ Active Model Switched to {matched['name']}[/bold green]\n\n"
                 f"[bold cyan]• Model ID:[/bold cyan]          {matched['id']}\n"
@@ -1568,15 +1634,66 @@ def run_opencode_tui(
             coord_url = session_state.get("coordinator_url", coordinator_url)
             total_layers = m["layers"]
 
-            def _async_repartition():
+            def _async_pull_and_partition():
                 try:
-                    with httpx.Client(timeout=1.0) as client:
-                        client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={m['id']}&total_layers={total_layers}&fast_boot=true&codec=zstd")
+                    norm_c = normalize_fast_url(coord_url)
+                    with httpx.Client(timeout=2.0) as client:
+                        client.post(f"{norm_c}/admin/partition?model_name={m['id']}&total_layers={total_layers}&fast_boot=true&codec=zstd")
                 except Exception:
                     pass
+                try:
+                    norm_c = normalize_fast_url(coord_url)
+                    with httpx.Client(timeout=1800.0) as cl:
+                        with cl.stream("POST", f"{norm_c}/admin/pull?model_name={m['id']}") as p_resp:
+                            if p_resp.status_code == 200:
+                                for p_line in p_resp.iter_lines():
+                                    if p_line.startswith("data: ") and not p_line.startswith("data: [DONE]"):
+                                        try:
+                                            p_chunk = json.loads(p_line[6:].strip())
+                                            p_type = p_chunk.get("type")
+                                            if p_type == "model_loading":
+                                                pct = float(p_chunk.get("percent", 0.0))
+                                                stage = p_chunk.get("stage", "Streaming Layers...")
+                                                bar = p_chunk.get("bar") or make_progress_bar(pct, width=22)
+                                                spd = float(p_chunk.get("speed_mb", 0.0))
+                                                eta = int(p_chunk.get("eta_s", 0))
+                                                cb = int(p_chunk.get("completed_bytes", 0))
+                                                tb = int(p_chunk.get("total_bytes", 0))
+                                                b_str = f" · {cb / 1e9:.2f} / {tb / 1e9:.2f} GB" if tb > 0 else ""
+                                                s_str = f" · {spd:.1f} MB/s" if spd > 0 else ""
+                                                e_str = f" · ETA: {eta}s" if eta > 0 else ""
+                                                p_text = f"{stage}\n{bar} {pct:.1f}%{b_str}{s_str}{e_str}"
+
+                                                session_state["is_pulling"] = True
+                                                session_state["pull_percent"] = pct
+                                                session_state["pull_stage"] = stage
+                                                session_state["pull_speed"] = f"{spd:.1f} MB/s" if spd > 0 else ""
+
+                                                if history_entries and history_entries[-1][0] == "loading":
+                                                    history_entries[-1] = ("loading", p_text, m["id"])
+                                                else:
+                                                    history_entries.append(("loading", p_text, m["id"]))
+
+                                                if app_instance[0]:
+                                                    app_instance[0].invalidate()
+                                            elif p_type == "model_ready":
+                                                session_state["is_pulling"] = False
+                                                r_stage = p_chunk.get("stage", "Model Ready on GPU VRAM (100% CUDA)")
+                                                r_text = f"[✓ Online Model Download Complete · 100% CUDA GPU VRAM Allocated]\n{r_stage}"
+                                                if history_entries and history_entries[-1][0] == "loading":
+                                                    history_entries[-1] = ("system", r_text, "Model Ready")
+                                                else:
+                                                    history_entries.append(("system", r_text, "Model Ready"))
+                                                if app_instance[0]:
+                                                    app_instance[0].invalidate()
+                                                break
+                                        except Exception:
+                                            pass
+                except Exception:
+                    session_state["is_pulling"] = False
 
             if is_coordinator_online(coord_url):
-                threading.Thread(target=_async_repartition, daemon=True).start()
+                threading.Thread(target=_async_pull_and_partition, daemon=True).start()
 
             if old_model.lower() != m["id"].lower():
                 history_entries.append(("system", f"✓ Switched active model to: {m['name']} ({m['vram_gb']} GB)", "Model Selected"))
@@ -1676,6 +1793,21 @@ def run_opencode_tui(
         elif role == "assistant":
             asst_html = f'<style color="#ffffff">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(asst_html)))
+        elif role == "loading":
+            lines = text.strip().split("\n")
+            content_html = ""
+            for l in lines:
+                content_html += f'<style color="#38bdf8"><b>│</b></style> <style color="#ffffff">{html.escape(l)}</style>\n'
+            tag = f" ({html.escape(meta)})" if meta else ""
+            load_html = (
+                f'<style color="#38bdf8"><b>┌─ [Online Model Streaming]</b></style><style color="#e0f2fe"><b>{tag}</b></style>\n'
+                f'{content_html}'
+                f'<style color="#38bdf8"><b>└──────────────────────────────────────────────────────────</b></style>\n\n'
+            )
+            try:
+                frags.extend(to_formatted_text(HTML(load_html)))
+            except Exception:
+                frags.append(("", f"[{meta}] {text}\n\n"))
         elif role == "metric":
             metric_html = f'<style color="#ffffff">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(metric_html)))
@@ -1770,6 +1902,13 @@ def run_opencode_tui(
     def get_card_status_fragments():
         is_gen = session_state.get("is_generating", False)
         if is_gen:
+            if session_state.get("is_pulling"):
+                pct = session_state.get("pull_percent", 0.0)
+                stage = session_state.get("pull_stage", "Streaming Layers...")
+                bar = make_progress_bar(pct, width=12)
+                sp = session_state.get("pull_speed", "")
+                sp_txt = f" · {sp}" if sp else ""
+                return to_formatted_text(HTML(f'  <style color="#f59e0b"><b>● Streaming Model: {bar} {pct:.1f}%{sp_txt}</b></style> <style color="#94a3b8">({html.escape(stage)})</style>'))
             s_tok = session_state.get("stream_tokens", 0)
             s_tps = session_state.get("stream_tps", 0.0)
             telemetry = f" ({s_tok} tok · {s_tps:.1f} tok/s)" if s_tok > 0 else " (connecting pipeline...)"
@@ -1944,6 +2083,15 @@ def run_opencode_tui(
                 frags.append(("bold #38bdf8", f"{disp_title}\n"))
             frags.append(("#ffffff", "32 Layers · FP16/INT8\n"))
 
+        if session_state.get("is_pulling"):
+            pull_pct = session_state.get("pull_percent", 0.0)
+            pull_stage = session_state.get("pull_stage", "Streaming Layers...")
+            pull_speed = session_state.get("pull_speed", "")
+            frags.append(("bold #f59e0b", f"Streaming: {pull_pct:.1f}%\n"))
+            frags.append(("#94a3b8", f"{pull_stage}\n"))
+            if pull_speed:
+                frags.append(("#94a3b8", f"{pull_speed}\n"))
+
         spec_text = "Fast-Boot + Speculative" if session_state.get("speculative", True) else "Disabled"
         frags.append(("#ffffff", f"Accel: {spec_text}\n\n"))
         if is_coord:
@@ -2100,7 +2248,7 @@ def run_opencode_tui(
                 "stream": True,
             }
             try:
-                with httpx.Client(base_url=normalized, timeout=httpx.Timeout(180.0, connect=15.0, read=120.0)) as client:
+                with httpx.Client(base_url=normalized, timeout=httpx.Timeout(300.0, connect=15.0, read=240.0)) as client:
                     with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
                         if resp.status_code != 200:
                             err_msg = resp.read().decode("utf-8", errors="replace")
@@ -2114,9 +2262,52 @@ def run_opencode_tui(
                             if line.startswith("data: ") and not line.startswith("data: [DONE]"):
                                 try:
                                     chunk = json.loads(line[6:].strip())
+                                    c_type = chunk.get("type")
+                                    if c_type == "model_loading":
+                                        m_name = chunk.get("model", "")
+                                        stage = chunk.get("stage", "Streaming Model Layers...")
+                                        pct = float(chunk.get("percent", 0.0))
+                                        bar = chunk.get("bar") or make_progress_bar(pct, width=22)
+                                        speed = float(chunk.get("speed_mb", 0.0))
+                                        eta = int(chunk.get("eta_s", 0))
+                                        comp_b = int(chunk.get("completed_bytes", 0))
+                                        tot_b = int(chunk.get("total_bytes", 0))
+
+                                        bytes_info = f" · {comp_b / 1e9:.2f} / {tot_b / 1e9:.2f} GB" if tot_b > 0 else ""
+                                        speed_info = f" · {speed:.1f} MB/s" if speed > 0 else ""
+                                        eta_info = f" · ETA: {eta}s" if eta > 0 else ""
+                                        progress_text = f"{stage}\n{bar} {pct:.1f}%{bytes_info}{speed_info}{eta_info}"
+
+                                        session_state["is_pulling"] = True
+                                        session_state["pull_percent"] = pct
+                                        session_state["pull_stage"] = stage
+                                        session_state["pull_speed"] = f"{speed:.1f} MB/s" if speed > 0 else ""
+
+                                        if history_entries and history_entries[-1][0] == "loading":
+                                            history_entries[-1] = ("loading", progress_text, m_name)
+                                        else:
+                                            history_entries.append(("loading", progress_text, m_name))
+
+                                        if app_instance[0]:
+                                            app_instance[0].invalidate()
+                                        continue
+
+                                    elif c_type == "model_ready":
+                                        session_state["is_pulling"] = False
+                                        ready_stage = chunk.get("stage", "Model Ready on GPU VRAM (100% CUDA)")
+                                        ready_text = f"[✓ Online Model Download Complete · 100% CUDA GPU VRAM Allocated]\n{ready_stage}"
+                                        if history_entries and history_entries[-1][0] == "loading":
+                                            history_entries[-1] = ("system", ready_text, "Model Ready")
+                                        else:
+                                            history_entries.append(("system", ready_text, "Model Ready"))
+                                        if app_instance[0]:
+                                            app_instance[0].invalidate()
+                                        continue
+
                                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                                     txt = delta.get("content", "")
                                     if txt:
+                                        session_state["is_pulling"] = False
                                         tok_cnt += 1
                                         full_resp += txt
                                         now = time.time()

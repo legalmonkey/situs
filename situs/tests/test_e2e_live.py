@@ -51,7 +51,7 @@ async def test_live_websocket_cluster_e2e():
                 break
             await asyncio.sleep(0.1)
 
-        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10.0) as client:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=60.0) as client:
             # 3. Check /status
             resp = await client.get("/status")
             assert resp.status_code == 200

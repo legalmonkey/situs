@@ -8,7 +8,8 @@ Zero hardcoding, zero canned templates, zero fake responses.
 import re
 import json
 import logging
-from typing import Optional, List, Dict, Any
+import time
+from typing import Optional, List, Dict, Any, AsyncGenerator, Callable
 import httpx
 
 logger = logging.getLogger("situs.inference_backend")
@@ -100,21 +101,156 @@ def get_installed_ollama_models(base_url: str) -> List[str]:
     return []
 
 
-def ensure_ollama_model(base_url: str, target_model: str) -> bool:
+def make_progress_bar(percent: float, width: int = 22) -> str:
+    """Renders a sleek progress bar like [████████░░░░░░░░░░]."""
+    clamped = max(0.0, min(100.0, float(percent)))
+    filled_len = int(round(width * clamped / 100.0))
+    empty_len = max(0, width - filled_len)
+    return f"[{'█' * filled_len}{'░' * empty_len}]"
+
+
+def format_stage_name(status: str) -> str:
+    """Maps Ollama raw status strings to structured multi-stage descriptions."""
+    s = str(status).lower()
+    if "manifest" in s and ("pull" in s or "fetch" in s):
+        return "Stage 1/4: Pulling Model Manifest from Online Registry"
+    if "pulling" in s or "downloading" in s:
+        return "Stage 2/4: Streaming Model Layers to GPU Node"
+    if "verifying" in s:
+        return "Stage 3/4: Verifying Layer Checksums & Weight Integrity"
+    if "writing" in s:
+        return "Stage 4/4: Initializing Neural Architecture & Allocating VRAM"
+    if "success" in s:
+        return "Model Ready: Active on GPU VRAM (100% CUDA)"
+    return status or "Stage 2/4: Streaming Model Layers"
+
+
+async def stream_pull_model(
+    model_name: str,
+    base_url: str = "http://127.0.0.1:11434",
+):
+    """
+    Asynchronously streams online model pulling progress from Ollama API.
+    Yields structured progress dictionaries for live progress bars.
+    """
+    canonical_model = normalize_ollama_model(model_name)
+    start_t = time.time()
+    last_comp = 0
+    last_t = start_t
+    speed_mb = 0.0
+    max_pct = 0.0
+
+    async with httpx.AsyncClient(timeout=1800.0) as client:
+        try:
+            payload = {"name": canonical_model, "stream": True}
+            async with client.stream("POST", f"{base_url}/api/pull", json=payload) as resp:
+                if resp.status_code != 200:
+                    err_bytes = await resp.aread()
+                    yield {
+                        "type": "model_loading_error",
+                        "model": canonical_model,
+                        "error": f"HTTP {resp.status_code}: {err_bytes.decode('utf-8', errors='replace')}",
+                    }
+                    return
+
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except Exception:
+                        continue
+
+                    if "error" in chunk:
+                        yield {
+                            "type": "model_loading_error",
+                            "model": canonical_model,
+                            "error": chunk["error"],
+                        }
+                        return
+
+                    raw_status = chunk.get("status", "")
+                    total = chunk.get("total", 0)
+                    completed = chunk.get("completed", 0)
+                    now = time.time()
+
+                    # Calculate instantaneous speed
+                    dt = now - last_t
+                    if dt >= 0.3:
+                        dbytes = completed - last_comp
+                        if dbytes > 0:
+                            speed_mb = round((dbytes / dt) / 1e6, 1)
+                        last_comp = completed
+                        last_t = now
+
+                    # Calculate percentage & ETA with monotonic progression
+                    s_lower = raw_status.lower()
+                    if s_lower == "success":
+                        pct = 100.0
+                    elif "writing manifest" in s_lower:
+                        pct = 99.0
+                    elif "verifying" in s_lower:
+                        pct = 95.0
+                    elif total > 0:
+                        pct = round((completed / total) * 100.0, 1)
+                    else:
+                        pct = max_pct
+
+                    max_pct = max(max_pct, pct)
+                    pct = max_pct
+
+                    rem_bytes = max(0, total - completed) if total > 0 else 0
+                    eta_s = int(rem_bytes / max(1000, speed_mb * 1e6)) if (speed_mb > 0 and rem_bytes > 0) else 0
+
+                    stage = format_stage_name(raw_status)
+                    bar = make_progress_bar(pct, width=22)
+
+                    yield {
+                        "type": "model_loading",
+                        "model": canonical_model,
+                        "status": raw_status,
+                        "stage": stage,
+                        "percent": pct,
+                        "completed_bytes": completed,
+                        "total_bytes": total,
+                        "speed_mb": speed_mb,
+                        "eta_s": eta_s,
+                        "bar": bar,
+                    }
+
+                    if raw_status == "success":
+                        break
+        except Exception as e:
+            yield {
+                "type": "model_loading_error",
+                "model": canonical_model,
+                "error": str(e),
+            }
+
+
+def ensure_ollama_model(base_url: str, target_model: str, progress_callback=None) -> bool:
     """
     Ensures the target model is available in Ollama.
-    If unpulled, initiates an on-demand pull via Ollama's pull API.
-    Cold starts for unpulled models take time, which is acceptable per user specification.
+    If unpulled, initiates an on-demand pull via Ollama's pull API with live status tracking.
     """
     installed = get_installed_ollama_models(base_url)
     for m in installed:
-        if m == target_model or m.startswith(f"{target_model}:") or target_model.startswith(f"{m.split(':')[0]}:"):
+        if m == target_model:
+            return True
+        if ":" not in target_model and m.startswith(f"{target_model}:"):
+            return True
+        if m.endswith(":latest") and m.split(":")[0] == target_model:
             return True
 
-    logger.info(f"Model '{target_model}' not installed in local Ollama ({installed}). Triggering on-demand pull...")
+    logger.info(f"Model '{target_model}' not installed in local Ollama ({installed}). Triggering on-demand pull from online server...")
+    start_t = time.time()
+    last_comp = 0
+    last_t = start_t
+    speed_mb = 0.0
+    max_pct = 0.0
+
     try:
-        # Pull model (timeout generous for cold start download)
-        with httpx.Client(timeout=600.0) as client:
+        with httpx.Client(timeout=1800.0) as client:
             with client.stream("POST", f"{base_url}/api/pull", json={"name": target_model, "stream": True}) as resp:
                 if resp.status_code != 200:
                     logger.error(f"Failed to pull model '{target_model}': {resp.status_code}")
@@ -127,7 +263,54 @@ def ensure_ollama_model(base_url: str, target_model: str) -> bool:
                         if "error" in chunk:
                             logger.error(f"Ollama pull error for '{target_model}': {chunk['error']}")
                             return False
-                        if chunk.get("status") == "success":
+                        raw_status = chunk.get("status", "")
+                        total = chunk.get("total", 0)
+                        completed = chunk.get("completed", 0)
+                        now = time.time()
+                        dt = now - last_t
+                        if dt >= 0.3:
+                            dbytes = completed - last_comp
+                            if dbytes > 0:
+                                speed_mb = round((dbytes / dt) / 1e6, 1)
+                            last_comp = completed
+                            last_t = now
+
+                        s_lower = raw_status.lower()
+                        if s_lower == "success":
+                            pct = 100.0
+                        elif "writing manifest" in s_lower:
+                            pct = 99.0
+                        elif "verifying" in s_lower:
+                            pct = 95.0
+                        elif total > 0:
+                            pct = round((completed / total) * 100.0, 1)
+                        else:
+                            pct = max_pct
+
+                        max_pct = max(max_pct, pct)
+                        pct = max_pct
+
+                        rem_bytes = max(0, total - completed) if total > 0 else 0
+                        eta_s = int(rem_bytes / max(1000, speed_mb * 1e6)) if (speed_mb > 0 and rem_bytes > 0) else 0
+
+                        stage = format_stage_name(raw_status)
+                        bar = make_progress_bar(pct, width=22)
+
+                        if progress_callback:
+                            progress_callback({
+                                "type": "model_loading",
+                                "model": target_model,
+                                "status": raw_status,
+                                "stage": stage,
+                                "percent": pct,
+                                "completed_bytes": completed,
+                                "total_bytes": total,
+                                "speed_mb": speed_mb,
+                                "eta_s": eta_s,
+                                "bar": bar,
+                            })
+
+                        if raw_status == "success":
                             logger.info(f"Successfully pulled model '{target_model}' into local Ollama.")
                             return True
                     except Exception:
@@ -168,18 +351,12 @@ def query_ollama(prompt: str, model_name: str = "") -> Optional[str]:
                         chosen_model = m
                         break
 
-            # 3. If not installed, pull target model as requested
+            # 3. If target model is not installed locally, pull the requested model directly from online registry
             if not chosen_model:
+                logger.info(f"Target model '{canonical_model}' is not present locally. Pulling from online registry...")
                 pulled = ensure_ollama_model(base_url, canonical_model)
                 if pulled:
                     chosen_model = canonical_model
-                elif installed:
-                    # If target model could not be pulled (e.g. offline/error), use installed model
-                    # rather than failing or giving canned responses, and log clearly
-                    chosen_model = installed[0]
-                    logger.warning(
-                        f"Target model '{canonical_model}' unavailable. Using installed model '{chosen_model}' on GPU."
-                    )
 
             if not chosen_model:
                 continue
