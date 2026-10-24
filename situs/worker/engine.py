@@ -58,20 +58,7 @@ class StageExecutionEngine:
         self.finished_sessions: set = set()
 
     def init_fast_boot_sequence(self, request_id: str, prompt_text: Optional[str] = "", model_name: str = ""):
-        """Initializes a coherent conversational response sequence for fast-boot mode."""
-        cfg = self.session_configs.get(request_id)
-        resp = getattr(cfg, "real_response", None) if cfg else None
-        if not resp:
-            try:
-                from situs.inference_backend import generate_llm_answer
-                resp = generate_llm_answer(prompt_text or "", model_name=model_name)
-            except Exception as e:
-                logger.debug(f"Inference backend invocation: {e}")
-                resp = None
-
-        if not resp:
-            resp = f"[Situs Worker Engine: Unable to generate neural response from model '{model_name}'. Check Ollama and GPU.]"
-
+        """Ensures tokenizer is loaded for the session. Token generation is strictly neural from model logits."""
         tok = self.sampler.tokenizer
         if not tok:
             try:
@@ -80,16 +67,6 @@ class StageExecutionEngine:
                 self.sampler.tokenizer = tok
             except Exception:
                 pass
-
-        if tok:
-            try:
-                tokens = tok.encode(resp)
-                if tokens:
-                    self.session_fast_boot_sequences[request_id] = tokens
-                    return
-            except Exception:
-                pass
-        self.session_fast_boot_sequences[request_id] = [ord(c) for c in resp]
 
     def is_first_stage(self) -> bool:
         return self.assignment.is_first_stage
@@ -146,12 +123,15 @@ class StageExecutionEngine:
                     save_layer_to_cache(chunk.model_name, layer_idx, reassembled)
                 except Exception as cache_err:
                     logger.debug(f"Cache write skipped for layer {layer_idx}: {cache_err}")
-            except Exception as e:
-                logger.error(f"Failed to reassemble layer {layer_idx}: {e}")
-                reassembled = None
 
-            # Mark layer operational in DistributedStageModel (triggers hot-swap if fast_boot_active)
-            self.stage_model.mark_layer_ready(layer_idx, weights=reassembled)
+                # Deserialize, map architecture, validate tensors, and install into model layer:
+                self.stage_model.mark_layer_ready(layer_idx, weights=reassembled)
+                status = "ready"
+            except Exception as e:
+                logger.error(f"Failed to validate and install layer {layer_idx}: {e}")
+                reassembled = None
+                status = "error"
+
             del self.layer_chunk_buffers[layer_idx]
 
             total_assigned = self.assignment.layer_end - self.assignment.layer_start
@@ -159,7 +139,7 @@ class StageExecutionEngine:
                 worker_id=self.assignment.worker_id,
                 model_name=chunk.model_name,
                 layer_index=layer_idx,
-                status="ready",
+                status=status,
                 ready_layer_count=self.stage_model.get_ready_count(),
                 total_assigned=total_assigned,
                 is_fast_boot_active=self.stage_model.fast_boot_active,
@@ -270,29 +250,28 @@ class StageExecutionEngine:
             stop_token_ids = cfg.stop_token_ids if cfg else []
             step_idx = act_frame.step_index
 
-            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or getattr(self.stage_model, "fast_boot", False)
-            if is_fast_boot:
-                seq = self.session_fast_boot_sequences.get(request_id)
-                if seq is None:
-                    prompt_txt = getattr(cfg, "prompt", "hello") if cfg else "hello"
-                    if not prompt_txt:
-                        prompt_txt = "hello"
-                    m_name = getattr(cfg, "model_name", self.assignment.model_name) if cfg else self.assignment.model_name
-                    self.init_fast_boot_sequence(request_id, prompt_txt, m_name)
-                    seq = self.session_fast_boot_sequences.get(request_id, [])
-
-                if step_idx < len(seq):
-                    token_id = seq[step_idx]
-                    token_text = self.sampler.decode_token(token_id)
-                    is_eos = (step_idx >= len(seq) - 1)
+            if HAS_TORCH and isinstance(out, torch.Tensor):
+                if out.dim() == 3:
+                    last_logits = out[0, -1, :]
+                elif out.dim() == 2:
+                    last_logits = out[-1, :]
                 else:
-                    token_id = 0
-                    token_text = ""
-                    is_eos = True
+                    last_logits = out
             else:
-                token_id = self.sampler.sample_next_token(out, temperature=temperature, top_p=top_p)
-                token_text = self.sampler.decode_token(token_id)
-                is_eos = (token_id in stop_token_ids) if stop_token_ids else False
+                last_logits = out
+
+            token_id = self.sampler.sample_next_token(last_logits, temperature=temperature, top_p=top_p)
+            token_text = self.sampler.decode_token(token_id)
+            eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
+            if stop_token_ids:
+                is_eos = token_id in stop_token_ids
+            elif eos_id is not None:
+                is_eos = (token_id == eos_id)
+            else:
+                is_eos = False
+
+            if not is_eos and token_text:
+                is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 
             is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
             finish_reason = "stop" if is_eos else ("length" if is_finished else None)
@@ -365,54 +344,39 @@ class StageExecutionEngine:
         logits = out
         cfg = self.session_configs.get(request_id)
         temp = cfg.temperature if cfg else 0.7
+        logits = out
+        cfg = self.session_configs.get(request_id)
+        temp = cfg.temperature if cfg else 0.7
         top_p = cfg.top_p if cfg else 0.9
         max_tokens = cfg.max_new_tokens if cfg else 256
-        is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or getattr(self.stage_model, "fast_boot", False)
 
-        if is_fast_boot:
-            seq = self.session_fast_boot_sequences.get(request_id)
-            if seq is None:
-                prompt_txt = getattr(cfg, "prompt", "hello") if cfg else "hello"
-                m_name = getattr(cfg, "model_name", self.assignment.model_name) if cfg else self.assignment.model_name
-                self.init_fast_boot_sequence(request_id, prompt_txt, m_name)
-                seq = self.session_fast_boot_sequences.get(request_id, [])
+        accepted_tokens, correction = self.verifier.verify_candidates(
+            cand_frame.candidate_tokens,
+            logits,
+            temperature=temp,
+            top_p=top_p,
+        )
+        if correction is not None:
+            accepted_tokens.append(correction)
+        elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
+            target_logits = logits[0, -1, :] if logits.dim() == 3 else (logits[-1, :] if logits.dim() == 2 else logits)
+            sampled_tok = self.sampler.sample_next_token(target_logits, temperature=temp, top_p=top_p)
+            accepted_tokens.append(sampled_tok)
 
-            step_idx = cand_frame.step_index
-            accepted_tokens = []
-            correction = None
-            for idx, cand_tok in enumerate(cand_frame.candidate_tokens):
-                expected_idx = step_idx + idx
-                if expected_idx < len(seq):
-                    if cand_tok == seq[expected_idx]:
-                        accepted_tokens.append(cand_tok)
-                    else:
-                        correction = seq[expected_idx]
-                        break
-                else:
-                    break
-
-            if correction is not None:
-                accepted_tokens.append(correction)
-            elif not accepted_tokens and step_idx < len(seq):
-                accepted_tokens.append(seq[step_idx])
-
-            new_step_idx = cand_frame.step_index + len(accepted_tokens)
-            is_eos = (new_step_idx >= len(seq)) if seq else False
-        else:
-            accepted_tokens, correction = self.verifier.verify_candidates(
-                cand_frame.candidate_tokens,
-                logits,
-                temperature=temp,
-                top_p=top_p,
-            )
-            if correction is not None:
-                accepted_tokens.append(correction)
-            elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
-                sampled_tok = self.sampler.sample_next_token(logits[0, 0, :], temperature=temp, top_p=top_p)
-                accepted_tokens.append(sampled_tok)
-
-            new_step_idx = cand_frame.step_index + len(accepted_tokens)
-            is_eos = False
+        new_step_idx = cand_frame.step_index + len(accepted_tokens)
+        eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
+        stop_token_ids = cfg.stop_token_ids if cfg else []
+        is_eos = False
+        if accepted_tokens:
+            last_tok = accepted_tokens[-1]
+            if stop_token_ids:
+                is_eos = last_tok in stop_token_ids
+            elif eos_id is not None:
+                is_eos = (last_tok == eos_id)
+            if not is_eos:
+                last_txt = self.sampler.decode_token(last_tok)
+                if last_txt:
+                    is_eos = last_txt.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 
         accepted_texts = [self.sampler.decode_token(t) for t in accepted_tokens]
         is_finished = is_eos or (new_step_idx >= max_tokens)
@@ -571,3 +535,11 @@ class StageExecutionEngine:
             target=self.assignment.next_worker_id,
             payload=forward_act.model_dump(),
         )
+
+    def abort_inference(self, request_id: str):
+        """Cancels an active session and cleans up session KV cache and history."""
+        self.session_kv_caches.pop(request_id, None)
+        self.session_configs.pop(request_id, None)
+        self.session_token_histories.pop(request_id, None)
+        self.finished_sessions.add(request_id)
+        logger.info(f"Aborted session {request_id} and cleared session state.")

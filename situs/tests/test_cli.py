@@ -274,9 +274,14 @@ def test_hardware_detection_and_safe_join():
     assert hw_auto.device_name != ""
     assert hw_auto.status_message != ""
     if hw_auto.physical_gpu_detected:
-        assert hw_auto.gpu_available is True
-        assert hw_auto.memory_type == "VRAM"
-        assert hw_auto.total_memory_gb <= 12.0  # Real GPU VRAM, not host RAM!
+        if hw_auto.cuda_runtime_working:
+            assert hw_auto.gpu_available is True
+            assert hw_auto.memory_type == "VRAM"
+            assert hw_auto.total_memory_gb <= 12.0
+        else:
+            assert hw_auto.gpu_available is False
+            assert hw_auto.device == "cpu"
+            assert "unavailable" in hw_auto.status_message.lower()
 
     # 3. Test DistributedStageModel safe fallback: requesting cuda:0 on cpu-only torch should not crash
     stage = load_hf_stage_model(

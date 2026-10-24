@@ -69,6 +69,40 @@ def save_layer_to_cache(
     return path
 
 
+def generate_mock_layer_bytes(
+    layer_idx: int = 0,
+    model_name: str = "llama-3.1:8b-instruct-q8_0",
+    hidden_dim: Optional[int] = None,
+    intermediate_size: Optional[int] = None,
+    num_heads: Optional[int] = None,
+    num_kv_heads: Optional[int] = None,
+    use_safetensors: bool = True,
+) -> bytes:
+    """Convenience helper to generate serialized layer weights (safetensors or PyTorch)."""
+    if hidden_dim is not None:
+        from situs.worker.loader import RealTransformerBlock
+        block = RealTransformerBlock(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads or 4,
+            num_kv_heads=num_kv_heads or 2,
+            intermediate_size=intermediate_size or (hidden_dim * 4),
+            layer_idx=layer_idx,
+        )
+        state = {k: v.cpu() for k, v in block.state_dict().items()}
+        if use_safetensors:
+            try:
+                import safetensors.torch
+                return safetensors.torch.save(state)
+            except Exception:
+                pass
+        import io
+        buf = io.BytesIO()
+        torch.save(state, buf)
+        return buf.getvalue()
+    streamer = ProgressiveLayerStreamer(model_name=model_name)
+    return streamer.generate_mock_layer_bytes(layer_idx)
+
+
 def load_layer_from_cache(
     model_name: str, layer_index: int, cache_dir: Optional[pathlib.Path] = None
 ) -> Optional[bytes]:
@@ -101,12 +135,11 @@ class ProgressiveJITStreamer:
 
     def generate_mock_layer_bytes(self, layer_index: int, size_bytes: int = 128 * 1024) -> bytes:
         """
-        Generates deterministic pseudo-random weight bytes for mock layers when
-        downloading real multi-gigabyte safetensors is unnecessary (e.g. testing/mocking).
+        Generates deterministic wire layer bytes for testing and simulated progressive streaming.
+        Produces exactly size_bytes matching chunking test expectations.
         """
         seed = f"{self.model_name}_layer_{layer_index}".encode("utf-8")
         h = hashlib.sha256(seed).digest()
-        # Repeat hash pattern to match target size
         repeats = (size_bytes // len(h)) + 1
         return (h * repeats)[:size_bytes]
 

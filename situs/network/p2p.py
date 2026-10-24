@@ -45,31 +45,34 @@ class P2PDataChannelNode:
             logger.warning("aiortc not installed; P2P direct data channels disabled, using WebSocket relay.")
             return
 
-        config = RTCConfiguration(iceServers=[RTCIceServer(urls=DEFAULT_STUN_SERVERS)])
-        self.pc = RTCPeerConnection(configuration=config)
+        try:
+            config = RTCConfiguration(iceServers=[RTCIceServer(urls=DEFAULT_STUN_SERVERS)])
+            self.pc = RTCPeerConnection(configuration=config)
 
-        if is_initiator:
-            # Worker A initiates the DataChannel
-            self.channel = self.pc.createDataChannel("situs-tensors", ordered=True)
-            self._setup_channel(self.channel)
+            if is_initiator:
+                # Worker A initiates the DataChannel
+                self.channel = self.pc.createDataChannel("situs-tensors", ordered=True)
+                self._setup_channel(self.channel)
 
-            offer = await self.pc.createOffer()
-            await self.pc.setLocalDescription(offer)
-            # Send offer through Coordinator WebSocket signaling
-            await self.signaling_send_fn({
-                "type": "ice_offer",
-                "source_worker": self.worker_id,
-                "target_worker": self.target_worker_id,
-                "sdp": self.pc.localDescription.sdp,
-            })
-            logger.info(f"Worker {self.worker_id} sent WebRTC P2P offer to {self.target_worker_id}")
-        else:
-            # Worker B awaits incoming DataChannel
-            @self.pc.on("datachannel")
-            def on_datachannel(channel):
-                logger.info(f"Worker {self.worker_id} received incoming P2P DataChannel from {self.target_worker_id}")
-                self.channel = channel
-                self._setup_channel(channel)
+                offer = await self.pc.createOffer()
+                await self.pc.setLocalDescription(offer)
+                # Send offer through Coordinator WebSocket signaling
+                await self.signaling_send_fn({
+                    "type": "ice_offer",
+                    "source_worker": self.worker_id,
+                    "target_worker": self.target_worker_id,
+                    "sdp": self.pc.localDescription.sdp,
+                })
+                logger.info(f"Worker {self.worker_id} sent WebRTC P2P offer to {self.target_worker_id}")
+            else:
+                # Worker B awaits incoming DataChannel
+                @self.pc.on("datachannel")
+                def on_datachannel(channel):
+                    logger.info(f"Worker {self.worker_id} received incoming P2P DataChannel from {self.target_worker_id}")
+                    self.channel = channel
+                    self._setup_channel(channel)
+        except Exception as e:
+            logger.warning(f"Failed to initialize P2P direct channel to {self.target_worker_id}: {e}")
 
     def _setup_channel(self, channel):
         @channel.on("open")

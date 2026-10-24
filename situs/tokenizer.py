@@ -7,7 +7,7 @@ Guarantees consistent token encoding and decoding, preventing gibberish Unicode 
 import os
 import sys
 import logging
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 
 logger = logging.getLogger("situs.tokenizer")
 
@@ -57,8 +57,11 @@ class EnglishFallbackTokenizer:
                 tokens.append(self.vocab[w])
             else:
                 for ch in full_w:
-                    tokens.append(self.vocab.get(ch, ord(ch) % 256))
-        return tokens or [ord(c) % 256 for c in text]
+                    if ch in self.vocab:
+                        tokens.append(self.vocab[ch])
+                    else:
+                        raise ValueError(f"Character {repr(ch)} not in fallback vocabulary")
+        return tokens
 
     def decode(self, token_ids: List[int], skip_special_tokens: bool = False) -> str:
         parts = []
@@ -78,53 +81,99 @@ class EnglishFallbackTokenizer:
         return "".join(parts)
 
 
-_cached_tokenizer: Optional[Any] = None
+_tokenizers_cache: Dict[str, Any] = {}
 
 
-def get_or_load_tokenizer(model_name: Optional[str] = None) -> Any:
+def get_or_load_tokenizer(model_name: Optional[str] = None, allow_fallback: bool = False) -> Any:
     """
-    Retrieves or initializes a real HuggingFace tokenizer with caching.
+    Retrieves or initializes a real HuggingFace tokenizer with caching per model.
     Checks local snapshot directories first for instant offline loading.
+    Raises RuntimeError or returns None if the tokenizer cannot be loaded and allow_fallback is False.
     """
-    global _cached_tokenizer
-    if _cached_tokenizer is not None:
-        return _cached_tokenizer
+    cache_key = (model_name or "default").lower().strip()
+    if cache_key in _tokenizers_cache:
+        return _tokenizers_cache[cache_key]
 
-    candidates = [
-        # Check local Qwen snapshot in user cache
-        os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"),
-        # Check local GPT2
+    candidates: List[str] = []
+
+    if model_name:
+        clean_name = model_name.split(":")[0].lower()
+        if "qwen" in clean_name:
+            candidates.extend([
+                os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"),
+                "Qwen/Qwen2.5-7B-Instruct",
+                "Qwen/Qwen2.5-3B-Instruct",
+            ])
+        elif "gemma" in clean_name:
+            candidates.extend([
+                "google/gemma-2-9b-it",
+                "google/gemma-7b",
+                "google/gemma-2b",
+            ])
+        elif "llama" in clean_name:
+            candidates.extend([
+                "meta-llama/Llama-3.1-8B-Instruct",
+                "meta-llama/Llama-3.2-3B-Instruct",
+            ])
+        elif "deepseek" in clean_name:
+            candidates.extend([
+                "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+            ])
+        elif "mistral" in clean_name:
+            candidates.extend([
+                "mistralai/Mistral-7B-Instruct-v0.3",
+            ])
+
+    # Universal local fallbacks
+    candidates.extend([
+        os.path.expanduser("~/.cache/huggingface/hub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e"),
         "gpt2",
-    ]
+    ])
 
     if HAS_TRANSFORMERS and AutoTokenizer is not None:
-        if model_name:
-            clean_name = model_name.split(":")[0].lower()
-            if "qwen" in clean_name:
-                candidates.insert(0, "Qwen/Qwen2.5-7B-Instruct")
-            elif "llama" in clean_name:
-                candidates.insert(0, "meta-llama/Llama-3.1-8B-Instruct")
-            elif "deepseek" in clean_name:
-                candidates.insert(0, "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-
+        # 1. Fast path: check known local directories / snapshots first
         for cand in candidates:
             if os.path.exists(cand):
                 try:
                     tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                     if tok is not None:
-                        _cached_tokenizer = tok
-                        logger.info(f"Loaded tokenizer from {cand}")
+                        _tokenizers_cache[cache_key] = tok
+                        logger.info(f"Loaded local tokenizer for '{model_name}' from {cand}")
                         return tok
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed loading local directory tokenizer from {cand}: {e}")
 
-        try:
-            tok = AutoTokenizer.from_pretrained("gpt2", local_files_only=True)
-            if tok is not None:
-                _cached_tokenizer = tok
-                return tok
-        except Exception:
-            pass
+        # 2. Universal local fallback snapshot (GPT-2 cache)
+        gpt2_snap = os.path.expanduser("~/.cache/huggingface/hub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e")
+        if os.path.exists(gpt2_snap):
+            try:
+                tok = AutoTokenizer.from_pretrained(gpt2_snap, local_files_only=True)
+                if tok is not None:
+                    _tokenizers_cache[cache_key] = tok
+                    logger.info(f"Loaded fallback GPT-2 tokenizer for '{model_name}'")
+                    return tok
+            except Exception:
+                pass
 
-    _cached_tokenizer = EnglishFallbackTokenizer()
-    return _cached_tokenizer
+        # 3. Try AutoTokenizer on model name ONLY if a hub directory exists for it
+        hub_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        for cand in candidates:
+            if not os.path.exists(cand):
+                repo_dir = os.path.join(hub_dir, f"models--{cand.replace('/', '--')}")
+                if os.path.exists(repo_dir):
+                    try:
+                        tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
+                        if tok is not None:
+                            _tokenizers_cache[cache_key] = tok
+                            logger.info(f"Loaded cached tokenizer for '{model_name}' from {cand}")
+                            return tok
+                    except Exception:
+                        pass
+
+    if allow_fallback:
+        fb = EnglishFallbackTokenizer()
+        _tokenizers_cache[cache_key] = fb
+        logger.info(f"Using EnglishFallbackTokenizer for '{model_name}'")
+        return fb
+
+    return None

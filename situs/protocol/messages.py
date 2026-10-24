@@ -164,6 +164,11 @@ class StageLayerAck(BaseModel):
     is_fast_boot_active: bool = False
 
 
+class InferenceAbort(BaseModel):
+    request_id: str
+    reason: str = "Client disconnected or timed out"
+
+
 class ProtocolFrame(BaseModel):
     type: MessageType
     source: str

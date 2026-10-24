@@ -90,4 +90,7 @@ async def test_live_websocket_cluster_e2e():
         for t in worker_tasks:
             t.cancel()
         server.should_exit = True
-        await server_task
+        try:
+            await asyncio.wait_for(server_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            server_task.cancel()

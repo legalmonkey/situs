@@ -13,6 +13,25 @@ class CoordinatorConfig:
     default_model: str = "gemma3:4b"
     relay_buffer_size: int = 64 * 1024 * 1024  # 64 MB
     enable_cors: bool = True
+    worker_auth_token: Optional[str] = field(
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", "situs-cluster-secret")
+    )
+    api_key: Optional[str] = field(default_factory=lambda: os.getenv("SITUS_API_KEY", None))
+    admin_key: Optional[str] = field(default_factory=lambda: os.getenv("SITUS_ADMIN_KEY", None))
+    allowed_origins: List[str] = field(
+        default_factory=lambda: [
+            o.strip()
+            for o in os.getenv(
+                "SITUS_ALLOWED_ORIGINS",
+                "http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000",
+            ).split(",")
+            if o.strip()
+        ]
+    )
+    request_timeout_s: float = 60.0
+    max_concurrent_requests: int = 16
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile: Optional[str] = None
 
 
 @dataclass
@@ -28,6 +47,9 @@ class WorkerConfig:
     heartbeat_interval_s: float = 3.0
     enable_speculative: bool = True
     p2p_direct_enabled: bool = True
+    auth_token: Optional[str] = field(
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", "situs-cluster-secret")
+    )
 
 
 @dataclass

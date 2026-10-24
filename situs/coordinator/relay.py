@@ -77,6 +77,15 @@ class RelayHub:
                 await self.send_to_worker(target_worker, frame)
             return
 
+        # If this is an abort frame, propagate to target or broadcast to all active workers
+        if frame.type == MessageType.INFERENCE_ABORT:
+            if frame.target and frame.target != "coordinator":
+                await self.send_to_worker(frame.target, frame)
+            else:
+                for w_id in list(self.active_connections.keys()):
+                    await self.send_to_worker(w_id, frame)
+            return
+
         # If it has a target worker (e.g. forward activation A -> B)
         if frame.target and frame.target != "coordinator":
             await self.send_to_worker(frame.target, frame)

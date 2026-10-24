@@ -69,7 +69,12 @@ class EarlyExitHead(nn.Module if HAS_TORCH else object):
         self.vocab_size = vocab_size
         if HAS_TORCH:
             self.norm = nn.LayerNorm(hidden_dim)
-            self.proj = nn.Linear(hidden_dim, vocab_size, bias=False)
+            self.proj = nn.Linear.__new__(nn.Linear)
+            super(nn.Linear, self.proj).__init__()
+            self.proj.in_features = hidden_dim
+            self.proj.out_features = vocab_size
+            self.proj.weight = nn.Parameter(torch.zeros(vocab_size, hidden_dim, dtype=torch.float32))
+            self.proj.bias = None
 
     def forward(self, h: "torch.Tensor") -> "torch.Tensor":
         if not HAS_TORCH:

@@ -319,16 +319,21 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
     smi_info = query_nvidia_smi()
     if smi_info is not None:
         gpu_name, total_vram, free_vram, used_vram = smi_info
+        is_cuda_usable = cuda_works and (req != "cpu")
         info = HardwareInfo(
-            gpu_available=True,
-            device="cuda:0" if req != "cpu" else "cpu",
-            device_type="cuda" if req != "cpu" else "cpu",
+            gpu_available=is_cuda_usable,
+            device="cuda:0" if is_cuda_usable else "cpu",
+            device_type="cuda" if is_cuda_usable else "cpu",
             device_name=gpu_name,
             total_memory_bytes=total_vram,
             free_memory_bytes=free_vram,
             used_memory_bytes=used_vram,
             memory_type="VRAM",
-            status_message=f"NVIDIA GPU detected: {gpu_name} ({total_vram / 1e9:.1f} GB VRAM). Proceeding with GPU pooling.",
+            status_message=(
+                f"NVIDIA GPU detected: {gpu_name} ({total_vram / 1e9:.1f} GB VRAM). Proceeding with CUDA acceleration."
+                if is_cuda_usable
+                else f"NVIDIA GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode."
+            ),
             physical_gpu_detected=True,
             physical_gpu_name=gpu_name,
             cuda_runtime_working=cuda_works,
@@ -341,16 +346,21 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
     cim_info = query_windows_cim_gpus()
     if cim_info is not None:
         gpu_name, total_vram, free_vram, used_vram = cim_info
+        is_cuda_usable = cuda_works and (req != "cpu")
         info = HardwareInfo(
-            gpu_available=True,
-            device="cuda:0" if req != "cpu" else "cpu",
-            device_type="cuda" if req != "cpu" else "cpu",
+            gpu_available=is_cuda_usable,
+            device="cuda:0" if is_cuda_usable else "cpu",
+            device_type="cuda" if is_cuda_usable else "cpu",
             device_name=gpu_name,
             total_memory_bytes=total_vram,
             free_memory_bytes=free_vram,
             used_memory_bytes=used_vram,
             memory_type="VRAM",
-            status_message=f"Physical GPU detected: {gpu_name} ({total_vram / 1e9:.1f} GB VRAM). Proceeding with GPU pooling.",
+            status_message=(
+                f"Physical GPU detected: {gpu_name} ({total_vram / 1e9:.1f} GB VRAM). Proceeding with GPU pooling."
+                if is_cuda_usable
+                else f"Physical GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode."
+            ),
             physical_gpu_detected=True,
             physical_gpu_name=gpu_name,
             cuda_runtime_working=cuda_works,

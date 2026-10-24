@@ -321,6 +321,7 @@ def join_cluster(
     speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
     compression: str = typer.Option("int8", "--compression", "-c", help="Activation compression ('int8', 'fp16', 'none')"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),
 ):
     """Join a Situs cluster as a GPU/CPU inference worker daemon."""
     normalized_ws = normalize_ws_url(coordinator)
@@ -395,9 +396,12 @@ def join_cluster(
         compression_dtype=compression,
         enable_speculative=speculative,
         p2p_direct_enabled=p2p,
+        auth_token=token or os.getenv("SITUS_WORKER_AUTH_TOKEN", "situs-cluster-secret"),
     )
 
     try:
+        import logging
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         from situs.worker.client import WorkerDaemon
         daemon = WorkerDaemon(cfg)
     except (ImportError, ModuleNotFoundError) as e:
@@ -485,17 +489,27 @@ def cluster_status(
 def partition_model(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
     model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
-    layers: int = typer.Option(32, "--layers", "-l", help="Total transformer layers in model"),
+    layers: Optional[int] = typer.Option(None, "--layers", "-l", help="Total transformer layers (auto-detected if omitted)"),
+    admin_key: Optional[str] = typer.Option(None, "--admin-key", envvar="SITUS_ADMIN_KEY", help="Administrator authorization key"),
 ):
     """Trigger automated pipeline layer partitioning across registered workers."""
     import httpx
 
     base_url = normalize_http_url(coordinator)
+    layer_info = f"{layers} layers" if layers else "auto-detected layers"
     if console:
-        console.print(f"[cyan]Partitioning {model} ({layers} layers) across cluster at {base_url}...[/cyan]")
+        console.print(f"[cyan]Partitioning {model} ({layer_info}) across cluster at {base_url}...[/cyan]")
+
+    headers = {}
+    if admin_key:
+        headers["X-Admin-Key"] = admin_key
+
+    query = f"model_name={model}"
+    if layers is not None:
+        query += f"&total_layers={layers}"
 
     try:
-        resp = httpx.post(f"{base_url}/admin/partition?model_name={model}&total_layers={layers}", timeout=10.0)
+        resp = httpx.post(f"{base_url}/admin/partition?{query}", headers=headers, timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -503,9 +517,10 @@ def partition_model(
             console.print(f"[bold red]Partitioning failed:[/bold red] {e}")
         raise typer.Exit(code=1)
 
+    partitions = data.get("partitions") or data.get("partition_plan", [])
     if console:
         console.print(Panel(
-            f"[bold green]Successfully partitioned {model} across {len(data.get('partition_plan', []))} workers![/bold green]",
+            f"[bold green]Successfully partitioned {model} across {len(partitions)} workers![/bold green]",
             border_style="green"
         ))
 
@@ -515,7 +530,7 @@ def partition_model(
         table.add_column("Is First Stage", justify="center", width=14)
         table.add_column("Is Last Stage", justify="center", width=14)
 
-        for p in data.get("partition_plan", []):
+        for p in partitions:
             table.add_row(
                 p["worker_id"],
                 f"[{p['layer_start']}..{p['layer_end'] - 1}]",
@@ -551,6 +566,7 @@ def one_shot_run(
     prompt: str = typer.Argument(..., help="Prompt to execute across the cluster"),
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
     model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="SITUS_API_KEY", help="Developer API key"),
 ):
     """Run a single prompt and stream tokens to stdout (for piping in PowerShell scripts)."""
     import httpx
@@ -562,9 +578,12 @@ def one_shot_run(
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
     }
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        with httpx.Client(base_url=base_url, timeout=60.0) as client:
+        with httpx.Client(base_url=base_url, headers=headers, timeout=60.0) as client:
             with client.stream("POST", "/v1/chat/completions", json=payload) as response:
                 if response.status_code != 200:
                     sys.stderr.write(f"Error {response.status_code}: {response.read().decode('utf-8')}\n")
