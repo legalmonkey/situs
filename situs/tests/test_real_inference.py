@@ -8,6 +8,19 @@ from situs.worker.engine import StageExecutionEngine
 from situs.tokenizer import get_or_load_tokenizer
 
 
+def _is_ollama_online() -> bool:
+    import httpx
+    for endpoint in ("http://127.0.0.1:11434/api/tags", "http://localhost:11434/api/tags"):
+        try:
+            with httpx.Client(timeout=0.5) as client:
+                res = client.get(endpoint)
+                if res.status_code == 200:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
 def test_extract_latest_user_query():
     multi_turn = (
         "user: hello\n"
@@ -19,6 +32,8 @@ def test_extract_latest_user_query():
 
 
 def test_generate_llm_answer_lightbulb_not_hardcoded_greeting():
+    if not _is_ollama_online():
+        pytest.skip("Local Ollama daemon is not running (live application test disabled)")
     prompt = "user: who invented the lightbulb\nassistant:"
     answer = generate_llm_answer(prompt)
     assert "Edison" in answer or "Swan" in answer
@@ -26,6 +41,8 @@ def test_generate_llm_answer_lightbulb_not_hardcoded_greeting():
 
 
 def test_generate_llm_answer_noodles():
+    if not _is_ollama_online():
+        pytest.skip("Local Ollama daemon is not running (live application test disabled)")
     prompt = "user: where were noodles invented?\nassistant:"
     answer = generate_llm_answer(prompt)
     assert "China" in answer
@@ -33,6 +50,8 @@ def test_generate_llm_answer_noodles():
 
 
 def test_generate_llm_answer_butter_paneer():
+    if not _is_ollama_online():
+        pytest.skip("Local Ollama daemon is not running (live application test disabled)")
     prompt = "user: give me a recipe for butter paneer\nassistant:"
     answer = generate_llm_answer(prompt, model_name="gemma3:4b")
     assert "paneer" in answer.lower()
@@ -51,12 +70,16 @@ def test_stage_engine_uses_real_answer_across_turns():
     model_a = DistributedStageModel(
         layer_start=0, layer_end=2, total_layers=total_layers,
         is_first_stage=True, is_last_stage=False,
-        hidden_dim=hidden_dim, vocab_size=vocab_size, device="cpu",
+        hidden_dim=hidden_dim, vocab_size=vocab_size,
+        num_heads=4, num_kv_heads=2, intermediate_size=256, head_dim=32, architecture="llama",
+        device="cpu",
     )
     model_b = DistributedStageModel(
         layer_start=2, layer_end=4, total_layers=total_layers,
         is_first_stage=False, is_last_stage=True,
-        hidden_dim=hidden_dim, vocab_size=vocab_size, device="cpu",
+        hidden_dim=hidden_dim, vocab_size=vocab_size,
+        num_heads=4, num_kv_heads=2, intermediate_size=256, head_dim=32, architecture="llama",
+        device="cpu",
     )
 
     assign_a = AssignLayers(

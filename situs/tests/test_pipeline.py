@@ -28,6 +28,11 @@ def test_two_worker_pipeline_autoregressive_loop():
         is_last_stage=False,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=256,
+        head_dim=32,
+        architecture="llama",
         device="cpu",
     )
     model_b = DistributedStageModel(
@@ -38,6 +43,11 @@ def test_two_worker_pipeline_autoregressive_loop():
         is_last_stage=True,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=256,
+        head_dim=32,
+        architecture="llama",
         device="cpu",
     )
 
@@ -139,17 +149,23 @@ def test_three_worker_pipeline_autoregressive_loop():
     model_a = DistributedStageModel(
         layer_start=0, layer_end=4, total_layers=total_layers,
         is_first_stage=True, is_last_stage=False,
-        hidden_dim=hidden_dim, vocab_size=vocab_size, device="cpu",
+        hidden_dim=hidden_dim, vocab_size=vocab_size,
+        num_heads=4, num_kv_heads=2, intermediate_size=256, head_dim=32, architecture="llama",
+        device="cpu",
     )
     model_b = DistributedStageModel(
         layer_start=4, layer_end=8, total_layers=total_layers,
         is_first_stage=False, is_last_stage=False,
-        hidden_dim=hidden_dim, vocab_size=vocab_size, device="cpu",
+        hidden_dim=hidden_dim, vocab_size=vocab_size,
+        num_heads=4, num_kv_heads=2, intermediate_size=256, head_dim=32, architecture="llama",
+        device="cpu",
     )
     model_c = DistributedStageModel(
         layer_start=8, layer_end=12, total_layers=total_layers,
         is_first_stage=False, is_last_stage=True,
-        hidden_dim=hidden_dim, vocab_size=vocab_size, device="cpu",
+        hidden_dim=hidden_dim, vocab_size=vocab_size,
+        num_heads=4, num_kv_heads=2, intermediate_size=256, head_dim=32, architecture="llama",
+        device="cpu",
     )
 
     assign_a = AssignLayers(

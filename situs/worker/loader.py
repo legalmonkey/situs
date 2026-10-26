@@ -140,20 +140,38 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
     """
     def __init__(
         self,
-        hidden_dim: int = 2048,
-        num_heads: int = 16,
-        num_kv_heads: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
+        hidden_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        intermediate_size: int,
+        head_dim: int,
+        architecture: str,
         eps: float = 1e-6,
         layer_idx: int = 0,
-        head_dim: Optional[int] = None,
     ):
         super().__init__()
+        if not is_architecture_supported(architecture):
+            raise ValueError(
+                f"Unsupported model architecture '{architecture}'. "
+                f"RealTransformerBlock requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
+                f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
+            )
+        for name, val in [
+            ("hidden_dim", hidden_dim),
+            ("num_heads", num_heads),
+            ("num_kv_heads", num_kv_heads),
+            ("intermediate_size", intermediate_size),
+            ("head_dim", head_dim),
+        ]:
+            if val is None or not isinstance(val, int) or val <= 0:
+                raise ValueError(f"RealTransformerBlock requires verified positive integer for '{name}', got {val}")
+
+        self.architecture = architecture
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads or num_heads
-        self.head_dim = head_dim or max(1, hidden_dim // max(1, num_heads))
-        self.intermediate_size = intermediate_size or (4 * hidden_dim)
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.intermediate_size = intermediate_size
         self.layer_idx = layer_idx
 
         if not HAS_TORCH:
@@ -317,6 +335,8 @@ def deserialize_and_validate_layer_weights(
     intermediate_size: Optional[int] = None,
     layer_idx: int = 0,
     device: str = "cpu",
+    head_dim: Optional[int] = None,
+    architecture: str = "llama",
 ) -> RealTransformerBlock:
     """
     Deserializes raw wire weights (Safetensors or PyTorch bytes), maps tensor names,
@@ -388,7 +408,7 @@ def deserialize_and_validate_layer_weights(
 
     actual_heads = num_heads
     actual_kv_heads = num_kv_heads or num_heads
-    derived_head_dim = None
+    derived_head_dim = head_dim
 
     for qk in ("q_proj.weight", "self_attn.q_proj.weight", "attn_q.weight", "attn.q_proj.weight"):
         if qk in clean_incoming and isinstance(clean_incoming[qk], torch.Tensor) and clean_incoming[qk].dim() >= 2:
@@ -421,8 +441,9 @@ def deserialize_and_validate_layer_weights(
         num_heads=actual_heads,
         num_kv_heads=actual_kv_heads,
         intermediate_size=actual_inter,
-        layer_idx=layer_idx,
         head_dim=derived_head_dim,
+        architecture=architecture,
+        layer_idx=layer_idx,
     )
 
     # Load and validate tensors (raises ValueError if incomplete, non-finite, or invalid)
@@ -440,13 +461,83 @@ def deserialize_and_validate_layer_weights(
     return block
 
 
+def verify_layer_numerical_parity(
+    block: RealTransformerBlock,
+    ref_block: Any,
+    tolerance: float = 1e-3,
+    test_input: Optional[Any] = None,
+) -> bool:
+    """
+    Verifies that installed weights in RealTransformerBlock produce outputs mathematically
+    equivalent to a reference transformer decoder block (e.g. HuggingFace LlamaDecoderLayer / GemmaDecoderLayer)
+    within the specified numerical tolerance.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("PyTorch is required for numerical parity verification")
+
+    if not isinstance(block, RealTransformerBlock):
+        raise TypeError(f"Expected RealTransformerBlock, got {type(block)}")
+
+    if test_input is None:
+        torch.manual_seed(42)
+        test_input = torch.randn(1, 4, block.hidden_dim, dtype=torch.float32)
+
+    block_eval = getattr(block, "eval", None)
+    if callable(block_eval):
+        block.eval()
+    ref_eval = getattr(ref_block, "eval", None)
+    if callable(ref_eval):
+        ref_block.eval()
+
+    with torch.no_grad():
+        x_block = test_input.clone()
+        out_block, _ = block(x_block)
+
+        x_ref = test_input.clone()
+        try:
+            ref_res = ref_block(x_ref)
+        except TypeError:
+            ref_res = ref_block(hidden_states=x_ref)
+
+        if isinstance(ref_res, (tuple, list)):
+            out_ref = ref_res[0]
+        elif hasattr(ref_res, "hidden_states"):
+            out_ref = ref_res.hidden_states
+        elif isinstance(ref_res, torch.Tensor):
+            out_ref = ref_res
+        else:
+            raise TypeError(f"Unrecognized reference block output type: {type(ref_res)}")
+
+        if out_block.shape != out_ref.shape:
+            logger.error(
+                f"Numerical parity failed: shape mismatch between RealTransformerBlock "
+                f"({out_block.shape}) and reference ({out_ref.shape})"
+            )
+            return False
+
+        max_diff = torch.max(torch.abs(out_block - out_ref)).item()
+        is_close = torch.allclose(out_block, out_ref, atol=tolerance, rtol=tolerance)
+        if not is_close:
+            logger.warning(
+                f"Numerical parity divergence: max absolute diff is {max_diff:.6e} > tolerance {tolerance}"
+            )
+            return False
+
+        return True
+
+
 class FastBootDraftBlock(nn.Module if HAS_TORCH else object):
     """
     Experimental low-rank transformer block for fast-boot (~1 MB per layer).
     Marked EXPERIMENTAL until convergence to full model weights is established.
     """
+    is_verified_inference: bool = False
+    is_experimental: bool = True
+
     def __init__(self, hidden_dim: int = 256, rank: int = 64):
         super().__init__()
+        self.is_verified_inference = False
+        self.is_experimental = True
         self.hidden_dim = hidden_dim
         self.rank = min(rank, max(16, hidden_dim // 4))
         if HAS_TORCH:
@@ -481,16 +572,16 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         total_layers: int,
         is_first_stage: bool,
         is_last_stage: bool,
-        hidden_dim: int = 2048,
-        vocab_size: int = 32000,
-        num_heads: int = 16,
-        num_kv_heads: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
+        hidden_dim: int,
+        vocab_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        intermediate_size: int,
+        head_dim: int,
+        architecture: str,
         device: str = "cpu",
         progressive: bool = False,
         fast_boot: bool = False,
-        head_dim: Optional[int] = None,
-        architecture: Optional[str] = "transformer",
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -499,6 +590,17 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 f"DistributedStageModel requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
                 f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
             )
+        for name, val in [
+            ("hidden_dim", hidden_dim),
+            ("vocab_size", vocab_size),
+            ("num_heads", num_heads),
+            ("num_kv_heads", num_kv_heads),
+            ("intermediate_size", intermediate_size),
+            ("head_dim", head_dim),
+        ]:
+            if val is None or not isinstance(val, int) or val <= 0:
+                raise ValueError(f"DistributedStageModel requires verified positive integer for '{name}', got {val}")
+
         self.architecture = architecture
         self.layer_start = layer_start
         self.layer_end = layer_end
@@ -508,9 +610,9 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads or num_heads
-        self.intermediate_size = intermediate_size or (4 * hidden_dim)
-        self.head_dim = head_dim or max(1, hidden_dim // max(1, num_heads))
+        self.num_kv_heads = num_kv_heads
+        self.intermediate_size = intermediate_size
+        self.head_dim = head_dim
 
         safe_device = device
         if safe_device.startswith("cuda") and not (HAS_TORCH and torch.cuda.is_available()):
@@ -559,8 +661,9 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                     intermediate_size=self.intermediate_size,
-                    layer_idx=layer_start + i,
                     head_dim=self.head_dim,
+                    architecture=self.architecture,
+                    layer_idx=layer_start + i,
                 )
                 for i in range(num_layers)
             ])
@@ -652,6 +755,8 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 intermediate_size=self.intermediate_size,
+                head_dim=self.head_dim,
+                architecture=self.architecture,
                 layer_idx=layer_index,
                 device=self.device,
             )
@@ -856,9 +961,9 @@ def load_hf_stage_model(
     hidden_dim = meta["hidden_dim"]
     vocab_size = meta["vocab_size"]
     num_heads = meta["num_heads"]
-    num_kv_heads = meta.get("num_kv_heads", num_heads)
+    num_kv_heads = meta.get("num_kv_heads") or num_heads
     intermediate_size = meta["intermediate_size"]
-    head_dim = meta.get("head_dim")
+    head_dim = meta.get("head_dim") or max(1, hidden_dim // max(1, num_heads))
 
     stage = DistributedStageModel(
         layer_start=layer_start,

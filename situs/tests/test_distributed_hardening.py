@@ -46,6 +46,11 @@ def test_distributed_inference_succeeds_when_coordinator_local_backend_unavailab
         is_last_stage=False,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         device="cpu",
     )
     model_b = DistributedStageModel(
@@ -56,6 +61,11 @@ def test_distributed_inference_succeeds_when_coordinator_local_backend_unavailab
         is_last_stage=True,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         device="cpu",
     )
 
@@ -155,6 +165,11 @@ def test_progressive_weight_deserialization_and_validation():
         is_last_stage=True,
         hidden_dim=hidden_dim,
         vocab_size=200,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        intermediate_size=intermediate_size,
+        head_dim=hidden_dim // num_heads,
+        architecture="llama",
         device="cpu",
         progressive=True,
     )
@@ -312,6 +327,11 @@ def test_inference_abort_cleanup():
         is_last_stage=False,
         hidden_dim=64,
         vocab_size=200,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         device="cpu",
     )
     assign = AssignLayers(
@@ -376,6 +396,7 @@ def test_network_latency_and_speed_aware_partitioning():
         "num_kv_heads": 8,
         "vocab_size": 32000,
         "context_length": 2048,
+        "torch_dtype": "bfloat16",
     }
     intervals = optimal_heterogeneous_partition([w_fast, w_slow], total_layers=32, model_metadata=meta)
     fast_count = intervals[0][1] - intervals[0][0]

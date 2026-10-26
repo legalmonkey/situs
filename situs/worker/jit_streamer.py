@@ -95,11 +95,15 @@ def generate_mock_layer_bytes(
     """Convenience helper to generate serialized layer weights (safetensors or PyTorch)."""
     if hidden_dim is not None:
         from situs.worker.loader import RealTransformerBlock
+        heads = num_heads or 4
+        h_dim = hidden_dim // heads
         block = RealTransformerBlock(
             hidden_dim=hidden_dim,
-            num_heads=num_heads or 4,
+            num_heads=heads,
             num_kv_heads=num_kv_heads or 2,
             intermediate_size=intermediate_size or (hidden_dim * 4),
+            head_dim=h_dim,
+            architecture="transformer",
             layer_idx=layer_idx,
         )
         state = {k: v.cpu() for k, v in block.state_dict().items()}

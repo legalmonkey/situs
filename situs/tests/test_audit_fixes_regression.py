@@ -95,6 +95,11 @@ def test_load_embedding_weights_rejects_shape_mismatch():
         is_last_stage=False,
         hidden_dim=64,
         vocab_size=200,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         device="cpu",
     )
     # Target shape is (200, 64)
@@ -128,6 +133,11 @@ def test_load_head_weights_rejects_shape_mismatch():
         is_last_stage=True,
         hidden_dim=64,
         vocab_size=200,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         device="cpu",
     )
     # Target lm_head weight shape is (200, 64), target norm shape is (64,)
@@ -185,6 +195,10 @@ def test_distributed_stage_model_rejects_unsupported_architecture():
             is_last_stage=False,
             hidden_dim=64,
             vocab_size=200,
+            num_heads=4,
+            num_kv_heads=4,
+            intermediate_size=128,
+            head_dim=16,
             architecture="gpt2",
             device="cpu",
         )
@@ -198,6 +212,10 @@ def test_distributed_stage_model_rejects_unsupported_architecture():
             is_last_stage=False,
             hidden_dim=64,
             vocab_size=200,
+            num_heads=4,
+            num_kv_heads=4,
+            intermediate_size=128,
+            head_dim=16,
             architecture="qwen2_moe",
             device="cpu",
         )
@@ -212,6 +230,10 @@ def test_distributed_stage_model_rejects_unsupported_architecture():
             is_last_stage=False,
             hidden_dim=64,
             vocab_size=200,
+            num_heads=4,
+            num_kv_heads=4,
+            intermediate_size=128,
+            head_dim=16,
             architecture=None,
             device="cpu",
         )
@@ -225,6 +247,10 @@ def test_distributed_stage_model_rejects_unsupported_architecture():
         is_last_stage=False,
         hidden_dim=64,
         vocab_size=200,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
         architecture="llama",
         device="cpu",
     )
@@ -314,10 +340,15 @@ def test_scheduler_telemetry_does_not_fabricate_synthetic_speeds():
         "num_heads": 8,
         "vocab_size": 32000,
         "context_length": 2048,
+        "torch_dtype": "bfloat16",
     }
 
     # With unknown compute speeds, neither node is fabricated to be faster than the other.
     parts = optimal_heterogeneous_partition([w1, w2], total_layers=8, model_metadata=meta)
+    assert w1.compute_speed_status == "unknown"
+    assert w2.compute_speed_status == "unknown"
+    assert w1.network_latency_status == "unknown"
+    assert w2.network_latency_status == "unknown"
     w1_count = parts[0][1] - parts[0][0]
     w2_count = parts[1][1] - parts[1][0]
     assert w1_count == 4
@@ -428,6 +459,11 @@ def test_forward_first_stage_rejects_out_of_range_tokens():
         is_last_stage=False,
         hidden_dim=64,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         device="cpu",
     )
 

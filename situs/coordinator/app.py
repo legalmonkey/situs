@@ -585,6 +585,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                     "finish_reason": token_info.finish_reason if token_info.is_finished else None,
                                 }
                             ],
+                            "is_verified": token_info.is_verified,
+                            "unverified_draft": not token_info.is_verified,
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
                         if token_info.is_finished:
@@ -607,6 +609,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                         "finish_reason": verified_info.finish_reason if verified_info.is_finished else None,
                                     }
                                 ],
+                                "is_verified": verified_info.is_verified,
+                                "unverified_draft": not verified_info.is_verified,
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
                         if verified_info.is_finished:
@@ -686,6 +690,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         deadline = time.time() + config.request_timeout_s
         generated_text = ""
         finish_reason = "stop"
+        has_unverified_draft = False
 
         try:
             while True:
@@ -718,6 +723,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 if frame.type == MessageType.NEXT_TOKEN:
                     token_info = NextToken.model_validate(frame.payload)
                     generated_text += token_info.token_text
+                    if not token_info.is_verified:
+                        has_unverified_draft = True
                     if token_info.is_finished:
                         finish_reason = token_info.finish_reason or "stop"
                         break
@@ -726,6 +733,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     verified_info = SpeculativeVerified.model_validate(frame.payload)
                     for text in verified_info.accepted_texts:
                         generated_text += text
+                    if not verified_info.is_verified:
+                        has_unverified_draft = True
                     if verified_info.is_finished:
                         finish_reason = verified_info.finish_reason or "stop"
                         break
@@ -747,7 +756,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             relay.cleanup_response_stream(request_id)
             sem.release()
 
-        return {
+        resp_dict = {
             "id": request_id,
             "object": "chat.completion",
             "created": int(time.time()),
@@ -764,7 +773,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "completion_tokens": len(generated_text.split()),
                 "total_tokens": len(input_ids) + len(generated_text.split()),
             },
+            "is_verified": not has_unverified_draft,
+            "unverified_draft": has_unverified_draft,
         }
+        return resp_dict
 
 
 def main():

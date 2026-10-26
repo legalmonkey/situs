@@ -179,6 +179,7 @@ class StageExecutionEngine:
             comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
             b64_payload = base64.b64encode(comp_bytes).decode("ascii")
 
+            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False)
             forward_act = ForwardActivation(
                 request_id=request_id,
                 step_index=0,
@@ -186,6 +187,8 @@ class StageExecutionEngine:
                 dtype=self.compression_dtype,
                 scale=scale,
                 payload_b64=b64_payload,
+                is_verified=not is_fast_boot,
+                is_experimental=is_fast_boot,
             )
 
             if self.is_last_stage():
@@ -234,6 +237,8 @@ class StageExecutionEngine:
             else:
                 out = [[0.0] * self.stage_model.vocab_size] if self.is_last_stage() else [[0.0] * self.stage_model.hidden_dim]
 
+            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(act_frame, "is_verified", True)
+
             if not self.is_last_stage():
                 # Middle stage: forward activations down the chain
                 comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
@@ -245,6 +250,8 @@ class StageExecutionEngine:
                     dtype=self.compression_dtype,
                     scale=scale,
                     payload_b64=b64_payload,
+                    is_verified=not is_fast_boot,
+                    is_experimental=is_fast_boot,
                 )
                 return ProtocolFrame(
                     type=MessageType.FORWARD_ACTIVATION,
@@ -301,6 +308,8 @@ class StageExecutionEngine:
                     token_text=token_text,
                     is_finished=is_finished,
                     finish_reason=finish_reason,
+                    is_verified=not is_fast_boot,
+                    is_experimental=is_fast_boot,
                 )
 
                 # Target the first worker (to embed next token) AND Coordinator
@@ -407,6 +416,7 @@ class StageExecutionEngine:
             self.session_fast_boot_sequences.pop(request_id, None)
             self.finished_sessions.add(request_id)
 
+        is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(cand_frame, "is_verified", True)
         verified = SpeculativeVerified(
             request_id=request_id,
             step_index=new_step_idx,
@@ -414,6 +424,8 @@ class StageExecutionEngine:
             accepted_texts=accepted_texts,
             is_finished=is_finished,
             finish_reason="stop" if is_eos else ("length" if is_finished else None),
+            is_verified=not is_fast_boot,
+            is_experimental=is_fast_boot,
         )
 
         target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
@@ -461,6 +473,8 @@ class StageExecutionEngine:
             request_id=request_id,
             step_index=verified_frame.step_index,
             token_id=last_token,
+            is_verified=verified_frame.is_verified,
+            is_experimental=verified_frame.is_experimental,
         )
         return self.process_next_token(dummy_next)
 
@@ -498,6 +512,8 @@ class StageExecutionEngine:
         self.session_token_histories[request_id].append(token_frame.token_id)
 
         try:
+            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(token_frame, "is_verified", True)
+
             # 1. Speculative Path: check for candidate n-grams
             candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
             if candidates and HAS_TORCH:
@@ -517,6 +533,8 @@ class StageExecutionEngine:
                     dtype=self.compression_dtype,
                     scale=scale,
                     payload_b64=b64_payload,
+                    is_verified=not is_fast_boot,
+                    is_experimental=is_fast_boot,
                 )
                 return ProtocolFrame(
                     type=MessageType.SPECULATIVE_CANDIDATES,
@@ -544,6 +562,8 @@ class StageExecutionEngine:
                 dtype=self.compression_dtype,
                 scale=scale,
                 payload_b64=b64_payload,
+                is_verified=not is_fast_boot,
+                is_experimental=is_fast_boot,
             )
 
             if self.is_last_stage():

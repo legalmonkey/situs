@@ -28,6 +28,11 @@ def test_speculative_pipeline_burst_acceleration():
         is_last_stage=False,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=256,
+        head_dim=32,
+        architecture="llama",
         device="cpu",
     )
     model_b = DistributedStageModel(
@@ -38,6 +43,11 @@ def test_speculative_pipeline_burst_acceleration():
         is_last_stage=True,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=256,
+        head_dim=32,
+        architecture="llama",
         device="cpu",
     )
 

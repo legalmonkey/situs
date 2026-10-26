@@ -92,6 +92,7 @@ def test_telemetry_weighted_partition():
             "num_kv_heads": 8,
             "vocab_size": 32000,
             "context_length": 2048,
+            "torch_dtype": "bfloat16",
         },
     )
     assert len(parts) == 2
@@ -144,6 +145,8 @@ def test_engine_cancellation_and_kv_cleanup():
         intermediate_size=128,
         num_heads=4,
         num_kv_heads=2,
+        head_dim=16,
+        architecture="gemma3",
         vocab_size=100,
         device="cpu",
     )
@@ -204,8 +207,9 @@ def test_real_transformer_block_custom_head_dim():
         num_heads=8,
         num_kv_heads=4,
         intermediate_size=10240,
-        layer_idx=0,
         head_dim=256,
+        architecture="gemma3",
+        layer_idx=0,
     )
     assert block.head_dim == 256
     assert block.q_proj.out_features == 2048

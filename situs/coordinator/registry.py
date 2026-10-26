@@ -5,7 +5,7 @@ import math
 import logging
 import functools
 from typing import Dict, List, Optional, Tuple, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from situs.protocol.messages import WorkerRegister, AssignLayers
 
 logger = logging.getLogger("situs.coordinator.registry")
@@ -30,6 +30,21 @@ class WorkerNode(BaseModel):
     fast_boot: bool = False
     compute_speed: Optional[float] = None
     network_latency_ms: Optional[float] = None
+    compute_speed_status: str = "unknown"
+    network_latency_status: str = "unknown"
+
+    @model_validator(mode="after")
+    def _validate_telemetry_status(self):
+        if self.compute_speed is not None and self.compute_speed > 0:
+            self.compute_speed_status = "measured"
+        else:
+            self.compute_speed_status = "unknown"
+
+        if self.network_latency_ms is not None and self.network_latency_ms >= 0:
+            self.network_latency_status = "measured"
+        else:
+            self.network_latency_status = "unknown"
+        return self
 
 
 def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,12 +127,34 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
     import json
     import pathlib
 
+    def _apply_inferred_precision(res: Dict[str, Any]) -> Dict[str, Any]:
+        model_name_lower = model_name.lower()
+        tag = model_name_lower.split(":", 1)[1] if ":" in model_name_lower else model_name_lower
+        inferred = None
+        if any(q in tag for q in ("q8", "int8", "fp8", "8bit")):
+            inferred = "int8"
+        elif any(q in tag for q in ("q6", "int6", "6bit")):
+            inferred = "int6"
+        elif any(q in tag for q in ("q5", "int5", "5bit")):
+            inferred = "int5"
+        elif any(q in tag for q in ("q4", "int4", "4bit")):
+            inferred = "int4"
+        elif any(q in tag for q in ("fp16", "bf16", "16bit", "half")):
+            inferred = "bfloat16"
+        elif any(q in tag for q in ("fp32", "32bit")):
+            inferred = "float32"
+
+        if inferred:
+            res["torch_dtype"] = inferred
+            res["precision"] = inferred
+        return res
+
     # 1. Direct filesystem path to config file or model directory
     if os.path.isfile(model_name):
         try:
             with open(model_name, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return _parse_verified_config_dict(data)
+            return _apply_inferred_precision(_parse_verified_config_dict(data))
         except Exception as e:
             logger.debug(f"Failed parsing config file at '{model_name}': {e}")
     elif os.path.isdir(model_name):
@@ -126,7 +163,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
             try:
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return _parse_verified_config_dict(data)
+                return _apply_inferred_precision(_parse_verified_config_dict(data))
             except Exception as e:
                 logger.debug(f"Failed parsing config file at '{cfg_path}': {e}")
 
@@ -147,7 +184,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
         if best_match is not None:
             try:
                 data = json.loads(best_match.read_text(encoding="utf-8"))
-                return _parse_verified_config_dict(data)
+                return _apply_inferred_precision(_parse_verified_config_dict(data))
             except Exception as e:
                 logger.debug(f"Failed loading verified config from {best_match}: {e}")
 
@@ -160,7 +197,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
             cached_cfg = model_dir / "config.json"
             if cached_cfg.is_file():
                 data = json.loads(cached_cfg.read_text(encoding="utf-8"))
-                return _parse_verified_config_dict(data)
+                return _apply_inferred_precision(_parse_verified_config_dict(data))
 
             # Check if layer safetensors header has verified embedded metadata
             layer_files = sorted(model_dir.glob("layer_*.bin"))
@@ -172,7 +209,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                         header = json.loads(cached_data[8:8 + h_len].decode("utf-8"))
                         meta = header.get("__metadata__")
                         if meta and isinstance(meta, dict):
-                            return _parse_verified_config_dict(meta)
+                            return _apply_inferred_precision(_parse_verified_config_dict(meta))
     except Exception as e:
         logger.debug(f"Cache config check failed for '{model_name}': {e}")
 
@@ -200,7 +237,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                                 pass
 
         if config is not None:
-            return _parse_verified_config_dict(config.to_dict() if hasattr(config, "to_dict") else vars(config))
+            return _apply_inferred_precision(_parse_verified_config_dict(config.to_dict() if hasattr(config, "to_dict") else vars(config)))
     except Exception as e:
         logger.debug(f"AutoConfig metadata resolution failed for '{model_name}': {e}")
 
@@ -245,7 +282,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                     head_dim = max(1, hidden_dim // max(1, heads))
 
                 if block_count and hidden_dim and vocab_size and intermediate and heads:
-                    return {
+                    return _apply_inferred_precision({
                         "total_layers": block_count,
                         "hidden_dim": hidden_dim,
                         "intermediate_size": intermediate,
@@ -257,7 +294,7 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                         "context_length": context_length,
                         "max_position_embeddings": context_length,
                         "torch_dtype": torch_dtype,
-                    }
+                    })
                 else:
                     logger.warning(
                         f"Ollama returned incomplete model_info for '{model_name}'; rejecting due to missing attributes."
@@ -327,13 +364,9 @@ def optimal_heterogeneous_partition(
             "in model_metadata or runtime_config. Assumed fixed sequence lengths have been removed."
         )
 
-    K = len(workers)
-    if K == 1:
-        return [(0, total_layers)]
-
     # Precision: dtype bytes per param (fp32=4, fp16/bf16=2, int8/fp8=1, int4=0.5)
     precision_val = (
-        (runtime_config.get("bytes_per_param") or runtime_config.get("precision") or runtime_config.get("compression_dtype"))
+        (runtime_config.get("bytes_per_param") or runtime_config.get("precision") or runtime_config.get("compression_dtype") or runtime_config.get("torch_dtype") or runtime_config.get("dtype"))
         if runtime_config else None
     ) or (
         meta.get("bytes_per_param")
@@ -342,6 +375,12 @@ def optimal_heterogeneous_partition(
         or meta.get("compression_dtype")
         or meta.get("dtype")
     )
+    if precision_val is None:
+        raise ValueError(
+            "optimal_heterogeneous_partition requires verified precision ('bytes_per_param', 'torch_dtype', or 'precision') "
+            "in model_metadata or runtime_config. Arbitrary default precision has been removed."
+        )
+
     if isinstance(precision_val, (int, float)) and precision_val > 0:
         bytes_per_param = float(precision_val)
     elif isinstance(precision_val, str):
@@ -352,12 +391,16 @@ def optimal_heterogeneous_partition(
             bytes_per_param = 2.0
         elif "8" in p_str:
             bytes_per_param = 1.0
+        elif "6" in p_str:
+            bytes_per_param = 0.75
+        elif "5" in p_str:
+            bytes_per_param = 0.625
         elif "4" in p_str:
             bytes_per_param = 0.5
         else:
-            bytes_per_param = 2.0
+            raise ValueError(f"Unsupported or unrecognized precision / torch_dtype: '{precision_val}'")
     else:
-        bytes_per_param = 2.0
+        raise ValueError(f"Invalid precision type: {type(precision_val)}")
 
     batch_size = int((runtime_config.get("batch_size") if runtime_config else None) or 1)
 
@@ -380,6 +423,19 @@ def optimal_heterogeneous_partition(
     # Last stage holds final RMSNorm + lm_head projection
     last_overhead = int((h_dim + h_dim * vocab_size) * bytes_per_param)
 
+    # Total model memory footprint
+    total_model_memory = (total_layers * bytes_per_layer) + first_overhead + last_overhead
+    total_usable_cluster_vram = sum(max(50 * 1024**2, int(w.free_vram_bytes * 0.9)) for w in workers)
+    if total_usable_cluster_vram < total_model_memory:
+        raise ValueError(
+            f"Insufficient cluster memory: total cluster usable memory ({total_usable_cluster_vram / (1024**3):.2f} GB) "
+            f"cannot accommodate model memory requirements ({total_model_memory / (1024**3):.2f} GB)."
+        )
+
+    K = len(workers)
+    if K == 1:
+        return [(0, total_layers)]
+
     speeds = []
     capacities_layers = []
 
@@ -389,16 +445,20 @@ def optimal_heterogeneous_partition(
         measured_speed = getattr(w, "compute_speed", None)
         if measured_speed is not None and measured_speed > 0:
             base_speed = float(measured_speed)
+            w.compute_speed_status = "measured"
         else:
             base_speed = 1.0
+            w.compute_speed_status = "unknown"
             logger.debug(f"Worker {w.worker_id}: compute_speed is unmeasured/unknown. Using baseline.")
 
         # 2. Network telemetry: degrade effective throughput with measured network latency
         measured_lat = getattr(w, "network_latency_ms", None)
         if measured_lat is not None and measured_lat >= 0:
             lat_penalty = 100.0 / (100.0 + max(0.0, float(measured_lat)))
+            w.network_latency_status = "measured"
         else:
             lat_penalty = 1.0
+            w.network_latency_status = "unknown"
             logger.debug(f"Worker {w.worker_id}: network_latency_ms is unmeasured/unknown. Using baseline.")
 
         speed = base_speed * lat_penalty
@@ -436,27 +496,19 @@ def optimal_heterogeneous_partition(
                     dp[k][i] = stage_cost
                     parent[k][i] = l
 
-    # 5. Proportional memory/speed fallback if strict DP bounds cannot cover all layers
+    # 5. Reject if strict DP bounds cannot cover all layers (no unsafe memory overflow fallback)
     if dp[K][total_layers] == math.inf:
-        logger.warning("DP partition constraint fallback to memory- and telemetry-weighted proportional partitioning.")
-        # Weight by available memory and compute speed
-        weights = [speeds[j] * max(1, capacities_layers[j]) for j in range(K)]
-        total_w = sum(weights)
-        alloc = []
-        rem = total_layers
-        for j in range(K - 1):
-            share = weights[j] / max(1e-6, total_w)
-            n = max(1, min(rem - (K - 1 - j), int(round(total_layers * share))))
-            alloc.append(n)
-            rem -= n
-        alloc.append(max(1, rem))
-    else:
-        alloc = [0] * K
-        curr = total_layers
-        for k in range(K, 0, -1):
-            l = parent[k][curr]
-            alloc[k - 1] = l
-            curr -= l
+        raise ValueError(
+            f"Insufficient cluster memory: cannot find a feasible layer partition across {K} workers "
+            f"within physical memory bounds (total required: {total_model_memory / (1024**3):.2f} GB)."
+        )
+
+    alloc = [0] * K
+    curr = total_layers
+    for k in range(K, 0, -1):
+        l = parent[k][curr]
+        alloc[k - 1] = l
+        curr -= l
 
     # Ensure every worker has at least 1 layer if total_layers >= K
     if total_layers >= K:
@@ -560,6 +612,7 @@ class WorkerRegistry:
         progressive: bool = False,
         fast_boot: bool = False,
         codec: str = "zstd",
+        runtime_config: Optional[Dict[str, Any]] = None,
     ) -> List[AssignLayers]:
         """
         Partitions transformer layers across currently connected alive workers using Dynamic Programming.
@@ -578,7 +631,7 @@ class WorkerRegistry:
         num_workers = len(alive)
 
         # Compute optimal heterogeneous intervals via DP
-        intervals = optimal_heterogeneous_partition(alive, resolved_layers, model_metadata=meta)
+        intervals = optimal_heterogeneous_partition(alive, resolved_layers, model_metadata=meta, runtime_config=runtime_config)
 
         assignments: List[AssignLayers] = []
         first_id = alive[0].worker_id if alive else None

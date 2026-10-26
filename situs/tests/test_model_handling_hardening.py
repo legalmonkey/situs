@@ -49,7 +49,7 @@ def test_weight_validation_all_required_tensors():
     # Remove one required tensor
     del tensors["gate_proj.weight"]
 
-    block = RealTransformerBlock(hidden_dim=64, num_heads=4, num_kv_heads=4, intermediate_size=128)
+    block = RealTransformerBlock(hidden_dim=64, num_heads=4, num_kv_heads=4, intermediate_size=128, head_dim=16, architecture="llama")
     with pytest.raises(ValueError, match="required parameter 'gate_proj.weight' is missing"):
         block.load_layer_weights(tensors)
 
@@ -60,7 +60,7 @@ def test_weight_validation_shape_mismatch():
     # Corrupt shape of k_proj
     tensors["k_proj.weight"] = torch.randn(128, 128)
 
-    block = RealTransformerBlock(hidden_dim=64, num_heads=4, num_kv_heads=4, intermediate_size=128)
+    block = RealTransformerBlock(hidden_dim=64, num_heads=4, num_kv_heads=4, intermediate_size=128, head_dim=16, architecture="llama")
     with pytest.raises(ValueError, match="Shape mismatch for parameter 'k_proj.weight'"):
         block.load_layer_weights(tensors)
 
@@ -70,7 +70,7 @@ def test_weight_validation_rejects_nan_and_inf():
     tensors_nan = _make_valid_block_tensors(hidden_dim=64, intermediate_dim=128)
     tensors_nan["q_proj.weight"][0, 0] = float("nan")
 
-    block = RealTransformerBlock(hidden_dim=64, num_heads=4, num_kv_heads=4, intermediate_size=128)
+    block = RealTransformerBlock(hidden_dim=64, num_heads=4, num_kv_heads=4, intermediate_size=128, head_dim=16, architecture="llama")
     with pytest.raises(ValueError, match="contains NaN or Inf values"):
         block.load_layer_weights(tensors_nan)
 
@@ -113,6 +113,8 @@ def test_mark_layer_ready_rejects_none():
         num_heads=4,
         num_kv_heads=4,
         intermediate_size=128,
+        head_dim=16,
+        architecture="llama",
         progressive=True,
     )
     with pytest.raises(ValueError, match="Cannot mark layer 0 ready without valid weights"):

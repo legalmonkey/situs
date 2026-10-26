@@ -92,6 +92,8 @@ class ForwardActivation(BaseModel):
     dtype: str = "int8"
     scale: float = 1.0
     payload_b64: Optional[str] = None  # Base64 string for JSON or raw bytes in binary mode
+    is_verified: bool = True
+    is_experimental: bool = False
 
 
 class NextToken(BaseModel):
@@ -101,6 +103,8 @@ class NextToken(BaseModel):
     token_text: str = ""
     is_finished: bool = False
     finish_reason: Optional[str] = None
+    is_verified: bool = True
+    is_experimental: bool = False
 
 
 class SpeculativeCandidates(BaseModel):
@@ -111,6 +115,8 @@ class SpeculativeCandidates(BaseModel):
     dtype: str = "int8"
     scale: float = 1.0
     payload_b64: Optional[str] = None
+    is_verified: bool = True
+    is_experimental: bool = False
 
 
 class SpeculativeVerified(BaseModel):
@@ -120,6 +126,8 @@ class SpeculativeVerified(BaseModel):
     accepted_texts: List[str]
     is_finished: bool = False
     finish_reason: Optional[str] = None
+    is_verified: bool = True
+    is_experimental: bool = False
 
 
 class WebRTCSignal(BaseModel):
