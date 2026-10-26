@@ -340,6 +340,11 @@ async def trigger_partition(
     codec: str = "zstd",
 ):
     verify_admin_key(request)
+    if fast_boot and config.is_production:
+        raise HTTPException(
+            status_code=400,
+            detail="Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.",
+        )
     try:
         assignments = registry.partition_model(
             model_name, total_layers=total_layers, progressive=progressive, fast_boot=fast_boot, codec=codec
@@ -513,9 +518,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     input_ids=input_ids,
                     prompt=prompt,
                     real_response=None,
-                    max_new_tokens=req.max_tokens or 256,
-                    temperature=req.temperature or 0.7,
-                    top_p=req.top_p or 0.9,
+                    max_new_tokens=req.max_tokens if req.max_tokens is not None else 256,
+                    temperature=req.temperature if req.temperature is not None else 0.7,
+                    top_p=req.top_p if req.top_p is not None else 0.9,
                 )
                 start_frame = ProtocolFrame(
                     type=MessageType.INFERENCE_START,
@@ -661,9 +666,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             input_ids=input_ids,
             prompt=prompt,
             real_response=None,
-            max_new_tokens=req.max_tokens or 256,
-            temperature=req.temperature or 0.7,
-            top_p=req.top_p or 0.9,
+            max_new_tokens=req.max_tokens if req.max_tokens is not None else 256,
+            temperature=req.temperature if req.temperature is not None else 0.7,
+            top_p=req.top_p if req.top_p is not None else 0.9,
         )
         start_frame = ProtocolFrame(
             type=MessageType.INFERENCE_START,

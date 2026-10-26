@@ -619,6 +619,12 @@ class WorkerRegistry:
         Respects heterogeneous device capabilities (VRAM, compute speed) without hardcoding 32 layers.
         Assigns embed_tokens to the first worker and norm+lm_head to the last worker.
         """
+        if fast_boot:
+            import os
+            env = os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
+            if env in ("production", "prod"):
+                raise ValueError("Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.")
+
         alive = self.get_alive_workers()
         if not alive:
             raise RuntimeError("No alive workers available to partition model.")

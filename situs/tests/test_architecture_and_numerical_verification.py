@@ -14,6 +14,8 @@ from situs.worker.loader import (
     FastBootDraftBlock,
     is_architecture_supported,
     verify_layer_numerical_parity,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
 )
 from situs.coordinator.registry import (
     WorkerNode,
@@ -133,7 +135,7 @@ def test_distributed_stage_model_requires_explicit_parameters():
 class CanonicalReferenceDecoderLayer(nn.Module):
     """
     Independent reference implementation of a Transformer Decoder Block
-    (RMSNorm + Multi-Head / Grouped-Query Attention + SwiGLU MLP).
+    (RMSNorm + RoPE Attention with KV Cache + SwiGLU MLP).
     """
     def __init__(self, hidden_dim: int, num_heads: int, num_kv_heads: int, intermediate_size: int, head_dim: int, eps: float = 1e-6):
         super().__init__()
@@ -153,12 +155,13 @@ class CanonicalReferenceDecoderLayer(nn.Module):
         self.gate_proj = nn.Linear(hidden_dim, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_dim, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_dim, bias=False)
+        self.rotary = RotaryEmbedding(head_dim)
 
     def _rmsnorm(self, x, weight):
         variance = x.pow(2).mean(-1, keepdim=True)
         return x * torch.rsqrt(variance + self.eps) * weight
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, past_kv=None):
         residual = hidden_states
         norm_x = self._rmsnorm(hidden_states, self.input_layernorm)
         b, s, _ = norm_x.shape
@@ -167,12 +170,42 @@ class CanonicalReferenceDecoderLayer(nn.Module):
         k = self.k_proj(norm_x).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(norm_x).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        past_len = 0
+        if past_kv is not None and isinstance(past_kv, (tuple, list)) and len(past_kv) == 2:
+            past_k, past_v = past_kv
+            if isinstance(past_k, torch.Tensor):
+                past_len = past_k.shape[-2]
+
+        cos, sin = self.rotary(norm_x, seq_len=s, offset=past_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if past_kv is not None and isinstance(past_kv, (tuple, list)) and len(past_kv) == 2:
+            past_k, past_v = past_kv
+            if isinstance(past_k, torch.Tensor) and isinstance(past_v, torch.Tensor):
+                k = torch.cat([past_k, k], dim=-2)
+                v = torch.cat([past_v, v], dim=-2)
+
+        new_kv = (k, v)
+
         if self.num_kv_heads < self.num_heads:
             repeats = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeats, dim=1)
-            v = v.repeat_interleave(repeats, dim=1)
+            k_exp = k.repeat_interleave(repeats, dim=1)
+            v_exp = v.repeat_interleave(repeats, dim=1)
+        else:
+            k_exp = k
+            v_exp = v
 
-        attn = F.scaled_dot_product_attention(q, k, v, is_causal=(s > 1))
+        if s > 1:
+            if past_len > 0:
+                q_idx = torch.arange(past_len, past_len + s, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(past_len + s, device=q.device).unsqueeze(0)
+                attn_mask = k_idx <= q_idx
+                attn = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=attn_mask)
+            else:
+                attn = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+        else:
+            attn = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
+
         attn = attn.transpose(1, 2).contiguous().view(b, s, -1)
         attn_out = self.o_proj(attn)
         h = residual + attn_out
@@ -182,7 +215,94 @@ class CanonicalReferenceDecoderLayer(nn.Module):
         gate = F.silu(self.gate_proj(norm_mlp))
         up = self.up_proj(norm_mlp)
         mlp_out = self.down_proj(gate * up)
-        return residual + mlp_out
+        return residual + mlp_out, new_kv
+
+
+class GemmaReferenceDecoderLayer(nn.Module):
+    """
+    Independent reference implementation of a Gemma Transformer Decoder Block
+    (GemmaRMSNorm with unit-offset + RoPE Attention with KV Cache + GeGLU MLP).
+    """
+    def __init__(self, hidden_dim: int, num_heads: int, num_kv_heads: int, intermediate_size: int, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.eps = eps
+
+        self.input_layernorm = nn.Parameter(torch.zeros(hidden_dim))
+        self.q_proj = nn.Linear(hidden_dim, num_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(num_heads * head_dim, hidden_dim, bias=False)
+
+        self.post_attention_layernorm = nn.Parameter(torch.zeros(hidden_dim))
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_dim, bias=False)
+        self.rotary = RotaryEmbedding(head_dim)
+        self.act_fn = nn.GELU(approximate="tanh")
+
+    def _rmsnorm(self, x, weight):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * (1.0 + weight)
+
+    def forward(self, hidden_states, past_kv=None):
+        residual = hidden_states
+        norm_x = self._rmsnorm(hidden_states, self.input_layernorm)
+        b, s, _ = norm_x.shape
+
+        q = self.q_proj(norm_x).view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(norm_x).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(norm_x).view(b, s, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        past_len = 0
+        if past_kv is not None and isinstance(past_kv, (tuple, list)) and len(past_kv) == 2:
+            past_k, past_v = past_kv
+            if isinstance(past_k, torch.Tensor):
+                past_len = past_k.shape[-2]
+
+        cos, sin = self.rotary(norm_x, seq_len=s, offset=past_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if past_kv is not None and isinstance(past_kv, (tuple, list)) and len(past_kv) == 2:
+            past_k, past_v = past_kv
+            if isinstance(past_k, torch.Tensor) and isinstance(past_v, torch.Tensor):
+                k = torch.cat([past_k, k], dim=-2)
+                v = torch.cat([past_v, v], dim=-2)
+
+        new_kv = (k, v)
+
+        if self.num_kv_heads < self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k_exp = k.repeat_interleave(repeats, dim=1)
+            v_exp = v.repeat_interleave(repeats, dim=1)
+        else:
+            k_exp = k
+            v_exp = v
+
+        if s > 1:
+            if past_len > 0:
+                q_idx = torch.arange(past_len, past_len + s, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(past_len + s, device=q.device).unsqueeze(0)
+                attn_mask = k_idx <= q_idx
+                attn = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=attn_mask)
+            else:
+                attn = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+        else:
+            attn = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
+
+        attn = attn.transpose(1, 2).contiguous().view(b, s, -1)
+        attn_out = self.o_proj(attn)
+        h = residual + attn_out
+
+        residual = h
+        norm_mlp = self._rmsnorm(h, self.post_attention_layernorm)
+        gate = self.act_fn(self.gate_proj(norm_mlp))
+        up = self.up_proj(norm_mlp)
+        mlp_out = self.down_proj(gate * up)
+        return residual + mlp_out, new_kv
 
 
 def test_verify_layer_numerical_parity_matching_weights():
@@ -250,6 +370,69 @@ def test_verify_layer_numerical_parity_detects_mismatch():
     # Random dissimilar weights
     parity = verify_layer_numerical_parity(real_block, ref_block, tolerance=1e-3)
     assert parity is False, "Parity verification must fail when weights differ"
+
+
+def test_gemma_layer_numerical_parity_matching_weights():
+    """Verify that RealTransformerBlock achieves numerical parity with GemmaReferenceDecoderLayer."""
+    hidden_dim = 128
+    num_heads = 4
+    num_kv_heads = 2
+    intermediate_size = 256
+    head_dim = 32
+
+    real_block = RealTransformerBlock(
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        intermediate_size=intermediate_size,
+        head_dim=head_dim,
+        architecture="gemma3",
+    )
+    ref_block = GemmaReferenceDecoderLayer(
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        intermediate_size=intermediate_size,
+        head_dim=head_dim,
+    )
+
+    with torch.no_grad():
+        ref_block.input_layernorm.copy_(real_block.input_layernorm.weight)
+        ref_block.q_proj.weight.copy_(real_block.q_proj.weight)
+        ref_block.k_proj.weight.copy_(real_block.k_proj.weight)
+        ref_block.v_proj.weight.copy_(real_block.v_proj.weight)
+        ref_block.o_proj.weight.copy_(real_block.o_proj.weight)
+        ref_block.post_attention_layernorm.copy_(real_block.post_attention_layernorm.weight)
+        ref_block.gate_proj.weight.copy_(real_block.gate_proj.weight)
+        ref_block.up_proj.weight.copy_(real_block.up_proj.weight)
+        ref_block.down_proj.weight.copy_(real_block.down_proj.weight)
+
+    test_input = torch.randn(1, 4, hidden_dim)
+    parity_prefill = verify_layer_numerical_parity(real_block, ref_block, tolerance=1e-3, test_input=test_input)
+    assert parity_prefill is True, "Gemma block must achieve numerical parity with Gemma reference layer on prefill"
+
+    # Cached single-token step
+    with torch.no_grad():
+        _, kv_real = real_block(test_input)
+        _, kv_ref = ref_block(test_input)
+    step_input = torch.randn(1, 1, hidden_dim)
+    parity_step = verify_layer_numerical_parity(real_block, ref_block, tolerance=1e-3, test_input=step_input, past_kv=kv_real)
+    assert parity_step is True, "Gemma block must achieve numerical parity on cached autoregressive step"
+
+
+def test_unverified_architectures_rejected():
+    """Verify that unverified architectures (qwen, transformer placeholder, gpt2, etc.) are strictly rejected."""
+    for bad_arch in ("qwen", "qwen2", "qwen2.5", "transformer", "gpt2", "mpt", "bert"):
+        assert not is_architecture_supported(bad_arch)
+        with pytest.raises(ValueError, match="Unsupported model architecture"):
+            RealTransformerBlock(
+                hidden_dim=128,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=256,
+                head_dim=32,
+                architecture=bad_arch,
+            )
 
 
 # =====================================================================

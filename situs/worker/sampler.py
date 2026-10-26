@@ -32,7 +32,7 @@ class TokenSampler:
             elif logits.dim() == 2:
                 logits = logits[-1, :]
 
-            if torch.isnan(logits).any() or torch.isinf(logits).all():
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
             # Prevent uniform random sampling across 256k vocab if weights are uninitialized (all zeros)
@@ -70,6 +70,12 @@ class TokenSampler:
                 arr = arr[0, -1, :]
             elif arr.ndim == 2:
                 arr = arr[-1, :]
+
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
+
+            if np.all(arr == 0):
+                return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
             if temperature <= 0.01:
                 return int(np.argmax(arr))

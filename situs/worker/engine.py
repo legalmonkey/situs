@@ -38,6 +38,13 @@ class StageExecutionEngine:
         compression_dtype: str = "int8",
         tokenizer=None,
     ):
+        is_fast_boot = getattr(assignment, "fast_boot", False) or getattr(stage_model, "fast_boot", False)
+        if is_fast_boot:
+            import os
+            env = os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
+            if env in ("production", "prod"):
+                raise ValueError("Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.")
+
         self.stage_model = stage_model
         self.assignment = assignment
         self.compression_dtype = compression_dtype
@@ -158,6 +165,8 @@ class StageExecutionEngine:
         """
         Invoked on the first pipeline stage when Coordinator dispatches a prompt.
         """
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
         if not self.is_first_stage():
             raise RuntimeError("start_inference called on a non-first stage worker")
 
@@ -167,13 +176,9 @@ class StageExecutionEngine:
         self.session_token_histories[request_id] = list(start_msg.input_ids)
 
         try:
-            if HAS_TORCH:
-                input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
-                h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
-                self.session_kv_caches[request_id] = new_kvs
-            else:
-                h = [[0.0] * self.stage_model.hidden_dim]
-                self.session_kv_caches[request_id] = []
+            input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
+            h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
+            self.session_kv_caches[request_id] = new_kvs
 
             # Compress boundary activation
             comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
@@ -215,6 +220,8 @@ class StageExecutionEngine:
         """
         Invoked on middle and last stages when activations arrive from previous stage.
         """
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
         request_id = act_frame.request_id
         if request_id in self.finished_sessions:
             return None
@@ -222,20 +229,17 @@ class StageExecutionEngine:
         try:
             comp_bytes = base64.b64decode(act_frame.payload_b64)
 
-            if HAS_TORCH:
-                hidden_states = decompress_tensor(
-                    comp_bytes,
-                    scale=act_frame.scale,
-                    shape=tuple(act_frame.shape),
-                    method=act_frame.dtype,
-                    device=self.stage_model.device,
-                    dtype=torch.float32,
-                )
-                past_kvs = self.session_kv_caches.get(request_id)
-                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
-                self.session_kv_caches[request_id] = new_kvs
-            else:
-                out = [[0.0] * self.stage_model.vocab_size] if self.is_last_stage() else [[0.0] * self.stage_model.hidden_dim]
+            hidden_states = decompress_tensor(
+                comp_bytes,
+                scale=act_frame.scale,
+                shape=tuple(act_frame.shape),
+                method=act_frame.dtype,
+                device=self.stage_model.device,
+                dtype=torch.float32,
+            )
+            past_kvs = self.session_kv_caches.get(request_id)
+            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+            self.session_kv_caches[request_id] = new_kvs
 
             is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(act_frame, "is_verified", True)
 
@@ -334,26 +338,25 @@ class StageExecutionEngine:
         """
         Invoked on Worker B to verify a drafted multi-token candidate batch in a single forward pass.
         """
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
         request_id = cand_frame.request_id
         if request_id in self.finished_sessions:
             return None
 
         comp_bytes = base64.b64decode(cand_frame.payload_b64)
 
-        if HAS_TORCH:
-            hidden_states = decompress_tensor(
-                comp_bytes,
-                scale=cand_frame.scale,
-                shape=tuple(cand_frame.shape),
-                method=cand_frame.dtype,
-                device=self.stage_model.device,
-                dtype=torch.float32,
-            )
-            past_kvs = self.session_kv_caches.get(request_id)
-            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
-            self.session_kv_caches[request_id] = new_kvs
-        else:
-            out = [[0.0] * self.stage_model.vocab_size] if self.is_last_stage() else [[0.0] * self.stage_model.hidden_dim]
+        hidden_states = decompress_tensor(
+            comp_bytes,
+            scale=cand_frame.scale,
+            shape=tuple(cand_frame.shape),
+            method=cand_frame.dtype,
+            device=self.stage_model.device,
+            dtype=torch.float32,
+        )
+        past_kvs = self.session_kv_caches.get(request_id)
+        out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+        self.session_kv_caches[request_id] = new_kvs
 
         if not self.is_last_stage():
             # Middle stage: forward intermediate candidate activations down the chain
@@ -483,6 +486,8 @@ class StageExecutionEngine:
         Invoked on the first pipeline stage when the last stage emits the next token ID.
         Worker A embeds the single token and sends intermediate activation to continue the cycle!
         """
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
         if not self.is_first_stage():
             first_target = getattr(self.assignment, "first_worker_id", None)
             if first_target and first_target != self.assignment.worker_id:
@@ -516,7 +521,7 @@ class StageExecutionEngine:
 
             # 1. Speculative Path: check for candidate n-grams
             candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
-            if candidates and HAS_TORCH:
+            if candidates:
                 input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
                 past_kvs = self.session_kv_caches.get(request_id)
                 h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
@@ -544,13 +549,10 @@ class StageExecutionEngine:
                 )
 
             # 2. Standard Single-Token Path
-            if HAS_TORCH:
-                input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
-                past_kvs = self.session_kv_caches.get(request_id)
-                h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
-                self.session_kv_caches[request_id] = new_kvs
-            else:
-                h = [[0.0] * self.stage_model.hidden_dim]
+            input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
+            past_kvs = self.session_kv_caches.get(request_id)
+            h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+            self.session_kv_caches[request_id] = new_kvs
 
             comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
             b64_payload = base64.b64encode(comp_bytes).decode("ascii")

@@ -36,48 +36,47 @@ SUPPORTED_ARCHITECTURES: Set[str] = {
     "gemma",
     "gemma2",
     "gemma3",
-    "qwen",
-    "qwen2",
-    "qwen2.5",
     "mistral",
-    "transformer",
 }
 
 
 def is_architecture_supported(arch: Optional[str]) -> bool:
     """
     Validates that the architecture is compatible with RealTransformerBlock
-    (RMSNorm, RoPE, and SwiGLU-style MLP). Explicitly rejects unsupported
-    architectures such as MoE, MPT, GPT-2 (LayerNorm + learned position embeddings), etc.
+    (RMSNorm, RoPE, and SwiGLU/GeGLU-style MLP with verified numerical parity).
+    Explicitly rejects unsupported architectures such as MoE, MPT, GPT-2,
+    Qwen (unsupported QKV bias), generic placeholder 'transformer', etc.
     """
     if not arch or not isinstance(arch, str):
         return False
     norm = arch.strip().lower()
-    incompatible = ("moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon", "chatglm", "bloom", "opt", "bert", "t5")
+    incompatible = ("moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon", "chatglm", "bloom", "opt", "bert", "t5", "qwen", "transformer")
     for bad in incompatible:
         if bad in norm:
             return False
     for supported in SUPPORTED_ARCHITECTURES:
         if norm == supported or norm.startswith(supported):
             return True
-        if supported != "transformer" and supported in norm:
+        if supported in norm:
             return True
     return False
 
 
 class RMSNorm(nn.Module if HAS_TORCH else object):
-    """Root Mean Square Layer Normalization (standard for LLaMA, Gemma, Mistral, Qwen)."""
-    def __init__(self, dim: int, eps: float = 1e-6):
+    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral; with unit-offset for Gemma)."""
+    def __init__(self, dim: int, eps: float = 1e-6, is_gemma: bool = False):
         super().__init__()
         self.eps = eps
+        self.is_gemma = is_gemma
         if HAS_TORCH:
-            self.weight = nn.Parameter(torch.ones(dim))
+            self.weight = nn.Parameter(torch.zeros(dim) if is_gemma else torch.ones(dim))
 
     def forward(self, x):
         if not HAS_TORCH or not isinstance(x, torch.Tensor):
             return x
         variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight
+        w = (1.0 + self.weight) if self.is_gemma else self.weight
+        return x * torch.rsqrt(variance + self.eps) * w
 
 
 class RotaryEmbedding(nn.Module if HAS_TORCH else object):
@@ -85,14 +84,33 @@ class RotaryEmbedding(nn.Module if HAS_TORCH else object):
     def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0):
         super().__init__()
         self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
         if HAS_TORCH:
             inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
             self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x, seq_len: int):
+    def forward(
+        self,
+        x,
+        seq_len: Optional[int] = None,
+        offset: int = 0,
+        position_ids: Optional[torch.Tensor] = None,
+    ):
         if not HAS_TORCH or not isinstance(x, torch.Tensor):
             return x, x
-        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        if position_ids is not None:
+            t = position_ids.to(device=x.device, dtype=self.inv_freq.dtype)
+            if t.dim() == 2:
+                freqs = t.unsqueeze(-1) * self.inv_freq.to(t.device)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                return emb.cos(), emb.sin()
+            else:
+                t = t.view(-1)
+        else:
+            if seq_len is None:
+                seq_len = x.shape[1] if x.dim() >= 2 else 1
+            t = torch.arange(offset, offset + seq_len, device=x.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
@@ -107,8 +125,16 @@ def apply_rotary_pos_emb(q, k, cos, sin):
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, dim]
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    cos = cos.to(device=q.device, dtype=q.dtype)
+    sin = sin.to(device=k.device, dtype=k.dtype)
+
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, dim]
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    elif cos.dim() == 3:
+        cos = cos.unsqueeze(1)  # [batch, 1, seq_len, dim]
+        sin = sin.unsqueeze(1)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -177,7 +203,10 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         if not HAS_TORCH:
             return
 
-        self.input_layernorm = RMSNorm(hidden_dim, eps=eps)
+        arch_norm = architecture.strip().lower() if architecture else ""
+        self.is_gemma = "gemma" in arch_norm
+
+        self.input_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=self.is_gemma)
 
         # Self-Attention projections (instant zero initialization)
         self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim)
@@ -185,12 +214,15 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim)
         self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim)
 
-        # SwiGLU MLP
-        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps)
+        # Feed-Forward Network (SwiGLU for LLaMA/Mistral, GeGLU for Gemma)
+        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=self.is_gemma)
         self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size)
         self.up_proj = _fast_linear(hidden_dim, self.intermediate_size)
         self.down_proj = _fast_linear(self.intermediate_size, hidden_dim)
-        self.act_fn = nn.SiLU()
+        if self.is_gemma:
+            self.act_fn = nn.GELU(approximate="tanh")
+        else:
+            self.act_fn = nn.SiLU()
 
         # Rotary Embeddings
         self.rotary = RotaryEmbedding(self.head_dim)
@@ -213,6 +245,18 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        # Determine past KV cache length for RoPE offset
+        past_len = 0
+        if past_kv is not None and isinstance(past_kv, (tuple, list)) and len(past_kv) == 2:
+            past_k, past_v = past_kv
+            if isinstance(past_k, torch.Tensor):
+                past_len = past_k.shape[-2]
+
+        # Apply Rotary Position Embeddings (RoPE)
+        if hasattr(self, "rotary") and self.rotary is not None:
+            cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=past_len)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         # KV Cache concatenation for autoregressive steps
         if past_kv is not None and isinstance(past_kv, (tuple, list)) and len(past_kv) == 2:
             past_k, past_v = past_kv
@@ -232,13 +276,22 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             v_exp = v
 
         # Scaled dot-product attention
-        is_causal = (seq_len > 1 and past_kv is None)
-        attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=is_causal)
+        if seq_len > 1:
+            if past_len > 0:
+                q_idx = torch.arange(past_len, past_len + seq_len, device=q.device).unsqueeze(1)
+                k_idx = torch.arange(past_len + seq_len, device=q.device).unsqueeze(0)
+                attn_mask = k_idx <= q_idx
+                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=attn_mask)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
+
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         attn_out = self.o_proj(attn_out)
         x = residual + attn_out
 
-        # SwiGLU MLP
+        # SwiGLU / GeGLU MLP
         residual = x
         norm_mlp = self.post_attention_layernorm(x)
         mlp_out = self.down_proj(self.act_fn(self.gate_proj(norm_mlp)) * self.up_proj(norm_mlp))
@@ -466,11 +519,12 @@ def verify_layer_numerical_parity(
     ref_block: Any,
     tolerance: float = 1e-3,
     test_input: Optional[Any] = None,
+    past_kv: Optional[Any] = None,
 ) -> bool:
     """
     Verifies that installed weights in RealTransformerBlock produce outputs mathematically
     equivalent to a reference transformer decoder block (e.g. HuggingFace LlamaDecoderLayer / GemmaDecoderLayer)
-    within the specified numerical tolerance.
+    within the specified numerical tolerance for both prompt prefill and cached single-token autoregressive generation.
     """
     if not HAS_TORCH:
         raise RuntimeError("PyTorch is required for numerical parity verification")
@@ -491,18 +545,25 @@ def verify_layer_numerical_parity(
 
     with torch.no_grad():
         x_block = test_input.clone()
-        out_block, _ = block(x_block)
+        out_block, block_new_kv = block(x_block, past_kv=past_kv)
 
         x_ref = test_input.clone()
         try:
-            ref_res = ref_block(x_ref)
+            ref_res = ref_block(x_ref, past_kv=past_kv)
         except TypeError:
-            ref_res = ref_block(hidden_states=x_ref)
+            try:
+                ref_res = ref_block(x_ref)
+            except TypeError:
+                ref_res = ref_block(hidden_states=x_ref)
 
+        ref_new_kv = None
         if isinstance(ref_res, (tuple, list)):
             out_ref = ref_res[0]
+            if len(ref_res) > 1:
+                ref_new_kv = ref_res[1]
         elif hasattr(ref_res, "hidden_states"):
             out_ref = ref_res.hidden_states
+            ref_new_kv = getattr(ref_res, "past_key_values", None)
         elif isinstance(ref_res, torch.Tensor):
             out_ref = ref_res
         else:
@@ -522,6 +583,15 @@ def verify_layer_numerical_parity(
                 f"Numerical parity divergence: max absolute diff is {max_diff:.6e} > tolerance {tolerance}"
             )
             return False
+
+        if past_kv is not None and block_new_kv is not None and ref_new_kv is not None:
+            if isinstance(block_new_kv, (tuple, list)) and isinstance(ref_new_kv, (tuple, list)):
+                if len(block_new_kv) >= 2 and len(ref_new_kv) >= 2:
+                    k_match = torch.allclose(block_new_kv[0], ref_new_kv[0], atol=tolerance, rtol=tolerance)
+                    v_match = torch.allclose(block_new_kv[1], ref_new_kv[1], atol=tolerance, rtol=tolerance)
+                    if not (k_match and v_match):
+                        logger.warning("Numerical parity divergence in cached KV states.")
+                        return False
 
         return True
 
@@ -620,6 +690,10 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             safe_device = "cpu"
         self.device = safe_device
         self.progressive = progressive
+        if fast_boot:
+            env = os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
+            if env in ("production", "prod"):
+                raise ValueError("Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.")
         self.fast_boot = fast_boot
         self.fast_boot_active = fast_boot
 
@@ -670,7 +744,8 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
         # 3. Norm and LM Head (ONLY if last stage)
         if self.is_last_stage:
-            self.norm = RMSNorm(hidden_dim)
+            is_gemma = "gemma" in (self.architecture.strip().lower() if self.architecture else "")
+            self.norm = RMSNorm(hidden_dim, is_gemma=is_gemma)
             self.lm_head = _fast_linear(hidden_dim, vocab_size)
         else:
             self.norm = None
