@@ -369,7 +369,15 @@ def test_network_latency_and_speed_aware_partitioning():
         network_latency_ms=150.0,  # High 150ms WAN latency
     )
 
-    intervals = optimal_heterogeneous_partition([w_fast, w_slow], total_layers=32)
+    meta = {
+        "hidden_dim": 2048,
+        "intermediate_size": 8192,
+        "num_heads": 16,
+        "num_kv_heads": 8,
+        "vocab_size": 32000,
+        "context_length": 2048,
+    }
+    intervals = optimal_heterogeneous_partition([w_fast, w_slow], total_layers=32, model_metadata=meta)
     fast_count = intervals[0][1] - intervals[0][0]
     slow_count = intervals[1][1] - intervals[1][0]
     assert fast_count + slow_count == 32

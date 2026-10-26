@@ -29,6 +29,41 @@ from situs.coordinator.registry import resolve_model_metadata
 
 logger = logging.getLogger("situs.worker.loader")
 
+SUPPORTED_ARCHITECTURES: Set[str] = {
+    "llama",
+    "llama2",
+    "llama3",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "qwen",
+    "qwen2",
+    "qwen2.5",
+    "mistral",
+    "transformer",
+}
+
+
+def is_architecture_supported(arch: Optional[str]) -> bool:
+    """
+    Validates that the architecture is compatible with RealTransformerBlock
+    (RMSNorm, RoPE, and SwiGLU-style MLP). Explicitly rejects unsupported
+    architectures such as MoE, MPT, GPT-2 (LayerNorm + learned position embeddings), etc.
+    """
+    if not arch or not isinstance(arch, str):
+        return False
+    norm = arch.strip().lower()
+    incompatible = ("moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon", "chatglm", "bloom", "opt", "bert", "t5")
+    for bad in incompatible:
+        if bad in norm:
+            return False
+    for supported in SUPPORTED_ARCHITECTURES:
+        if norm == supported or norm.startswith(supported):
+            return True
+        if supported != "transformer" and supported in norm:
+            return True
+    return False
+
 
 class RMSNorm(nn.Module if HAS_TORCH else object):
     """Root Mean Square Layer Normalization (standard for LLaMA, Gemma, Mistral, Qwen)."""
@@ -455,8 +490,16 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         progressive: bool = False,
         fast_boot: bool = False,
         head_dim: Optional[int] = None,
+        architecture: Optional[str] = "transformer",
     ):
         super().__init__()
+        if not is_architecture_supported(architecture):
+            raise ValueError(
+                f"Unsupported model architecture '{architecture}'. "
+                f"DistributedStageModel requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
+                f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
+            )
+        self.architecture = architecture
         self.layer_start = layer_start
         self.layer_end = layer_end
         self.total_layers = total_layers
@@ -537,16 +580,22 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         """Loads verified pre-trained token embedding weights into the first stage."""
         if not self.is_first_stage or self.embed_tokens is None:
             return
-        if not HAS_TORCH or not isinstance(weights, torch.Tensor):
+        if not HAS_TORCH:
             return
+        if not isinstance(weights, torch.Tensor):
+            raise ValueError(
+                f"Expected torch.Tensor for embedding weights, got {type(weights).__name__}. "
+                f"Incompatible weights are rejected."
+            )
         with torch.no_grad():
             target_shape = self.embed_tokens.weight.shape
             src = weights.to(device=self.device, dtype=torch.float32)
-            if src.shape == target_shape:
-                self.embed_tokens.weight.copy_(src)
-            elif src.shape[1] == target_shape[1]:
-                min_v = min(src.shape[0], target_shape[0])
-                self.embed_tokens.weight[:min_v].copy_(src[:min_v])
+            if src.shape != target_shape:
+                raise ValueError(
+                    f"Embedding weight shape mismatch: expected {tuple(target_shape)}, got {tuple(src.shape)}. "
+                    f"Partial copying is rejected."
+                )
+            self.embed_tokens.weight.copy_(src)
             logger.info(f"Loaded verified embedding weights {tuple(src.shape)} into first stage.")
 
     def load_head_weights(self, lm_head_weight: Any, norm_weight: Optional[Any] = None):
@@ -556,18 +605,31 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if not HAS_TORCH:
             return
         with torch.no_grad():
-            if norm_weight is not None and self.norm is not None and isinstance(norm_weight, torch.Tensor):
+            if norm_weight is not None and self.norm is not None:
+                if not isinstance(norm_weight, torch.Tensor):
+                    raise ValueError(
+                        f"Expected torch.Tensor for RMSNorm weights, got {type(norm_weight).__name__}."
+                    )
                 n_src = norm_weight.to(device=self.device, dtype=torch.float32)
-                if n_src.shape == self.norm.weight.shape:
-                    self.norm.weight.copy_(n_src)
-            if lm_head_weight is not None and self.lm_head is not None and isinstance(lm_head_weight, torch.Tensor):
+                if n_src.shape != self.norm.weight.shape:
+                    raise ValueError(
+                        f"RMSNorm weight shape mismatch: expected {tuple(self.norm.weight.shape)}, got {tuple(n_src.shape)}. "
+                        f"Partial copying is rejected."
+                    )
+                self.norm.weight.copy_(n_src)
+            if lm_head_weight is not None and self.lm_head is not None:
+                if not isinstance(lm_head_weight, torch.Tensor):
+                    raise ValueError(
+                        f"Expected torch.Tensor for LM Head weights, got {type(lm_head_weight).__name__}."
+                    )
                 h_src = lm_head_weight.to(device=self.device, dtype=torch.float32)
                 target_shape = self.lm_head.weight.shape
-                if h_src.shape == target_shape:
-                    self.lm_head.weight.copy_(h_src)
-                elif h_src.shape[1] == target_shape[1]:
-                    min_v = min(h_src.shape[0], target_shape[0])
-                    self.lm_head.weight[:min_v].copy_(h_src[:min_v])
+                if h_src.shape != target_shape:
+                    raise ValueError(
+                        f"LM Head weight shape mismatch: expected {tuple(target_shape)}, got {tuple(h_src.shape)}. "
+                        f"Partial copying is rejected."
+                    )
+                self.lm_head.weight.copy_(h_src)
                 logger.info(f"Loaded verified LM Head weights into last stage.")
 
     def hot_swap_layer(self, layer_index: int, weights: Optional[Any] = None, new_block: Optional[Any] = None):
@@ -642,10 +704,19 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if not self.is_first_stage:
             raise RuntimeError("Called forward_first_stage on a non-first stage worker")
 
-        if self.embed_tokens is not None and HAS_TORCH and isinstance(input_ids, torch.Tensor):
+        if self.embed_tokens is not None and HAS_TORCH:
+            if not isinstance(input_ids, torch.Tensor):
+                if isinstance(input_ids, (list, tuple)):
+                    input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=self.device)
+                else:
+                    raise ValueError(f"input_ids must be a torch.Tensor, got {type(input_ids).__name__}")
             max_idx = self.embed_tokens.num_embeddings - 1
-            if (input_ids > max_idx).any() or (input_ids < 0).any():
-                input_ids = torch.clamp(input_ids, 0, max_idx)
+            if (input_ids < 0).any() or (input_ids > max_idx).any():
+                invalid_vals = input_ids[(input_ids < 0) | (input_ids > max_idx)].unique().tolist()
+                raise ValueError(
+                    f"Invalid token ID detected in input_ids: {invalid_vals}. "
+                    f"Token IDs must be in range [0, {self.vocab_size}) (vocab_size={self.vocab_size})."
+                )
 
         h = self.embed_tokens(input_ids)
         new_kvs = []
@@ -774,6 +845,14 @@ def load_hf_stage_model(
     Dynamically inspects model architecture metadata without hardcoding defaults.
     """
     meta = resolve_model_metadata(model_name)
+    arch = meta.get("architecture") or meta.get("model_type")
+    if not is_architecture_supported(arch):
+        raise ValueError(
+            f"Unsupported model architecture '{arch}' for model '{model_name}'. "
+            f"DistributedStageModel requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
+            f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
+        )
+
     hidden_dim = meta["hidden_dim"]
     vocab_size = meta["vocab_size"]
     num_heads = meta["num_heads"]
@@ -796,6 +875,7 @@ def load_hf_stage_model(
         progressive=progressive,
         fast_boot=fast_boot,
         head_dim=head_dim,
+        architecture=arch,
     )
 
     if not progressive and not fast_boot and HAS_TORCH:

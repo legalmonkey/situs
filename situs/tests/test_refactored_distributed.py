@@ -91,6 +91,7 @@ def test_telemetry_weighted_partition():
             "num_heads": 16,
             "num_kv_heads": 8,
             "vocab_size": 32000,
+            "context_length": 2048,
         },
     )
     assert len(parts) == 2

@@ -40,7 +40,7 @@ class CoordinatorConfig:
     relay_buffer_size: int = 64 * 1024 * 1024  # 64 MB
     enable_cors: bool = True
     worker_auth_token: Optional[str] = field(
-        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN")
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", None)
     )
     api_key: Optional[str] = field(default_factory=lambda: os.getenv("SITUS_API_KEY", None))
     admin_key: Optional[str] = field(default_factory=lambda: os.getenv("SITUS_ADMIN_KEY", None))
@@ -125,7 +125,10 @@ class WorkerConfig:
     enable_speculative: bool = True
     p2p_direct_enabled: bool = True
     auth_token: Optional[str] = field(
-        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN")
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", None)
+    )
+    worker_auth_token: Optional[str] = field(
+        default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", None)
     )
     environment: str = field(
         default_factory=lambda: os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
@@ -140,15 +143,25 @@ class WorkerConfig:
             raise ValueError(
                 f"Invalid worker_id '{self.worker_id}': ID must be 1-128 alphanumeric/hyphen/underscore/dot characters and cannot be reserved or contain path traversal."
             )
-        if self.is_production:
-            if not self.auth_token or not self.auth_token.strip():
-                raise ValueError("Production mode requires SITUS_WORKER_AUTH_TOKEN (auth_token) to be configured.")
-            if self.auth_token.strip().lower() in INSECURE_SECRETS:
-                raise ValueError(
-                    f"Insecure auth_token '{self.auth_token}' is not allowed in production mode."
-                )
+        for token_val, token_name in [
+            (self.auth_token, "auth_token"),
+            (self.worker_auth_token, "worker_auth_token"),
+        ]:
+            if self.is_production:
+                if token_val is None or not token_val.strip():
+                    raise ValueError(
+                        f"Production mode requires SITUS_WORKER_AUTH_TOKEN ({token_name}) to be configured."
+                    )
+                if token_val.strip().lower() in INSECURE_SECRETS:
+                    raise ValueError(
+                        f"Insecure {token_name} '{token_val}' is not allowed in production mode."
+                    )
 
     def __post_init__(self):
+        if self.worker_auth_token is not None and self.auth_token is None:
+            self.auth_token = self.worker_auth_token
+        elif self.auth_token is not None and self.worker_auth_token is None:
+            self.worker_auth_token = self.auth_token
         self.validate()
 
 

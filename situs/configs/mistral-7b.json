@@ -1,10 +1,14 @@
 {
-  "architectures": ["MistralForCausalLM"],
+  "architectures": [
+    "MistralForCausalLM"
+  ],
   "model_type": "mistral",
   "num_hidden_layers": 32,
   "hidden_size": 4096,
   "intermediate_size": 14336,
   "vocab_size": 32768,
   "num_attention_heads": 32,
-  "num_key_value_heads": 8
+  "num_key_value_heads": 8,
+  "max_position_embeddings": 32768,
+  "torch_dtype": "bfloat16"
 }

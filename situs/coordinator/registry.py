@@ -40,7 +40,7 @@ def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     num_heads = data.get("num_attention_heads") or data.get("n_head") or data.get("num_heads")
     num_kv_heads = data.get("num_key_value_heads") or data.get("num_kv_heads") or num_heads
     intermediate_size = data.get("intermediate_size") or data.get("n_inner")
-    arch = data.get("model_type") or data.get("architecture") or "transformer"
+    arch = data.get("model_type") or data.get("architecture")
     if isinstance(data.get("architectures"), list) and data["architectures"]:
         arch = data["architectures"][0]
 
@@ -76,6 +76,15 @@ def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     if head_dim is None and hidden_dim and num_heads:
         head_dim = max(1, hidden_dim // max(1, num_heads))
 
+    context_length = _to_int(
+        data.get("max_position_embeddings")
+        or data.get("context_length")
+        or data.get("seq_length")
+        or data.get("max_sequence_length")
+        or data.get("n_positions")
+    )
+    torch_dtype = data.get("torch_dtype") or data.get("precision") or data.get("dtype")
+
     return {
         "total_layers": total_layers,
         "hidden_dim": hidden_dim,
@@ -84,7 +93,10 @@ def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads if num_kv_heads else num_heads,
         "head_dim": head_dim,
-        "architecture": str(arch),
+        "architecture": str(arch) if arch is not None else None,
+        "context_length": context_length,
+        "max_position_embeddings": context_length,
+        "torch_dtype": torch_dtype,
     }
 
 
@@ -205,7 +217,10 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                 vocab_size = None
                 intermediate = None
                 heads = None
+                kv_heads = None
                 head_dim = None
+                context_length = None
+                torch_dtype = None
                 for k, v in model_info.items():
                     if k.endswith(".block_count") and isinstance(v, int):
                         block_count = v
@@ -221,7 +236,11 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                         kv_heads = v
                     elif (k.endswith(".key_length") or k.endswith(".head_dim")) and isinstance(v, int):
                         head_dim = v
-                arch = model_info.get("general.architecture", "transformer")
+                    elif (k.endswith(".context_length") or k.endswith(".max_position_embeddings")) and isinstance(v, int):
+                        context_length = v
+                    elif k.endswith(".file_type") or k.endswith(".precision"):
+                        torch_dtype = str(v)
+                arch = model_info.get("general.architecture")
                 if head_dim is None and hidden_dim and heads:
                     head_dim = max(1, hidden_dim // max(1, heads))
 
@@ -235,6 +254,9 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                         "num_kv_heads": kv_heads if kv_heads else heads,
                         "head_dim": head_dim,
                         "architecture": arch,
+                        "context_length": context_length,
+                        "max_position_embeddings": context_length,
+                        "torch_dtype": torch_dtype,
                     }
                 else:
                     logger.warning(
@@ -254,28 +276,91 @@ def optimal_heterogeneous_partition(
     workers: List[WorkerNode],
     total_layers: int,
     model_metadata: Optional[Dict[str, Any]] = None,
+    runtime_config: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[int, int]]:
     """
     Computes optimal contiguous layer slices [start, end) for each worker using Dynamic Programming.
     Discovers hardware capabilities, VRAM limits, model layer footprints (weights + KV cache + overhead),
     and performance telemetry at runtime. Strictly prevents naive equal division across heterogeneous GPUs.
     """
-    K = len(workers)
-    if K == 0:
+    if not workers:
         return []
+
+    if not model_metadata or not isinstance(model_metadata, dict):
+        raise ValueError(
+            "optimal_heterogeneous_partition requires verified model_metadata. "
+            "Arbitrary fallback model dimensions have been removed."
+        )
+
+    # Validate required model geometry - no fallback dimensions allowed!
+    required_attrs = ("hidden_dim", "intermediate_size", "vocab_size", "num_heads")
+    missing_attrs = [
+        attr for attr in required_attrs
+        if model_metadata.get(attr) is None or model_metadata.get(attr) <= 0
+    ]
+    if missing_attrs:
+        raise ValueError(
+            f"optimal_heterogeneous_partition requires verified model metadata attributes: missing or invalid {missing_attrs}"
+        )
+
+    meta = model_metadata
+    h_dim = meta["hidden_dim"]
+    inter_dim = meta["intermediate_size"]
+    vocab_size = meta["vocab_size"]
+    num_heads = meta["num_heads"]
+    num_kv_heads = meta.get("num_kv_heads") or num_heads
+    head_dim = meta.get("head_dim") or max(1, h_dim // max(1, num_heads))
+
+    # Actual verified context length for KV-cache footprint (reject assumed fixed length)
+    context_length = (
+        (runtime_config.get("context_length") or runtime_config.get("max_seq_len"))
+        if runtime_config else None
+    ) or (
+        meta.get("context_length")
+        or meta.get("max_position_embeddings")
+        or meta.get("seq_length")
+        or meta.get("max_seq_len")
+    )
+    if context_length is None or context_length <= 0:
+        raise ValueError(
+            "optimal_heterogeneous_partition requires verified 'context_length' (or 'max_position_embeddings') "
+            "in model_metadata or runtime_config. Assumed fixed sequence lengths have been removed."
+        )
+
+    K = len(workers)
     if K == 1:
         return [(0, total_layers)]
 
-    meta = model_metadata or {}
-    h_dim = meta.get("hidden_dim", 2048)
-    inter_dim = meta.get("intermediate_size", h_dim * 4)
-    vocab_size = meta.get("vocab_size", 32000)
-    num_heads = meta.get("num_heads", 16)
-    num_kv_heads = meta.get("num_kv_heads", num_heads)
-    head_dim = meta.get("head_dim") or max(1, h_dim // max(1, num_heads))
+    # Precision: dtype bytes per param (fp32=4, fp16/bf16=2, int8/fp8=1, int4=0.5)
+    precision_val = (
+        (runtime_config.get("bytes_per_param") or runtime_config.get("precision") or runtime_config.get("compression_dtype"))
+        if runtime_config else None
+    ) or (
+        meta.get("bytes_per_param")
+        or meta.get("precision")
+        or meta.get("torch_dtype")
+        or meta.get("compression_dtype")
+        or meta.get("dtype")
+    )
+    if isinstance(precision_val, (int, float)) and precision_val > 0:
+        bytes_per_param = float(precision_val)
+    elif isinstance(precision_val, str):
+        p_str = precision_val.strip().lower()
+        if "32" in p_str:
+            bytes_per_param = 4.0
+        elif "16" in p_str or "bf" in p_str or "half" in p_str:
+            bytes_per_param = 2.0
+        elif "8" in p_str:
+            bytes_per_param = 1.0
+        elif "4" in p_str:
+            bytes_per_param = 0.5
+        else:
+            bytes_per_param = 2.0
+    else:
+        bytes_per_param = 2.0
 
-    # Bytes per element (fp16/bf16 = 2, int8 = 1)
-    bytes_per_param = 2
+    batch_size = int((runtime_config.get("batch_size") if runtime_config else None) or 1)
+
     # Layer weights: Attention Q, K, V, O projections + SwiGLU Gate, Up, Down projections + RMSNorms
     params_per_layer = (
         (h_dim * num_heads * head_dim) +
@@ -284,38 +369,38 @@ def optimal_heterogeneous_partition(
         (h_dim * inter_dim * 3) +
         (h_dim * 2)
     )
-    layer_weight_bytes = params_per_layer * bytes_per_param
-    # Dynamic KV cache footprint per layer (seq_len ~2048, batch_size=1)
-    kv_cache_bytes = 2 * num_kv_heads * head_dim * 2048 * bytes_per_param
+    layer_weight_bytes = int(params_per_layer * bytes_per_param)
+    # Dynamic KV cache footprint per layer using actual context length, batch size, and precision
+    kv_cache_bytes = int(2 * num_kv_heads * head_dim * context_length * batch_size * bytes_per_param)
     bytes_per_layer = max(10 * 1024**2, layer_weight_bytes + kv_cache_bytes)
 
     # Stage-specific memory overhead:
     # First stage holds embedding table
-    first_overhead = vocab_size * h_dim * bytes_per_param
+    first_overhead = int(vocab_size * h_dim * bytes_per_param)
     # Last stage holds final RMSNorm + lm_head projection
-    last_overhead = (h_dim + h_dim * vocab_size) * bytes_per_param
+    last_overhead = int((h_dim + h_dim * vocab_size) * bytes_per_param)
 
     speeds = []
     capacities_layers = []
 
     for idx, w in enumerate(workers):
-        is_cuda = (w.device_type == "cuda")
-        is_mps = (w.device_type == "mps")
-        vram_gb = max(1.0, w.total_vram_bytes / 1e9)
-
         # 1. Performance telemetry: use runtime-measured compute speed if available
-        base_speed = getattr(w, "compute_speed", None)
-        if not base_speed or base_speed <= 0:
-            if is_cuda:
-                base_speed = 10.0 + (vram_gb * 1.5)
-            elif is_mps:
-                base_speed = 8.0
-            else:
-                base_speed = 1.0  # CPU is order of magnitude slower
+        # Explicitly mark unmeasured telemetry as unknown without fabricating synthetic speeds
+        measured_speed = getattr(w, "compute_speed", None)
+        if measured_speed is not None and measured_speed > 0:
+            base_speed = float(measured_speed)
+        else:
+            base_speed = 1.0
+            logger.debug(f"Worker {w.worker_id}: compute_speed is unmeasured/unknown. Using baseline.")
 
-        # 2. Network telemetry: degrade effective throughput with network latency
-        lat_ms = getattr(w, "network_latency_ms", None) or 0.0
-        lat_penalty = 100.0 / (100.0 + max(0.0, lat_ms))
+        # 2. Network telemetry: degrade effective throughput with measured network latency
+        measured_lat = getattr(w, "network_latency_ms", None)
+        if measured_lat is not None and measured_lat >= 0:
+            lat_penalty = 100.0 / (100.0 + max(0.0, float(measured_lat)))
+        else:
+            lat_penalty = 1.0
+            logger.debug(f"Worker {w.worker_id}: network_latency_ms is unmeasured/unknown. Using baseline.")
+
         speed = base_speed * lat_penalty
         speeds.append(speed)
 
