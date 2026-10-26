@@ -142,9 +142,13 @@ situs run "Explain distributed pipeline parallelism over home Wi-Fi"
 
 ### Option A: Standard OpenAI Python SDK
 ```python
+import os
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="situs")
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key=os.getenv("SITUS_API_KEY", "your-api-key"),
+)
 
 response = client.chat.completions.create(
     model="llama-3.1:8b-instruct-q8_0",
@@ -166,6 +170,42 @@ curl -N http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+---
+
+## Cluster Security & Authentication
+
+Situs enforces security and authentication in both local and production environments:
+
+### Environment Configuration
+
+| Variable | Description | Default | Production Requirement |
+| :--- | :--- | :--- | :--- |
+| `SITUS_ENV` | Environment mode (`development` / `production`) | `development` | Optional (set to `production` for strict enforcement) |
+| `SITUS_WORKER_AUTH_TOKEN` | Secret token required for workers to join the cluster | `None` (open dev mode) | **Required** in production |
+| `SITUS_API_KEY` | Bearer token required for OpenAI API endpoints (`/v1/*`) | `None` (open dev mode) | **Required** in production |
+| `SITUS_ADMIN_KEY` | Secret key required for admin control (`/admin/*`) | `None` (open dev mode) | **Required** in production |
+| `SITUS_ALLOWED_ORIGINS` | Comma-separated explicit CORS allowed origins | `localhost, 127.0.0.1` | Explicit origins required; wildcard `*` is prohibited |
+
+### Running with Security Enabled
+
+1. **Launch Coordinator with Authentication**:
+   ```powershell
+   situs coordinator --port 8000 --token "your-cluster-secret" --api-key "client-api-key" --admin-key "admin-secret-key"
+   # Or configure via environment variables:
+   $env:SITUS_WORKER_AUTH_TOKEN="your-cluster-secret"
+   $env:SITUS_API_KEY="client-api-key"
+   $env:SITUS_ADMIN_KEY="admin-secret-key"
+   situs coordinator --port 8000
+   ```
+
+2. **Join Worker with Authentication**:
+   ```powershell
+   situs join 172.20.164.173:8000 --id worker-b --token "your-cluster-secret"
+   ```
+
+3. **CORS Security**:
+   Wildcard origins (`*`) are strictly prohibited when credentials are enabled to prevent cross-origin credential theft. Set explicit origins in `SITUS_ALLOWED_ORIGINS`.
 
 ---
 

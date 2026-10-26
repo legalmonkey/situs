@@ -32,35 +32,167 @@ class WorkerNode(BaseModel):
     network_latency_ms: Optional[float] = None
 
 
+def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Dynamically parses and validates a model config dict without arbitrary fallback defaults."""
+    total_layers = data.get("num_hidden_layers") or data.get("n_layer") or data.get("num_layers") or data.get("total_layers")
+    hidden_dim = data.get("hidden_size") or data.get("n_embd") or data.get("hidden_dim")
+    vocab_size = data.get("vocab_size")
+    num_heads = data.get("num_attention_heads") or data.get("n_head") or data.get("num_heads")
+    num_kv_heads = data.get("num_key_value_heads") or data.get("num_kv_heads") or num_heads
+    intermediate_size = data.get("intermediate_size") or data.get("n_inner")
+    arch = data.get("model_type") or data.get("architecture") or "transformer"
+    if isinstance(data.get("architectures"), list) and data["architectures"]:
+        arch = data["architectures"][0]
+
+    def _to_int(val):
+        try:
+            return int(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    total_layers = _to_int(total_layers)
+    hidden_dim = _to_int(hidden_dim)
+    vocab_size = _to_int(vocab_size)
+    num_heads = _to_int(num_heads)
+    num_kv_heads = _to_int(num_kv_heads) or num_heads
+    intermediate_size = _to_int(intermediate_size)
+
+    missing = []
+    if total_layers is None or total_layers <= 0:
+        missing.append("total_layers")
+    if hidden_dim is None or hidden_dim <= 0:
+        missing.append("hidden_dim")
+    if vocab_size is None or vocab_size <= 0:
+        missing.append("vocab_size")
+    if num_heads is None or num_heads <= 0:
+        missing.append("num_heads")
+    if intermediate_size is None or intermediate_size <= 0:
+        missing.append("intermediate_size")
+
+    if missing:
+        raise ValueError(f"Verified model config is missing required attributes: {missing}")
+
+    head_dim = _to_int(data.get("head_dim") or data.get("attention_head_dim") or data.get("key_length"))
+    if head_dim is None and hidden_dim and num_heads:
+        head_dim = max(1, hidden_dim // max(1, num_heads))
+
+    return {
+        "total_layers": total_layers,
+        "hidden_dim": hidden_dim,
+        "intermediate_size": intermediate_size,
+        "vocab_size": vocab_size,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads if num_kv_heads else num_heads,
+        "head_dim": head_dim,
+        "architecture": str(arch),
+    }
+
+
 @functools.lru_cache(maxsize=64)
 def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
     """
-    Dynamically discovers model configuration (total layers, hidden dimensions, heads).
-    Checks known model family architectures, local Ollama daemon, and HuggingFace AutoConfig.
-    Avoids hardcoded 32 layers or arbitrary hidden dimension defaults.
+    Dynamically discovers model configuration (total layers, hidden dimensions, heads, vocab).
+    Derives values directly from verified model configs (AutoConfig or local config files),
+    cached weights, or Ollama daemon.
+    Explicitly rejects unsupported models and disallows arbitrary fallback defaults.
     """
-    clean = model_name.lower().split(":")[0].replace("-", "").replace("_", "")
+    import os
+    import json
+    import pathlib
 
-    # 1. Known model family architectures (fast path, zero I/O)
-    KNOWN_FAMILIES = {
-        "gemma3": {"total_layers": 34, "hidden_dim": 2560, "intermediate_size": 10240, "vocab_size": 32000, "num_heads": 8, "num_kv_heads": 4},
-        "gemma29b": {"total_layers": 42, "hidden_dim": 3584, "intermediate_size": 14336, "vocab_size": 32000, "num_heads": 16, "num_kv_heads": 8},
-        "gemma2": {"total_layers": 26, "hidden_dim": 2304, "intermediate_size": 9216, "vocab_size": 32000, "num_heads": 8, "num_kv_heads": 4},
-        "llama3.1": {"total_layers": 32, "hidden_dim": 4096, "intermediate_size": 14336, "vocab_size": 32000, "num_heads": 32, "num_kv_heads": 8},
-        "llama3.23b": {"total_layers": 28, "hidden_dim": 3072, "intermediate_size": 8192, "vocab_size": 32000, "num_heads": 24, "num_kv_heads": 8},
-        "llama3.21b": {"total_layers": 16, "hidden_dim": 2048, "intermediate_size": 8192, "vocab_size": 32000, "num_heads": 32, "num_kv_heads": 8},
-        "llama3": {"total_layers": 32, "hidden_dim": 4096, "intermediate_size": 14336, "vocab_size": 32000, "num_heads": 32, "num_kv_heads": 8},
-        "qwen2.57b": {"total_layers": 28, "hidden_dim": 3584, "intermediate_size": 18944, "vocab_size": 32000, "num_heads": 28, "num_kv_heads": 4},
-        "qwen2.53b": {"total_layers": 36, "hidden_dim": 2048, "intermediate_size": 11008, "vocab_size": 32000, "num_heads": 16, "num_kv_heads": 2},
-        "qwen2.5": {"total_layers": 28, "hidden_dim": 3584, "intermediate_size": 18944, "vocab_size": 32000, "num_heads": 28, "num_kv_heads": 4},
-        "mistral7b": {"total_layers": 32, "hidden_dim": 4096, "intermediate_size": 14336, "vocab_size": 32000, "num_heads": 32, "num_kv_heads": 8},
-        "deepseekr17b": {"total_layers": 28, "hidden_dim": 3584, "intermediate_size": 18944, "vocab_size": 32000, "num_heads": 28, "num_kv_heads": 4},
-    }
-    for fam, spec in KNOWN_FAMILIES.items():
-        if fam.replace(".", "") in clean:
-            return {**spec, "architecture": "transformer"}
+    # 1. Direct filesystem path to config file or model directory
+    if os.path.isfile(model_name):
+        try:
+            with open(model_name, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return _parse_verified_config_dict(data)
+        except Exception as e:
+            logger.debug(f"Failed parsing config file at '{model_name}': {e}")
+    elif os.path.isdir(model_name):
+        cfg_path = os.path.join(model_name, "config.json")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return _parse_verified_config_dict(data)
+            except Exception as e:
+                logger.debug(f"Failed parsing config file at '{cfg_path}': {e}")
 
-    # 2. Check local Ollama daemon /api/show
+    # 2. Local verified configs directory (situs/configs/)
+    configs_dir = pathlib.Path(__file__).resolve().parent.parent / "configs"
+    if configs_dir.is_dir():
+        clean = model_name.lower().split(":")[0].replace("-", "").replace("_", "")
+        # Find matching config files
+        best_match = None
+        for cfg_file in configs_dir.glob("*.json"):
+            stem_clean = cfg_file.stem.lower().replace("-", "").replace("_", "")
+            if stem_clean == clean:
+                best_match = cfg_file
+                break
+            if stem_clean in clean or clean in stem_clean:
+                best_match = cfg_file
+
+        if best_match is not None:
+            try:
+                data = json.loads(best_match.read_text(encoding="utf-8"))
+                return _parse_verified_config_dict(data)
+            except Exception as e:
+                logger.debug(f"Failed loading verified config from {best_match}: {e}")
+
+    # 3. Check local model directory or cache config file
+    try:
+        from situs.worker.jit_streamer import DEFAULT_CACHE_DIR
+        safe_name = model_name.replace("/", "_").replace(":", "_")
+        model_dir = DEFAULT_CACHE_DIR / safe_name
+        if model_dir.is_dir():
+            cached_cfg = model_dir / "config.json"
+            if cached_cfg.is_file():
+                data = json.loads(cached_cfg.read_text(encoding="utf-8"))
+                return _parse_verified_config_dict(data)
+
+            # Check if layer safetensors header has verified embedded metadata
+            layer_files = sorted(model_dir.glob("layer_*.bin"))
+            if layer_files:
+                cached_data = layer_files[0].read_bytes()
+                if len(cached_data) > 8:
+                    h_len = int.from_bytes(cached_data[:8], "little")
+                    if 0 < h_len < len(cached_data):
+                        header = json.loads(cached_data[8:8 + h_len].decode("utf-8"))
+                        meta = header.get("__metadata__")
+                        if meta and isinstance(meta, dict):
+                            return _parse_verified_config_dict(meta)
+    except Exception as e:
+        logger.debug(f"Cache config check failed for '{model_name}': {e}")
+
+    # 4. Check HuggingFace AutoConfig
+    try:
+        from transformers import AutoConfig
+        config = None
+        try:
+            config = AutoConfig.from_pretrained(model_name, local_files_only=True)
+        except Exception:
+            hub_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            repo_name = f"models--{model_name.replace('/', '--')}"
+            repo_dir = os.path.join(hub_dir, repo_name)
+            if os.path.isdir(repo_dir):
+                snapshots_dir = os.path.join(repo_dir, "snapshots")
+                if os.path.isdir(snapshots_dir):
+                    for s in os.listdir(snapshots_dir):
+                        s_path = os.path.join(snapshots_dir, s)
+                        if os.path.isdir(s_path):
+                            try:
+                                config = AutoConfig.from_pretrained(s_path, local_files_only=True)
+                                if config:
+                                    break
+                            except Exception:
+                                pass
+
+        if config is not None:
+            return _parse_verified_config_dict(config.to_dict() if hasattr(config, "to_dict") else vars(config))
+    except Exception as e:
+        logger.debug(f"AutoConfig metadata resolution failed for '{model_name}': {e}")
+
+    # 5. Check local Ollama daemon /api/show
     try:
         import httpx
         with httpx.Client(timeout=1.0) as client:
@@ -69,85 +201,52 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                 data = resp.json()
                 model_info = data.get("model_info", {})
                 block_count = None
+                hidden_dim = None
+                vocab_size = None
+                intermediate = None
+                heads = None
+                head_dim = None
                 for k, v in model_info.items():
                     if k.endswith(".block_count") and isinstance(v, int):
                         block_count = v
-                        break
-                hidden_dim = None
-                for k, v in model_info.items():
-                    if (k.endswith(".embedding_length") or k.endswith(".hidden_size")) and isinstance(v, int):
+                    elif (k.endswith(".embedding_length") or k.endswith(".hidden_size")) and isinstance(v, int):
                         hidden_dim = v
-                        break
-                vocab_size = None
-                for k, v in model_info.items():
-                    if k.endswith(".vocab_size") and isinstance(v, int):
+                    elif k.endswith(".vocab_size") and isinstance(v, int):
                         vocab_size = v
-                        break
-                intermediate = None
-                for k, v in model_info.items():
-                    if k.endswith(".feed_forward_length") and isinstance(v, int):
+                    elif k.endswith(".feed_forward_length") and isinstance(v, int):
                         intermediate = v
-                        break
-                heads = None
-                for k, v in model_info.items():
-                    if k.endswith(".head_count") and not k.endswith("_kv") and isinstance(v, int):
+                    elif k.endswith(".head_count") and not k.endswith("_kv") and isinstance(v, int):
                         heads = v
-                        break
-                kv_heads = None
-                for k, v in model_info.items():
-                    if k.endswith(".head_count_kv") and isinstance(v, int):
+                    elif k.endswith(".head_count_kv") and isinstance(v, int):
                         kv_heads = v
-                        break
-                arch = model_info.get("general.architecture", "llama")
+                    elif (k.endswith(".key_length") or k.endswith(".head_dim")) and isinstance(v, int):
+                        head_dim = v
+                arch = model_info.get("general.architecture", "transformer")
+                if head_dim is None and hidden_dim and heads:
+                    head_dim = max(1, hidden_dim // max(1, heads))
 
-                if block_count and block_count > 0:
-                    if hidden_dim is None or hidden_dim <= 0:
-                        logger.warning(
-                            f"Ollama returned block_count={block_count} but no hidden_dim for '{model_name}'; "
-                            "cannot derive reliable metadata."
-                        )
-                    else:
-                        return {
-                            "total_layers": block_count,
-                            "hidden_dim": hidden_dim,
-                            "intermediate_size": intermediate if intermediate else (hidden_dim * 4),
-                            "vocab_size": vocab_size if vocab_size else 32000,
-                            "num_heads": heads if heads else max(1, hidden_dim // 128),
-                            "num_kv_heads": kv_heads if kv_heads else heads if heads else max(1, hidden_dim // 128),
-                            "architecture": arch,
-                        }
+                if block_count and hidden_dim and vocab_size and intermediate and heads:
+                    return {
+                        "total_layers": block_count,
+                        "hidden_dim": hidden_dim,
+                        "intermediate_size": intermediate,
+                        "vocab_size": vocab_size,
+                        "num_heads": heads,
+                        "num_kv_heads": kv_heads if kv_heads else heads,
+                        "head_dim": head_dim,
+                        "architecture": arch,
+                    }
+                else:
+                    logger.warning(
+                        f"Ollama returned incomplete model_info for '{model_name}'; rejecting due to missing attributes."
+                    )
     except Exception as e:
         logger.debug(f"Ollama metadata query failed: {e}")
 
-    # 3. Check HuggingFace AutoConfig
-    if "/" in model_name or "\\" in model_name:
-        try:
-            from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(model_name, local_files_only=True)
-            num_layers = getattr(config, "num_hidden_layers", None) or getattr(config, "n_layer", None)
-            hidden = getattr(config, "hidden_size", None) or getattr(config, "n_embd", None)
-            if num_layers is None or hidden is None:
-                raise ValueError(
-                    f"HuggingFace AutoConfig for '{model_name}' is missing required fields "
-                    f"(num_hidden_layers={num_layers}, hidden_size={hidden})."
-                )
-            return {
-                "total_layers": num_layers,
-                "hidden_dim": hidden,
-                "intermediate_size": getattr(config, "intermediate_size", hidden * 4),
-                "vocab_size": getattr(config, "vocab_size", 32000),
-                "num_heads": getattr(config, "num_attention_heads", getattr(config, "n_head", max(1, hidden // 128))),
-                "num_kv_heads": getattr(config, "num_key_value_heads", getattr(config, "num_attention_heads", max(1, hidden // 128))),
-                "architecture": getattr(config, "model_type", "unknown"),
-            }
-        except Exception:
-            pass
-
     raise RuntimeError(
         f"Cannot resolve model metadata for '{model_name}'. "
-        f"Model is not in the known families list, Ollama daemon is unreachable, "
-        f"and HuggingFace AutoConfig lookup failed. "
-        f"Please ensure the model is available locally or specify a supported model."
+        f"Model is unsupported: verified configuration could not be resolved from "
+        f"local config files, Hugging Face AutoConfig, or Ollama daemon."
     )
 
 
@@ -158,7 +257,8 @@ def optimal_heterogeneous_partition(
 ) -> List[Tuple[int, int]]:
     """
     Computes optimal contiguous layer slices [start, end) for each worker using Dynamic Programming.
-    Optimizes pipeline makespan max_j (layers_j / speed_j) while strictly respecting memory limits.
+    Discovers hardware capabilities, VRAM limits, model layer footprints (weights + KV cache + overhead),
+    and performance telemetry at runtime. Strictly prevents naive equal division across heterogeneous GPUs.
     """
     K = len(workers)
     if K == 0:
@@ -169,28 +269,64 @@ def optimal_heterogeneous_partition(
     meta = model_metadata or {}
     h_dim = meta.get("hidden_dim", 2048)
     inter_dim = meta.get("intermediate_size", h_dim * 4)
-    bytes_per_layer = max(10 * 1024**2, int(2 * (h_dim * inter_dim * 2 + h_dim * h_dim * 4)))
+    vocab_size = meta.get("vocab_size", 32000)
+    num_heads = meta.get("num_heads", 16)
+    num_kv_heads = meta.get("num_kv_heads", num_heads)
+    head_dim = meta.get("head_dim") or max(1, h_dim // max(1, num_heads))
+
+    # Bytes per element (fp16/bf16 = 2, int8 = 1)
+    bytes_per_param = 2
+    # Layer weights: Attention Q, K, V, O projections + SwiGLU Gate, Up, Down projections + RMSNorms
+    params_per_layer = (
+        (h_dim * num_heads * head_dim) +
+        (h_dim * num_kv_heads * head_dim * 2) +
+        (num_heads * head_dim * h_dim) +
+        (h_dim * inter_dim * 3) +
+        (h_dim * 2)
+    )
+    layer_weight_bytes = params_per_layer * bytes_per_param
+    # Dynamic KV cache footprint per layer (seq_len ~2048, batch_size=1)
+    kv_cache_bytes = 2 * num_kv_heads * head_dim * 2048 * bytes_per_param
+    bytes_per_layer = max(10 * 1024**2, layer_weight_bytes + kv_cache_bytes)
+
+    # Stage-specific memory overhead:
+    # First stage holds embedding table
+    first_overhead = vocab_size * h_dim * bytes_per_param
+    # Last stage holds final RMSNorm + lm_head projection
+    last_overhead = (h_dim + h_dim * vocab_size) * bytes_per_param
 
     speeds = []
     capacities_layers = []
 
-    for w in workers:
+    for idx, w in enumerate(workers):
         is_cuda = (w.device_type == "cuda")
+        is_mps = (w.device_type == "mps")
         vram_gb = max(1.0, w.total_vram_bytes / 1e9)
+
+        # 1. Performance telemetry: use runtime-measured compute speed if available
         base_speed = getattr(w, "compute_speed", None)
         if not base_speed or base_speed <= 0:
-            base_speed = (10.0 + vram_gb * 0.5) if is_cuda else 1.0
-        # Network latency penalty: latency degrades stage transit speed
+            if is_cuda:
+                base_speed = 10.0 + (vram_gb * 1.5)
+            elif is_mps:
+                base_speed = 8.0
+            else:
+                base_speed = 1.0  # CPU is order of magnitude slower
+
+        # 2. Network telemetry: degrade effective throughput with network latency
         lat_ms = getattr(w, "network_latency_ms", None) or 0.0
         lat_penalty = 100.0 / (100.0 + max(0.0, lat_ms))
         speed = base_speed * lat_penalty
         speeds.append(speed)
 
-        free_bytes = max(100 * 1024**2, w.free_vram_bytes)
-        max_fit = max(1, int(free_bytes // bytes_per_layer))
+        # 3. Memory telemetry: available free VRAM with 10% safety margin for runtime buffers
+        avail_vram = max(50 * 1024**2, int(w.free_vram_bytes * 0.9))
+        stage_overhead = (first_overhead if idx == 0 else 0) + (last_overhead if idx == (K - 1) else 0)
+        usable_for_layers = max(bytes_per_layer, avail_vram - min(avail_vram // 2, stage_overhead))
+        max_fit = max(1, int(usable_for_layers // bytes_per_layer))
         capacities_layers.append(max_fit)
 
-    # DP table: dp[k][i] = min makespan assigning i layers across first k workers
+    # 4. Dynamic Programming: minimize makespan max_k (l_k / speed_k) under capacity limits
     dp = [[math.inf] * (total_layers + 1) for _ in range(K + 1)]
     parent = [[0] * (total_layers + 1) for _ in range(K + 1)]
     dp[0][0] = 0.0
@@ -203,7 +339,9 @@ def optimal_heterogeneous_partition(
 
         for i in range(total_layers + 1):
             min_l = 1 if (total_layers >= K and not is_last) else 0
-            for l in range(min_l, min(i, max(cap * 3, total_layers)) + 1):
+            # Search within actual capacity bound (with 50% burst margin before hard fallback)
+            max_search = min(i, max(cap, int(cap * 1.5)))
+            for l in range(min_l, max_search + 1):
                 prev_i = i - l
                 if dp[k - 1][prev_i] == math.inf:
                     continue
@@ -213,13 +351,16 @@ def optimal_heterogeneous_partition(
                     dp[k][i] = stage_cost
                     parent[k][i] = l
 
+    # 5. Proportional memory/speed fallback if strict DP bounds cannot cover all layers
     if dp[K][total_layers] == math.inf:
-        logger.warning("DP partition constraint fallback to capacity-weighted proportional partitioning.")
-        total_w = sum(speeds[j] * max(1, capacities_layers[j]) for j in range(K))
+        logger.warning("DP partition constraint fallback to memory- and telemetry-weighted proportional partitioning.")
+        # Weight by available memory and compute speed
+        weights = [speeds[j] * max(1, capacities_layers[j]) for j in range(K)]
+        total_w = sum(weights)
         alloc = []
         rem = total_layers
         for j in range(K - 1):
-            share = (speeds[j] * max(1, capacities_layers[j])) / total_w
+            share = weights[j] / max(1e-6, total_w)
             n = max(1, min(rem - (K - 1 - j), int(round(total_layers * share))))
             alloc.append(n)
             rem -= n
@@ -232,6 +373,7 @@ def optimal_heterogeneous_partition(
             alloc[k - 1] = l
             curr -= l
 
+    # Ensure every worker has at least 1 layer if total_layers >= K
     if total_layers >= K:
         for idx in range(K):
             if alloc[idx] == 0:

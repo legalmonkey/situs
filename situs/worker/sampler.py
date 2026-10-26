@@ -32,6 +32,13 @@ class TokenSampler:
             elif logits.dim() == 2:
                 logits = logits[-1, :]
 
+            if torch.isnan(logits).any() or torch.isinf(logits).all():
+                return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
+
+            # Prevent uniform random sampling across 256k vocab if weights are uninitialized (all zeros)
+            if torch.all(logits == 0):
+                return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
+
             if temperature <= 0.01:
                 return int(torch.argmax(logits).item())
 
@@ -75,28 +82,14 @@ class TokenSampler:
             return int(np.random.choice(len(probs), p=probs))
 
     def decode_token(self, token_id: int) -> str:
-        """Decodes token ID to text string."""
-        if not self.tokenizer:
-            try:
-                from situs.tokenizer import get_or_load_tokenizer
-                self.tokenizer = get_or_load_tokenizer()
-            except Exception:
-                pass
+        """Decodes token ID to text string using the verified tokenizer."""
 
         if self.tokenizer:
             try:
                 text = self.tokenizer.decode([token_id], skip_special_tokens=False)
-                if text:
+                if text is not None:
                     return text
             except Exception:
                 pass
 
-        # Safe fallback: ASCII only, never produce CJK unicode glyphs from arbitrary integers
-        if 32 <= token_id <= 126 or token_id in (10, 13, 9):
-            return chr(token_id)
-        elif 0 <= token_id < 256:
-            try:
-                return bytes([token_id]).decode("utf-8", errors="replace")
-            except Exception:
-                pass
-        return " "
+        return ""

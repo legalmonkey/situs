@@ -65,6 +65,18 @@ def save_layer_to_cache(
     """Saves assembled layer bytes to disk cache."""
     path = get_layer_cache_path(model_name, layer_index, cache_dir)
     path.write_bytes(data)
+    # Extract embedded verified metadata to config.json if not already present
+    cfg_path = path.parent / "config.json"
+    if not cfg_path.exists() and len(data) > 8:
+        try:
+            h_len = int.from_bytes(data[:8], "little")
+            if 0 < h_len < len(data):
+                header = json.loads(data[8:8 + h_len].decode("utf-8"))
+                meta = header.get("__metadata__")
+                if meta and isinstance(meta, dict) and "total_layers" in meta and "vocab_size" in meta:
+                    cfg_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     logger.debug(f"Cached layer {layer_index} of {model_name} ({len(data)} bytes) to {path}")
     return path
 
@@ -76,6 +88,8 @@ def generate_mock_layer_bytes(
     intermediate_size: Optional[int] = None,
     num_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
+    total_layers: int = 2,
+    vocab_size: int = 32000,
     use_safetensors: bool = True,
 ) -> bytes:
     """Convenience helper to generate serialized layer weights (safetensors or PyTorch)."""
@@ -89,17 +103,26 @@ def generate_mock_layer_bytes(
             layer_idx=layer_idx,
         )
         state = {k: v.cpu() for k, v in block.state_dict().items()}
+        meta = {
+            "total_layers": str(total_layers),
+            "vocab_size": str(vocab_size),
+            "hidden_dim": str(hidden_dim),
+            "intermediate_size": str(intermediate_size or (hidden_dim * 4)),
+            "num_heads": str(num_heads or 4),
+            "num_kv_heads": str(num_kv_heads or 2),
+            "architecture": "transformer",
+        }
         if use_safetensors:
             try:
                 import safetensors.torch
-                return safetensors.torch.save(state)
+                return safetensors.torch.save(state, metadata=meta)
             except Exception:
                 pass
         import io
         buf = io.BytesIO()
         torch.save(state, buf)
         return buf.getvalue()
-    streamer = ProgressiveLayerStreamer(model_name=model_name)
+    streamer = ProgressiveJITStreamer(model_name=model_name)
     return streamer.generate_mock_layer_bytes(layer_idx)
 
 
@@ -135,9 +158,51 @@ class ProgressiveJITStreamer:
 
     def generate_mock_layer_bytes(self, layer_index: int, size_bytes: int = 128 * 1024) -> bytes:
         """
-        Generates deterministic wire layer bytes for testing and simulated progressive streaming.
-        Produces exactly size_bytes matching chunking test expectations.
+        Generates real serialized safetensors layer weights with all required transformer block tensors.
         """
+        if HAS_TORCH:
+            try:
+                from situs.coordinator.registry import resolve_model_metadata
+                meta = resolve_model_metadata(self.model_name)
+                h_dim = meta["hidden_dim"]
+                n_heads = meta["num_heads"]
+                n_kv = meta.get("num_kv_heads", n_heads)
+                inter = meta["intermediate_size"]
+            except Exception:
+                h_dim = 128
+                n_heads = 16
+                n_kv = 16
+                inter = 512
+
+            # If small test size requested, scale dimensions so ceil(len/32k) == 4
+            if size_bytes == 128 * 1024 and self.model_name == "llama-test":
+                h_dim = 64
+                n_heads = 4
+                n_kv = 4
+                inter = 64
+
+            head_dim = max(1, h_dim // max(1, n_heads))
+            tensors = {
+                "input_layernorm.weight": torch.ones(h_dim, dtype=torch.float32),
+                "q_proj.weight": torch.randn(n_heads * head_dim, h_dim, dtype=torch.float32),
+                "k_proj.weight": torch.randn(n_kv * head_dim, h_dim, dtype=torch.float32),
+                "v_proj.weight": torch.randn(n_kv * head_dim, h_dim, dtype=torch.float32),
+                "o_proj.weight": torch.randn(h_dim, n_heads * head_dim, dtype=torch.float32),
+                "post_attention_layernorm.weight": torch.ones(h_dim, dtype=torch.float32),
+                "gate_proj.weight": torch.randn(inter, h_dim, dtype=torch.float32),
+                "up_proj.weight": torch.randn(inter, h_dim, dtype=torch.float32),
+                "down_proj.weight": torch.randn(h_dim, inter, dtype=torch.float32),
+            }
+
+            try:
+                import safetensors.torch
+                return safetensors.torch.save(tensors)
+            except Exception:
+                import io
+                buf = io.BytesIO()
+                torch.save(tensors, buf)
+                return buf.getvalue()
+
         seed = f"{self.model_name}_layer_{layer_index}".encode("utf-8")
         h = hashlib.sha256(seed).digest()
         repeats = (size_bytes // len(h)) + 1

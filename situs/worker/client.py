@@ -149,7 +149,7 @@ class WorkerDaemon:
     async def heartbeat_loop(self):
         while self.is_running and self.ws:
             try:
-                gpu_name, total_b, free_b, dev_type, used_b = self.query_gpu_info()
+                gpu_name, total_b, free_b, dev_type, used_b = await asyncio.to_thread(self.query_gpu_info)
                 hb = Heartbeat(
                     worker_id=self.worker_id,
                     timestamp=time.time(),
@@ -177,7 +177,10 @@ class WorkerDaemon:
 
     async def run(self):
         ws_base = self.config.coordinator_url.rstrip("/")
-        ws_url = f"{ws_base}/{self.worker_id}"
+        if not ws_base.endswith(f"/{self.worker_id}"):
+            ws_url = f"{ws_base}/{self.worker_id}"
+        else:
+            ws_url = ws_base
         if getattr(self.config, "auth_token", None):
             sep = "&" if "?" in ws_url else "?"
             ws_url = f"{ws_url}{sep}token={self.config.auth_token}"
@@ -186,14 +189,30 @@ class WorkerDaemon:
         gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
         logger.info(f"Hardware: {gpu_name} (Used: {used_vram / 1e9:.2f} GB | Free: {free_vram / 1e9:.2f} GB | Total: {total_vram / 1e9:.2f} GB VRAM)")
 
-        # Pre-warm tokenizer so ASSIGN_LAYERS executes in milliseconds without network delays
-        try:
-            from situs.tokenizer import get_or_load_tokenizer
-            await asyncio.to_thread(get_or_load_tokenizer, self.config.model_name, allow_fallback=True)
-        except Exception as e:
-            logger.debug(f"Tokenizer pre-warm notice: {e}")
+        # Pre-warm tokenizer in background so registration is instant without network delays
+        async def _prewarm_tok():
+            try:
+                from situs.tokenizer import get_or_load_tokenizer
+                await asyncio.to_thread(get_or_load_tokenizer, self.config.model_name)
+            except Exception as e:
+                logger.debug(f"Tokenizer pre-warm notice: {e}")
 
-        async for websocket in websockets.connect(ws_url, ping_interval=20, ping_timeout=120):
+        asyncio.create_task(_prewarm_tok())
+
+        connect_kwargs = {"ping_interval": 20, "ping_timeout": 120}
+        if getattr(self.config, "auth_token", None):
+            import inspect
+            sig_params = inspect.signature(websockets.connect).parameters
+            auth_headers = [
+                ("X-Worker-Token", self.config.auth_token),
+                ("Authorization", f"Bearer {self.config.auth_token}"),
+            ]
+            if "additional_headers" in sig_params:
+                connect_kwargs["additional_headers"] = auth_headers
+            elif "extra_headers" in sig_params:
+                connect_kwargs["extra_headers"] = dict(auth_headers)
+
+        async for websocket in websockets.connect(ws_url, **connect_kwargs):
             self.ws = websocket
             try:
                 # 1. Register with Coordinator
@@ -245,7 +264,6 @@ class WorkerDaemon:
                             tok = await asyncio.to_thread(
                                 get_or_load_tokenizer,
                                 assign.model_name,
-                                allow_fallback=True,
                             )
                             self.engine = StageExecutionEngine(
                                 stage_model=stage_model,
@@ -347,15 +365,22 @@ def main():
     parser.add_argument("--device", default="cuda:0" if HAS_TORCH and torch.cuda.is_available() else "cpu", help="PyTorch compute device")
     parser.add_argument("--model", default="gemma3:4b", help="Model identifier")
     parser.add_argument("--compression", default="int8", choices=["none", "fp16", "int8"], help="Activation compression dtype")
+    parser.add_argument("--token", "--auth-token", default=os.getenv("SITUS_WORKER_AUTH_TOKEN"), help="Worker authentication token")
     args = parser.parse_args()
 
-    cfg = WorkerConfig(
-        coordinator_url=args.coordinator,
-        worker_id=args.id,
-        device=args.device,
-        model_name=args.model,
-        compression_dtype=args.compression,
-    )
+    try:
+        cfg = WorkerConfig(
+            coordinator_url=args.coordinator,
+            worker_id=args.id,
+            device=args.device,
+            model_name=args.model,
+            compression_dtype=args.compression,
+            auth_token=args.token,
+        )
+    except ValueError as e:
+        sys.stderr.write(f"\n[Situs Security Configuration Error] {e}\n\n")
+        sys.exit(1)
+
     daemon = WorkerDaemon(cfg)
     asyncio.run(daemon.run())
 

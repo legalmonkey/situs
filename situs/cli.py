@@ -276,6 +276,9 @@ def start_coordinator(
     host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host address to bind to"),
     port: int = typer.Option(8000, "--port", "-p", help="Port number for coordinator & relay"),
     workers_min: int = typer.Option(2, "--workers-min", help="Minimum workers required before inference"),
+    worker_auth_token: Optional[str] = typer.Option(None, "--worker-auth-token", "--token", envvar="SITUS_WORKER_AUTH_TOKEN", help="Worker authentication token"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="SITUS_API_KEY", help="OpenAI API key for coordinator gateway"),
+    admin_key: Optional[str] = typer.Option(None, "--admin-key", envvar="SITUS_ADMIN_KEY", help="Administrator authorization key"),
 ):
     """Start the Situs Coordinator, WebSocket Relay, and OpenAI API Gateway."""
     lan_ip = get_local_ip()
@@ -298,13 +301,30 @@ def start_coordinator(
 
     try:
         import uvicorn
-        from situs.coordinator.app import app as fastapi_app
+        if worker_auth_token:
+            os.environ["SITUS_WORKER_AUTH_TOKEN"] = worker_auth_token
+        if api_key:
+            os.environ["SITUS_API_KEY"] = api_key
+        if admin_key:
+            os.environ["SITUS_ADMIN_KEY"] = admin_key
+
+        from situs.coordinator.app import app as fastapi_app, config as coord_config
+        if worker_auth_token:
+            coord_config.worker_auth_token = worker_auth_token
+        if api_key:
+            coord_config.api_key = api_key
+        if admin_key:
+            coord_config.admin_key = admin_key
+        coord_config.validate()
     except (ImportError, ModuleNotFoundError) as e:
         sys.stderr.write(f"\n[Situs] Cannot start coordinator - missing dependency: {e}\n\n")
         sys.stderr.write("To install all dependencies for this device, run in PowerShell:\n")
         sys.stderr.write("    pip install -e .\n")
         sys.stderr.write("or:\n")
         sys.stderr.write("    pip install -r requirements.txt\n\n")
+        raise typer.Exit(code=1)
+    except ValueError as e:
+        sys.stderr.write(f"\n[Situs Security Configuration Error] {e}\n\n")
         raise typer.Exit(code=1)
     uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
 
@@ -388,16 +408,20 @@ def join_cluster(
         console.print(info_panel)
         console.print("\n[white]Outbound duplex connection established. Waiting for pipeline partition...[/white]\n")
 
-    cfg = WorkerConfig(
-        coordinator_url=normalized_ws,
-        worker_id=worker_id,
-        device=actual_device,
-        model_name=model,
-        compression_dtype=compression,
-        enable_speculative=speculative,
-        p2p_direct_enabled=p2p,
-        auth_token=token or os.getenv("SITUS_WORKER_AUTH_TOKEN", "situs-cluster-secret"),
-    )
+    try:
+        cfg = WorkerConfig(
+            coordinator_url=normalized_ws,
+            worker_id=worker_id,
+            device=actual_device,
+            model_name=model,
+            compression_dtype=compression,
+            enable_speculative=speculative,
+            p2p_direct_enabled=p2p,
+            auth_token=token or os.getenv("SITUS_WORKER_AUTH_TOKEN"),
+        )
+    except ValueError as e:
+        sys.stderr.write(f"\n[Situs Security Configuration Error] {e}\n\n")
+        raise typer.Exit(code=1)
 
     try:
         import logging

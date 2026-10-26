@@ -13,6 +13,7 @@ import subprocess
 import platform
 import logging
 import json
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -124,8 +125,20 @@ def find_nvidia_smi() -> Optional[str]:
     return None
 
 
-def query_nvidia_smi() -> Optional[Tuple[str, int, int, int]]:
-    """Queries nvidia-smi tool for GPU name, total VRAM, free VRAM, and used VRAM."""
+_last_smi_query_time: float = 0.0
+_last_smi_result: Optional[Tuple[str, int, int, int]] = None
+_SMI_CACHE_TTL: float = 5.0
+
+
+def query_nvidia_smi(force_refresh: bool = False) -> Optional[Tuple[str, int, int, int]]:
+    """Queries nvidia-smi tool for GPU name, total VRAM, free VRAM, and used VRAM.
+    Uses cached result within TTL to prevent blocking the async event loop with repeated child processes.
+    """
+    global _last_smi_query_time, _last_smi_result
+    now = time.time()
+    if not force_refresh and _last_smi_result is not None and (now - _last_smi_query_time) < _SMI_CACHE_TTL:
+        return _last_smi_result
+
     smi_bin = find_nvidia_smi()
     if not smi_bin:
         return None
@@ -134,7 +147,7 @@ def query_nvidia_smi() -> Optional[Tuple[str, int, int, int]]:
             [smi_bin, "--query-gpu=name,memory.total,memory.free,memory.used", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
-            timeout=1.5,
+            timeout=6.0,
             check=True,
         )
         output = res.stdout.strip()
@@ -148,16 +161,18 @@ def query_nvidia_smi() -> Optional[Tuple[str, int, int, int]]:
             total_b = int(total_mb * 1024 * 1024)
             free_b = int(free_mb * 1024 * 1024)
             used_b = int(used_mb * 1024 * 1024)
-            return (gpu_name, total_b, free_b, used_b)
+            _last_smi_result = (gpu_name, total_b, free_b, used_b)
+            _last_smi_query_time = now
+            return _last_smi_result
     except Exception:
         pass
-    return None
+    return _last_smi_result
 
 
 def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
     """
     Returns live (total_bytes, used_bytes, free_bytes) from dedicated GPU VRAM.
-    Uses PyTorch CUDA allocator if active; otherwise queries nvidia-smi directly.
+    Uses PyTorch CUDA allocator if active; otherwise queries nvidia-smi with caching.
     """
     if HAS_TORCH:
         try:

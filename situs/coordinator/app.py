@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 import json
+import re
 import hmac
 import asyncio
 import logging
@@ -13,7 +14,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from situs.config import CoordinatorConfig
+from situs.config import CoordinatorConfig, is_valid_worker_id, WORKER_ID_REGEX
 from situs.coordinator.registry import WorkerRegistry, resolve_model_metadata
 from situs.coordinator.relay import RelayHub
 from situs.protocol.messages import (
@@ -26,7 +27,56 @@ from situs.protocol.messages import (
 )
 from situs.tokenizer import get_or_load_tokenizer
 
+from starlette.types import Message, Send, Scope, Receive
+from starlette.datastructures import Headers
+from starlette.responses import PlainTextResponse, Response
+
 logger = logging.getLogger("situs.coordinator")
+
+
+class StrictCORSMiddleware(CORSMiddleware):
+    """CORS middleware strictly enforcing origin validation and preventing credential header leakage to untrusted origins."""
+
+    def is_allowed_origin(self, origin: str) -> bool:
+        if not origin or origin.lower() in ("*", "null"):
+            return False
+        norm_origin = origin.rstrip("/").lower()
+        # Dynamically check current config.allowed_origins in addition to middleware's allow_origins
+        allowed = set(self.allow_origins) | set(config.allowed_origins)
+        for allowed_orig in allowed:
+            if not allowed_orig:
+                continue
+            norm_allowed = allowed_orig.rstrip("/").lower()
+            if norm_allowed in ("*", "null") or "*" in norm_allowed:
+                continue
+            if norm_allowed == norm_origin:
+                return True
+        return False
+
+    def preflight_response(self, request_headers: Headers) -> Response:
+        origin = request_headers.get("origin")
+        if origin is not None and not self.is_allowed_origin(origin=origin):
+            return PlainTextResponse("Disallowed CORS origin", status_code=400)
+        res = super().preflight_response(request_headers)
+        if origin is not None and not self.is_allowed_origin(origin=origin):
+            for h in list(res.headers.keys()):
+                if h.lower().startswith("access-control-"):
+                    del res.headers[h]
+        return res
+
+    async def send(self, message: Message, send: Send, request_headers: Headers) -> None:
+        if message["type"] != "http.response.start":
+            await send(message)
+            return
+
+        origin = request_headers.get("Origin") or request_headers.get("origin")
+        if origin is not None and not self.is_allowed_origin(origin=origin):
+            # Untrusted origin: do not attach any Access-Control headers
+            await send(message)
+            return
+
+        await super().send(message, send, request_headers)
+
 
 config = CoordinatorConfig()
 registry = WorkerRegistry(heartbeat_timeout_s=config.heartbeat_timeout_s)
@@ -35,14 +85,20 @@ relay = RelayHub(registry=registry)
 app = FastAPI(title="Situs Distributed Inference Gateway", version="0.1.0")
 
 # Configure CORS with strict explicit origins (preventing insecure wildcard with credentials)
-allowed_origins = config.allowed_origins or ["http://localhost:8000", "http://127.0.0.1:8000"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+if config.enable_cors:
+    for origin in config.allowed_origins:
+        norm = origin.strip().lower()
+        if norm in ("*", "null") or "*" in norm:
+            raise ValueError(
+                f"Insecure CORS configuration: Origin '{origin}' is not permitted when credentials are enabled."
+            )
+    app.add_middleware(
+        StrictCORSMiddleware,
+        allow_origins=config.allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
 _request_semaphore: Optional[asyncio.Semaphore] = None
 
@@ -59,36 +115,45 @@ def get_request_semaphore() -> asyncio.Semaphore:
 # ==========================================
 
 def verify_api_key(request: Request):
-    """Enforces authenticated developer API keys for OpenAI endpoints when configured."""
+    """Enforces authenticated developer API keys for OpenAI endpoints when configured or in production."""
     if config.api_key:
-        auth_hdr = request.headers.get("authorization", "")
-        key = (
-            auth_hdr.replace("Bearer ", "").strip()
-            if auth_hdr.startswith("Bearer ")
-            else request.headers.get("x-api-key", "").strip()
-        )
+        auth_hdr = request.headers.get("authorization", "").strip()
+        if auth_hdr.lower().startswith("bearer "):
+            key = auth_hdr[7:].strip()
+        else:
+            key = request.headers.get("x-api-key", "").strip()
         if not key or not hmac.compare_digest(key, config.api_key):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized: Invalid or missing API key.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+    elif config.is_production:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Authentication required in production mode.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def verify_admin_key(request: Request):
     """Enforces administrator credentials for cluster control and management routes."""
     if config.admin_key:
-        auth_hdr = request.headers.get("authorization", "")
-        key = (
-            auth_hdr.replace("Bearer ", "").strip()
-            if auth_hdr.startswith("Bearer ")
-            else request.headers.get("x-admin-key", "").strip()
-        )
+        auth_hdr = request.headers.get("authorization", "").strip()
+        if auth_hdr.lower().startswith("bearer "):
+            key = auth_hdr[7:].strip()
+        else:
+            key = request.headers.get("x-admin-key", "").strip()
         if not key or not hmac.compare_digest(key, config.admin_key):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Forbidden: Invalid or missing Admin authorization key.",
             )
+    elif config.is_production:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Admin authorization required in production mode.",
+        )
 
 
 # ==========================================
@@ -115,31 +180,47 @@ class ChatCompletionRequest(BaseModel):
 
 @app.websocket("/ws/worker/{worker_id}")
 async def worker_websocket(websocket: WebSocket, worker_id: str):
-    # 1. Validate worker registration authentication token
+    # 1. Validate worker ID format & reject reserved or invalid identifiers
+    if not is_valid_worker_id(worker_id):
+        logger.warning(f"Rejected worker connection: Invalid worker_id '{worker_id}'")
+        await websocket.close(code=1008, reason=f"Invalid worker ID format: '{worker_id}'")
+        return
+
+    # 2. Validate worker registration authentication token
     if config.worker_auth_token:
-        token = websocket.query_params.get("token") or websocket.headers.get("x-worker-token")
-        auth_hdr = websocket.headers.get("authorization", "")
-        if auth_hdr.startswith("Bearer "):
-            token = auth_hdr.replace("Bearer ", "").strip()
+        token = websocket.headers.get("x-worker-token")
+        if not token:
+            auth_hdr = websocket.headers.get("authorization", "").strip()
+            if auth_hdr.lower().startswith("bearer "):
+                token = auth_hdr[7:].strip()
+            elif auth_hdr:
+                token = auth_hdr
+        if not token:
+            token = websocket.query_params.get("token")
 
         if not token or not hmac.compare_digest(token, config.worker_auth_token):
             logger.warning(f"Rejected worker connection {worker_id}: Invalid worker authentication token")
             await websocket.close(code=1008, reason="Authentication failed: invalid worker token")
             return
+    elif config.is_production:
+        logger.warning(f"Rejected worker connection {worker_id}: Production mode requires worker authentication token")
+        await websocket.close(code=1008, reason="Authentication required in production")
+        return
 
-    # 2. Prevent usurping an already-connected worker's identity
+    # 3. Prevent usurping an already-connected worker's identity
     if relay.is_worker_connected(worker_id):
         logger.warning(f"Rejected duplicate connection attempt for already connected worker_id: {worker_id}")
         await websocket.close(code=1008, reason=f"Worker ID '{worker_id}' is already actively connected")
         return
 
     await relay.connect_worker(worker_id, websocket)
+    is_registered = False
     try:
         while True:
             data = await websocket.receive_text()
             frame = ProtocolFrame.model_validate_json(data)
 
-            # 3. Enforce frame source integrity (prevent cross-worker frame injection)
+            # 4. Enforce frame source integrity (prevent cross-worker frame injection)
             if frame.source != worker_id and frame.source != "coordinator":
                 logger.warning(
                     f"Frame spoofing detected: worker '{worker_id}' sent frame with source='{frame.source}'. Dropping frame."
@@ -148,7 +229,14 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
 
             if frame.type == MessageType.WORKER_REGISTER:
                 reg = WorkerRegister.model_validate(frame.payload)
+                if reg.worker_id != worker_id or not is_valid_worker_id(reg.worker_id):
+                    logger.warning(
+                        f"Worker identity mismatch: connected as '{worker_id}' but registered as '{reg.worker_id}'"
+                    )
+                    await websocket.close(code=1008, reason="Worker ID mismatch in registration frame")
+                    return
                 registry.register_worker(reg)
+                is_registered = True
                 ack = ProtocolFrame(
                     type=MessageType.WORKER_REGISTERED,
                     source="coordinator",
@@ -156,6 +244,12 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
                     payload={"status": "registered", "worker_id": worker_id},
                 )
                 await relay.send_to_worker(worker_id, ack)
+
+            elif not is_registered:
+                logger.warning(
+                    f"Worker '{worker_id}' attempted to send '{frame.type}' before completing registration. Dropping frame."
+                )
+                continue
 
             elif frame.type == MessageType.HEARTBEAT:
                 free_vram = frame.payload.get("free_vram_bytes", 0)
@@ -327,20 +421,60 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         await sem.acquire()
 
     target_model = req.model or registry.active_model or "gemma3:4b"
+
+    # Check worker cluster readiness before loading weights or tokenizers
+    pipeline = registry.get_pipeline_order()
+    alive = registry.get_alive_workers()
+    if len(alive) < 1 and len(pipeline) < 1:
+        sem.release()
+        raise HTTPException(
+            status_code=503,
+            detail="Distributed cluster not ready. Require at least 1 worker (currently 0 connected).",
+        )
+
+    # Check and partition cluster dynamically if needed
+    if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
+        if len(alive) >= 1:
+            meta = resolve_model_metadata(target_model)
+            resolved_layers = meta["total_layers"]
+            assignments = registry.partition_model(
+                target_model, total_layers=resolved_layers, fast_boot=False, progressive=False, codec="zstd"
+            )
+            for assign in assignments:
+                frame = ProtocolFrame(
+                    type=MessageType.ASSIGN_LAYERS,
+                    source="coordinator",
+                    target=assign.worker_id,
+                    payload=assign.model_dump(),
+                )
+                await relay.send_to_worker(assign.worker_id, frame)
+            await asyncio.sleep(0.1)
+            pipeline = registry.get_pipeline_order()
+
+    if not req.stream and len(pipeline) < 1:
+        sem.release()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned).",
+        )
+
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     stream_queue = relay.register_response_stream(request_id)
 
     # Format prompt from chat messages
     prompt = "\n".join([f"{m.role}: {m.content}" for m in req.messages]) + "\nassistant:"
 
-    # Encode tokens using tokenizer (fail clearly with HTTP 400 if tokenizer cannot be loaded)
-    tokenizer = get_or_load_tokenizer(target_model, allow_fallback=True)
-    if tokenizer is None:
+    # Encode tokens using verified tokenizer (fail clearly with HTTP 400 if tokenizer cannot be loaded)
+    try:
+        tokenizer = get_or_load_tokenizer(target_model)
+        if tokenizer is None:
+            raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
+    except Exception as e:
         relay.cleanup_response_stream(request_id)
         sem.release()
         raise HTTPException(
             status_code=400,
-            detail=f"Prompt tokenization failed: could not load valid tokenizer for model '{target_model}'.",
+            detail=f"Prompt tokenization failed: could not load valid tokenizer for model '{target_model}': {e}",
         )
     try:
         input_ids = tokenizer.encode(prompt)
@@ -355,27 +489,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             status_code=400,
             detail=f"Prompt tokenization failed for model '{target_model}': {e}",
         )
-
-    # Check and partition cluster dynamically if needed
-    pipeline = registry.get_pipeline_order()
-    if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
-        alive = registry.get_alive_workers()
-        if len(alive) >= 1:
-            meta = resolve_model_metadata(target_model)
-            resolved_layers = meta.get("total_layers", 32)
-            assignments = registry.partition_model(
-                target_model, total_layers=resolved_layers, fast_boot=False, progressive=False, codec="zstd"
-            )
-            for assign in assignments:
-                frame = ProtocolFrame(
-                    type=MessageType.ASSIGN_LAYERS,
-                    source="coordinator",
-                    target=assign.worker_id,
-                    payload=assign.model_dump(),
-                )
-                await relay.send_to_worker(assign.worker_id, frame)
-            await asyncio.sleep(0.1)
-            pipeline = registry.get_pipeline_order()
 
     # 1. Return SSE Streaming Response
     if req.stream:
@@ -427,6 +540,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     await relay.send_to_worker(last_worker.worker_id, cfg_frame)
 
                 # Stream token frames from workers to client with cancellation handling
+                deadline = time.time() + config.request_timeout_s
+                done_yielded = False
                 while True:
                     if await request.is_disconnected():
                         logger.info(f"Client disconnected for request {request_id}. Propagating abort to workers.")
@@ -436,6 +551,18 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             payload={"request_id": request_id},
                         )
                         await relay.route_frame(abort_frame)
+                        break
+
+                    if time.time() > deadline:
+                        logger.error(f"Streaming request {request_id} timed out after {config.request_timeout_s}s")
+                        abort_frame = ProtocolFrame(
+                            type=MessageType.INFERENCE_ABORT,
+                            source="coordinator",
+                            payload={"request_id": request_id},
+                        )
+                        await relay.route_frame(abort_frame)
+                        err_chunk = {"error": f"Inference request timed out after {config.request_timeout_s} seconds."}
+                        yield f"data: {json.dumps(err_chunk)}\n\n"
                         break
 
                     try:
@@ -462,6 +589,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         yield f"data: {json.dumps(chunk)}\n\n"
                         if token_info.is_finished:
                             yield "data: [DONE]\n\n"
+                            done_yielded = True
                             break
 
                     elif frame.type == MessageType.SPECULATIVE_VERIFIED:
@@ -482,17 +610,28 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
                         if verified_info.is_finished:
+                            yield "data: [DONE]\n\n"
+                            done_yielded = True
                             break
 
                     elif frame.type == MessageType.ERROR:
                         err_msg = frame.payload.get("error", "Distributed worker error")
+                        abort_frame = ProtocolFrame(
+                            type=MessageType.INFERENCE_ABORT,
+                            source="coordinator",
+                            payload={"request_id": request_id},
+                        )
+                        await relay.route_frame(abort_frame)
                         yield f"data: {json.dumps({'error': err_msg})}\n\n"
                         break
 
                     elif frame.type == MessageType.INFERENCE_FINISH:
+                        yield "data: [DONE]\n\n"
+                        done_yielded = True
                         break
 
-                yield "data: [DONE]\n\n"
+                if not done_yielded:
+                    yield "data: [DONE]\n\n"
             finally:
                 relay.cleanup_response_stream(request_id)
                 sem.release()
@@ -593,6 +732,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
                 elif frame.type == MessageType.ERROR:
                     err_msg = frame.payload.get("error", "Worker error")
+                    abort_frame = ProtocolFrame(
+                        type=MessageType.INFERENCE_ABORT,
+                        source="coordinator",
+                        payload={"request_id": request_id},
+                    )
+                    await relay.route_frame(abort_frame)
                     raise HTTPException(status_code=500, detail=f"Distributed inference failed: {err_msg}")
 
                 elif frame.type == MessageType.INFERENCE_FINISH:

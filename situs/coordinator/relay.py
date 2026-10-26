@@ -30,6 +30,17 @@ class RelayHub:
         if worker_id in self.active_connections:
             del self.active_connections[worker_id]
             logger.info(f"Worker disconnected from relay: {worker_id}")
+            # Propagate error immediately to any in-flight response streams so requests don't hang
+            err_frame = ProtocolFrame(
+                type=MessageType.ERROR,
+                source="coordinator",
+                payload={"error": f"Worker node '{worker_id}' disconnected during inference."},
+            )
+            for q in list(self.response_streams.values()):
+                try:
+                    q.put_nowait(err_frame)
+                except Exception:
+                    pass
 
     def is_worker_connected(self, worker_id: str) -> bool:
         return worker_id in self.active_connections
@@ -97,4 +108,10 @@ class RelayHub:
 
     def cleanup_response_stream(self, request_id: str):
         if request_id in self.response_streams:
-            del self.response_streams[request_id]
+            q = self.response_streams.pop(request_id, None)
+            if q:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        break

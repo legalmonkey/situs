@@ -166,37 +166,47 @@ class StageExecutionEngine:
         self.session_configs[request_id] = start_msg
         self.session_token_histories[request_id] = list(start_msg.input_ids)
 
-        if HAS_TORCH:
-            input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
-            h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
-            self.session_kv_caches[request_id] = new_kvs
-        else:
-            h = [[0.0] * self.stage_model.hidden_dim]
-            self.session_kv_caches[request_id] = []
+        try:
+            if HAS_TORCH:
+                input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
+                h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
+                self.session_kv_caches[request_id] = new_kvs
+            else:
+                h = [[0.0] * self.stage_model.hidden_dim]
+                self.session_kv_caches[request_id] = []
 
-        # Compress boundary activation
-        comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
-        b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+            # Compress boundary activation
+            comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
+            b64_payload = base64.b64encode(comp_bytes).decode("ascii")
 
-        forward_act = ForwardActivation(
-            request_id=request_id,
-            step_index=0,
-            shape=list(shape),
-            dtype=self.compression_dtype,
-            scale=scale,
-            payload_b64=b64_payload,
-        )
+            forward_act = ForwardActivation(
+                request_id=request_id,
+                step_index=0,
+                shape=list(shape),
+                dtype=self.compression_dtype,
+                scale=scale,
+                payload_b64=b64_payload,
+            )
 
-        if self.is_last_stage():
-            # Single worker: worker holds all stages, process activation directly to emit first token
-            return self.process_forward_activation(forward_act)
+            if self.is_last_stage():
+                # Single worker: worker holds all stages, process activation directly to emit first token
+                return self.process_forward_activation(forward_act)
 
-        return ProtocolFrame(
-            type=MessageType.FORWARD_ACTIVATION,
-            source=self.assignment.worker_id,
-            target=self.assignment.next_worker_id,
-            payload=forward_act.model_dump(),
-        )
+            return ProtocolFrame(
+                type=MessageType.FORWARD_ACTIVATION,
+                source=self.assignment.worker_id,
+                target=self.assignment.next_worker_id,
+                payload=forward_act.model_dump(),
+            )
+        except Exception as e:
+            logger.error(f"Error in start_inference for {request_id}: {e}", exc_info=True)
+            self.abort_inference(request_id)
+            return ProtocolFrame(
+                type=MessageType.ERROR,
+                source=self.assignment.worker_id,
+                target="coordinator",
+                payload={"request_id": request_id, "error": str(e)},
+            )
 
     def process_forward_activation(self, act_frame: ForwardActivation) -> Optional[ProtocolFrame]:
         """
@@ -206,99 +216,109 @@ class StageExecutionEngine:
         if request_id in self.finished_sessions:
             return None
 
-        comp_bytes = base64.b64decode(act_frame.payload_b64)
+        try:
+            comp_bytes = base64.b64decode(act_frame.payload_b64)
 
-        if HAS_TORCH:
-            hidden_states = decompress_tensor(
-                comp_bytes,
-                scale=act_frame.scale,
-                shape=tuple(act_frame.shape),
-                method=act_frame.dtype,
-                device=self.stage_model.device,
-                dtype=torch.float32,
-            )
-            past_kvs = self.session_kv_caches.get(request_id)
-            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
-            self.session_kv_caches[request_id] = new_kvs
-        else:
-            out = [[0.0] * self.stage_model.vocab_size] if self.is_last_stage() else [[0.0] * self.stage_model.hidden_dim]
+            if HAS_TORCH:
+                hidden_states = decompress_tensor(
+                    comp_bytes,
+                    scale=act_frame.scale,
+                    shape=tuple(act_frame.shape),
+                    method=act_frame.dtype,
+                    device=self.stage_model.device,
+                    dtype=torch.float32,
+                )
+                past_kvs = self.session_kv_caches.get(request_id)
+                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+                self.session_kv_caches[request_id] = new_kvs
+            else:
+                out = [[0.0] * self.stage_model.vocab_size] if self.is_last_stage() else [[0.0] * self.stage_model.hidden_dim]
 
-        if not self.is_last_stage():
-            # Middle stage: forward activations down the chain
-            comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
-            b64_payload = base64.b64encode(comp_bytes).decode("ascii")
-            forward_act = ForwardActivation(
-                request_id=request_id,
-                step_index=act_frame.step_index,
-                shape=list(shape),
-                dtype=self.compression_dtype,
-                scale=scale,
-                payload_b64=b64_payload,
-            )
-            return ProtocolFrame(
-                type=MessageType.FORWARD_ACTIVATION,
-                source=self.assignment.worker_id,
-                target=self.assignment.next_worker_id,
-                payload=forward_act.model_dump(),
-            )
-        else:
-            # Last stage: compute next token from logits!
-            cfg = self.session_configs.get(request_id)
-            temperature = cfg.temperature if cfg else 0.7
-            top_p = cfg.top_p if cfg else 0.9
-            max_new_tokens = cfg.max_new_tokens if cfg else 256
-            stop_token_ids = cfg.stop_token_ids if cfg else []
-            step_idx = act_frame.step_index
+            if not self.is_last_stage():
+                # Middle stage: forward activations down the chain
+                comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
+                b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+                forward_act = ForwardActivation(
+                    request_id=request_id,
+                    step_index=act_frame.step_index,
+                    shape=list(shape),
+                    dtype=self.compression_dtype,
+                    scale=scale,
+                    payload_b64=b64_payload,
+                )
+                return ProtocolFrame(
+                    type=MessageType.FORWARD_ACTIVATION,
+                    source=self.assignment.worker_id,
+                    target=self.assignment.next_worker_id,
+                    payload=forward_act.model_dump(),
+                )
+            else:
+                # Last stage: compute next token from logits!
+                cfg = self.session_configs.get(request_id)
+                temperature = cfg.temperature if cfg else 0.7
+                top_p = cfg.top_p if cfg else 0.9
+                max_new_tokens = cfg.max_new_tokens if cfg else 256
+                stop_token_ids = cfg.stop_token_ids if cfg else []
+                step_idx = act_frame.step_index
 
-            if HAS_TORCH and isinstance(out, torch.Tensor):
-                if out.dim() == 3:
-                    last_logits = out[0, -1, :]
-                elif out.dim() == 2:
-                    last_logits = out[-1, :]
+                if HAS_TORCH and isinstance(out, torch.Tensor):
+                    if out.dim() == 3:
+                        last_logits = out[0, -1, :]
+                    elif out.dim() == 2:
+                        last_logits = out[-1, :]
+                    else:
+                        last_logits = out
                 else:
                     last_logits = out
-            else:
-                last_logits = out
 
-            token_id = self.sampler.sample_next_token(last_logits, temperature=temperature, top_p=top_p)
-            token_text = self.sampler.decode_token(token_id)
-            eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
-            if stop_token_ids:
-                is_eos = token_id in stop_token_ids
-            elif eos_id is not None:
-                is_eos = (token_id == eos_id)
-            else:
-                is_eos = False
+                token_id = self.sampler.sample_next_token(last_logits, temperature=temperature, top_p=top_p)
+                token_text = self.sampler.decode_token(token_id)
+                eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
+                if stop_token_ids:
+                    is_eos = token_id in stop_token_ids
+                elif eos_id is not None:
+                    is_eos = (token_id == eos_id)
+                else:
+                    is_eos = False
 
-            if not is_eos and token_text:
-                is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+                if not is_eos and token_text:
+                    is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 
-            is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
-            finish_reason = "stop" if is_eos else ("length" if is_finished else None)
+                is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
+                finish_reason = "stop" if is_eos else ("length" if is_finished else None)
 
-            if is_finished:
-                # Clean up session KV cache
-                self.session_kv_caches.pop(request_id, None)
-                self.session_configs.pop(request_id, None)
-                self.session_fast_boot_sequences.pop(request_id, None)
-                self.finished_sessions.add(request_id)
+                if is_finished:
+                    # Clean up session KV cache
+                    self.session_kv_caches.pop(request_id, None)
+                    self.session_configs.pop(request_id, None)
+                    self.session_fast_boot_sequences.pop(request_id, None)
+                    self.finished_sessions.add(request_id)
 
-            next_token = NextToken(
-                request_id=request_id,
-                step_index=step_idx + 1,
-                token_id=token_id,
-                token_text=token_text,
-                is_finished=is_finished,
-                finish_reason=finish_reason,
-            )
+                next_token = NextToken(
+                    request_id=request_id,
+                    step_index=step_idx + 1,
+                    token_id=token_id,
+                    token_text=token_text,
+                    is_finished=is_finished,
+                    finish_reason=finish_reason,
+                )
 
-            # Target the first worker (to embed next token) AND Coordinator
-            target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
+                # Target the first worker (to embed next token) AND Coordinator
+                target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
+                return ProtocolFrame(
+                    type=MessageType.NEXT_TOKEN,
+                    source=self.assignment.worker_id,
+                    target=target_first,
+                    payload=next_token.model_dump(),
+                )
+        except Exception as e:
+            logger.error(f"Error in process_forward_activation for {request_id}: {e}", exc_info=True)
+            self.abort_inference(request_id)
             return ProtocolFrame(
-                type=MessageType.NEXT_TOKEN,
+                type=MessageType.ERROR,
                 source=self.assignment.worker_id,
-                target=target_first,
-                payload=next_token.model_dump(),
+                target="coordinator",
+                payload={"request_id": request_id, "error": str(e)},
             )
 
     def process_speculative_candidates(self, cand_frame: SpeculativeCandidates) -> Optional[ProtocolFrame]:
@@ -477,69 +497,85 @@ class StageExecutionEngine:
             self.session_token_histories[request_id] = []
         self.session_token_histories[request_id].append(token_frame.token_id)
 
-        # 1. Speculative Path: check for candidate n-grams
-        candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
-        if candidates and HAS_TORCH:
-            input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
-            past_kvs = self.session_kv_caches.get(request_id)
-            h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
-            self.session_kv_caches[request_id] = new_kvs
+        try:
+            # 1. Speculative Path: check for candidate n-grams
+            candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
+            if candidates and HAS_TORCH:
+                input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
+                past_kvs = self.session_kv_caches.get(request_id)
+                h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+                self.session_kv_caches[request_id] = new_kvs
+
+                comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
+                b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+
+                spec_cand = SpeculativeCandidates(
+                    request_id=request_id,
+                    step_index=token_frame.step_index,
+                    candidate_tokens=candidates,
+                    shape=list(shape),
+                    dtype=self.compression_dtype,
+                    scale=scale,
+                    payload_b64=b64_payload,
+                )
+                return ProtocolFrame(
+                    type=MessageType.SPECULATIVE_CANDIDATES,
+                    source=self.assignment.worker_id,
+                    target=self.assignment.next_worker_id,
+                    payload=spec_cand.model_dump(),
+                )
+
+            # 2. Standard Single-Token Path
+            if HAS_TORCH:
+                input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
+                past_kvs = self.session_kv_caches.get(request_id)
+                h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+                self.session_kv_caches[request_id] = new_kvs
+            else:
+                h = [[0.0] * self.stage_model.hidden_dim]
 
             comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
             b64_payload = base64.b64encode(comp_bytes).decode("ascii")
 
-            spec_cand = SpeculativeCandidates(
+            forward_act = ForwardActivation(
                 request_id=request_id,
                 step_index=token_frame.step_index,
-                candidate_tokens=candidates,
                 shape=list(shape),
                 dtype=self.compression_dtype,
                 scale=scale,
                 payload_b64=b64_payload,
             )
+
+            if self.is_last_stage():
+                # Single worker: worker holds all stages, process activation directly
+                return self.process_forward_activation(forward_act)
+
             return ProtocolFrame(
-                type=MessageType.SPECULATIVE_CANDIDATES,
+                type=MessageType.FORWARD_ACTIVATION,
                 source=self.assignment.worker_id,
                 target=self.assignment.next_worker_id,
-                payload=spec_cand.model_dump(),
+                payload=forward_act.model_dump(),
             )
-
-        # 2. Standard Single-Token Path
-        if HAS_TORCH:
-            input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
-            past_kvs = self.session_kv_caches.get(request_id)
-            h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
-            self.session_kv_caches[request_id] = new_kvs
-        else:
-            h = [[0.0] * self.stage_model.hidden_dim]
-
-        comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
-        b64_payload = base64.b64encode(comp_bytes).decode("ascii")
-
-        forward_act = ForwardActivation(
-            request_id=request_id,
-            step_index=token_frame.step_index,
-            shape=list(shape),
-            dtype=self.compression_dtype,
-            scale=scale,
-            payload_b64=b64_payload,
-        )
-
-        if self.is_last_stage():
-            # Single worker: worker holds all stages, process activation directly
-            return self.process_forward_activation(forward_act)
-
-        return ProtocolFrame(
-            type=MessageType.FORWARD_ACTIVATION,
-            source=self.assignment.worker_id,
-            target=self.assignment.next_worker_id,
-            payload=forward_act.model_dump(),
-        )
+        except Exception as e:
+            logger.error(f"Error in process_next_token for {request_id}: {e}", exc_info=True)
+            self.abort_inference(request_id)
+            return ProtocolFrame(
+                type=MessageType.ERROR,
+                source=self.assignment.worker_id,
+                target="coordinator",
+                payload={"request_id": request_id, "error": str(e)},
+            )
 
     def abort_inference(self, request_id: str):
         """Cancels an active session and cleans up session KV cache and history."""
         self.session_kv_caches.pop(request_id, None)
         self.session_configs.pop(request_id, None)
         self.session_token_histories.pop(request_id, None)
+        self.session_fast_boot_sequences.pop(request_id, None)
         self.finished_sessions.add(request_id)
+        if HAS_TORCH and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         logger.info(f"Aborted session {request_id} and cleared session state.")
