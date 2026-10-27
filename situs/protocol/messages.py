@@ -36,6 +36,14 @@ class MessageType(str, Enum):
     ERROR = "error"
 
 
+class ModelManifest(BaseModel):
+    """Cryptographic manifest pinning model weights, revision, and tokenizer integrity."""
+    model_id: str
+    commit_hash: Optional[str] = None
+    tokenizer_sha256: Optional[str] = None
+    weights_sha256: Optional[str] = None
+
+
 class WorkerRegister(BaseModel):
     worker_id: str
     gpu_name: str
@@ -44,6 +52,7 @@ class WorkerRegister(BaseModel):
     used_vram_bytes: Optional[int] = None
     device_type: str = "cuda"  # 'cuda' or 'cpu'
     supported_models: List[str] = Field(default_factory=list)
+    model_manifests: Dict[str, ModelManifest] = Field(default_factory=dict)
 
 
 class AssignLayers(BaseModel):
@@ -58,7 +67,6 @@ class AssignLayers(BaseModel):
     prev_worker_id: Optional[str] = None
     first_worker_id: Optional[str] = None
     progressive: bool = False
-    fast_boot: bool = False
     codec: str = "zstd"
 
 
@@ -82,6 +90,7 @@ class InferenceStart(BaseModel):
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
+    seed: Optional[int] = None
     stop_token_ids: List[int] = Field(default_factory=list)
 
 
@@ -92,6 +101,9 @@ class ForwardActivation(BaseModel):
     dtype: str = "int8"
     scale: float = 1.0
     payload_b64: Optional[str] = None  # Base64 string for JSON or raw bytes in binary mode
+    stage_index: Optional[int] = None
+    expected_next_stage: Optional[int] = None
+    position_offset: int = 0
     is_verified: bool = True
     is_experimental: bool = False
 
@@ -169,7 +181,6 @@ class StageLayerAck(BaseModel):
     status: str = "ready"  # 'ready', 'loading', 'error'
     ready_layer_count: int = 1
     total_assigned: int = 16
-    is_fast_boot_active: bool = False
 
 
 class InferenceAbort(BaseModel):

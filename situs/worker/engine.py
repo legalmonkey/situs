@@ -20,6 +20,8 @@ from situs.worker.loader import DistributedStageModel
 from situs.worker.sampler import TokenSampler
 from situs.worker.speculative import PromptLookupDrafter, SpeculativeVerifier
 from situs.worker.jit_streamer import save_layer_to_cache
+from situs.protocol.framing import pack_tensor_frame, unpack_tensor_frame, TensorContractError
+from situs.worker.memory import GPUMemoryManager, RequestScopedKVCache, MemoryExhaustedError
 
 logger = logging.getLogger("situs.worker.engine")
 
@@ -30,6 +32,44 @@ except ImportError:
     HAS_TORCH = False
 
 
+class StageOrderingError(ValueError):
+    """Raised when an activation frame violates strict pipeline stage ordering invariants."""
+    pass
+
+
+class CancellationTokenRegistry:
+    """Out-of-band cancellation registry for cooperative request abortion."""
+    def __init__(self):
+        self._cancelled: set = set()
+
+    def cancel(self, request_id: str) -> None:
+        self._cancelled.add(request_id)
+
+    def is_cancelled(self, request_id: str) -> bool:
+        return request_id in self._cancelled
+
+    def clear(self, request_id: str) -> None:
+        self._cancelled.discard(request_id)
+
+
+class ActivationReplayRingBuffer:
+    """Ring buffer caching recent boundary activations (depth K=4) for fault-tolerant replay."""
+    def __init__(self, capacity: int = 4):
+        self.capacity = capacity
+        self.buffer: List[Tuple[str, int, bytes, Dict[str, Any]]] = []
+
+    def record(self, request_id: str, step_index: int, payload_bytes: bytes, metadata: Dict[str, Any]) -> None:
+        if len(self.buffer) >= self.capacity:
+            self.buffer.pop(0)
+        self.buffer.append((request_id, step_index, payload_bytes, metadata))
+
+    def retrieve(self, request_id: str, step_index: int) -> Optional[Tuple[bytes, Dict[str, Any]]]:
+        for req_id, step, p_bytes, meta in reversed(self.buffer):
+            if req_id == request_id and step == step_index:
+                return p_bytes, meta
+        return None
+
+
 class StageExecutionEngine:
     def __init__(
         self,
@@ -38,13 +78,6 @@ class StageExecutionEngine:
         compression_dtype: str = "int8",
         tokenizer=None,
     ):
-        is_fast_boot = getattr(assignment, "fast_boot", False) or getattr(stage_model, "fast_boot", False)
-        if is_fast_boot:
-            import os
-            env = os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
-            if env in ("production", "prod"):
-                raise ValueError("Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.")
-
         self.stage_model = stage_model
         self.assignment = assignment
         self.compression_dtype = compression_dtype
@@ -59,21 +92,15 @@ class StageExecutionEngine:
         self.session_token_histories: Dict[str, List[int]] = {}
         # Buffer for incoming progressive JIT layer chunks: layer_index -> {chunk_index: b64_payload}
         self.layer_chunk_buffers: Dict[int, Dict[int, str]] = {}
-        # Pre-computed conversational sequences for fast-boot skeleton mode
-        self.session_fast_boot_sequences: Dict[str, List[int]] = {}
         # Completed sessions to prevent stale in-flight duplicate frames from reviving finished generations
         self.finished_sessions: set = set()
 
-    def init_fast_boot_sequence(self, request_id: str, prompt_text: Optional[str] = "", model_name: str = ""):
-        """Ensures tokenizer is loaded for the session. Token generation is strictly neural from model logits."""
-        tok = self.sampler.tokenizer
-        if not tok:
-            try:
-                from situs.tokenizer import get_or_load_tokenizer
-                tok = get_or_load_tokenizer(model_name)
-                self.sampler.tokenizer = tok
-            except Exception:
-                pass
+        # State-of-the-art memory budgeting, cache isolation, and fault recovery
+        dev = getattr(stage_model, "device", "cpu")
+        self.memory_manager = GPUMemoryManager(total_vram_bytes=16 * 1024**3, safety_headroom_fraction=0.10, device=dev)
+        self.kv_cache_manager = RequestScopedKVCache(memory_manager=self.memory_manager)
+        self.cancellation_tokens = CancellationTokenRegistry()
+        self.replay_buffer = ActivationReplayRingBuffer(capacity=4)
 
     def is_first_stage(self) -> bool:
         return self.assignment.is_first_stage
@@ -149,7 +176,6 @@ class StageExecutionEngine:
                 status=status,
                 ready_layer_count=self.stage_model.get_ready_count(),
                 total_assigned=total_assigned,
-                is_fast_boot_active=self.stage_model.fast_boot_active,
             )
             target = source_worker or self.assignment.prev_worker_id or "coordinator"
             return ProtocolFrame(
@@ -171,20 +197,40 @@ class StageExecutionEngine:
             raise RuntimeError("start_inference called on a non-first stage worker")
 
         request_id = start_msg.request_id
+        if self.cancellation_tokens.is_cancelled(request_id):
+            return ProtocolFrame(
+                type=MessageType.ERROR,
+                source=self.assignment.worker_id,
+                target="coordinator",
+                payload={"request_id": request_id, "error": "Request cancelled prior to start"},
+            )
+
         self.finished_sessions.discard(request_id)
         self.session_configs[request_id] = start_msg
         self.session_token_histories[request_id] = list(start_msg.input_ids)
 
         try:
+            # Memory check & reservation
+            est_bytes = len(start_msg.input_ids) * 1024 * 8
+            self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
+
             input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
             h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
+            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
             self.session_kv_caches[request_id] = new_kvs
 
             # Compress boundary activation
             comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
             b64_payload = base64.b64encode(comp_bytes).decode("ascii")
 
-            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False)
+            # Record in activation replay ring buffer for downstream fault tolerance
+            self.replay_buffer.record(
+                request_id=request_id,
+                step_index=0,
+                payload_bytes=comp_bytes,
+                metadata={"shape": list(shape), "scale": scale, "dtype": self.compression_dtype},
+            )
+
             forward_act = ForwardActivation(
                 request_id=request_id,
                 step_index=0,
@@ -192,8 +238,11 @@ class StageExecutionEngine:
                 dtype=self.compression_dtype,
                 scale=scale,
                 payload_b64=b64_payload,
-                is_verified=not is_fast_boot,
-                is_experimental=is_fast_boot,
+                stage_index=self.assignment.layer_start,
+                expected_next_stage=self.assignment.layer_end,
+                position_offset=0,
+                is_verified=True,
+                is_experimental=False,
             )
 
             if self.is_last_stage():
@@ -223,8 +272,16 @@ class StageExecutionEngine:
         if not HAS_TORCH:
             raise RuntimeError("PyTorch is required for model inference")
         request_id = act_frame.request_id
-        if request_id in self.finished_sessions:
+        if self.cancellation_tokens.is_cancelled(request_id) or request_id in self.finished_sessions:
             return None
+
+        # Verify distributed stage ordering invariants
+        if not self.is_first_stage() and act_frame.expected_next_stage is not None:
+            if act_frame.expected_next_stage != self.assignment.layer_start:
+                raise StageOrderingError(
+                    f"Stage ordering invariant violated: incoming activation targeted stage {act_frame.expected_next_stage}, "
+                    f"but current worker executes stage [{self.assignment.layer_start}..{self.assignment.layer_end})"
+                )
 
         try:
             comp_bytes = base64.b64decode(act_frame.payload_b64)
@@ -237,16 +294,24 @@ class StageExecutionEngine:
                 device=self.stage_model.device,
                 dtype=torch.float32,
             )
-            past_kvs = self.session_kv_caches.get(request_id)
+            past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
             out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
             self.session_kv_caches[request_id] = new_kvs
-
-            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(act_frame, "is_verified", True)
 
             if not self.is_last_stage():
                 # Middle stage: forward activations down the chain
                 comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
                 b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+
+                # Record in activation replay buffer
+                self.replay_buffer.record(
+                    request_id=request_id,
+                    step_index=act_frame.step_index,
+                    payload_bytes=comp_bytes,
+                    metadata={"shape": list(shape), "scale": scale, "dtype": self.compression_dtype},
+                )
+
                 forward_act = ForwardActivation(
                     request_id=request_id,
                     step_index=act_frame.step_index,
@@ -254,8 +319,11 @@ class StageExecutionEngine:
                     dtype=self.compression_dtype,
                     scale=scale,
                     payload_b64=b64_payload,
-                    is_verified=not is_fast_boot,
-                    is_experimental=is_fast_boot,
+                    stage_index=self.assignment.layer_start,
+                    expected_next_stage=self.assignment.layer_end,
+                    position_offset=act_frame.position_offset,
+                    is_verified=True,
+                    is_experimental=False,
                 )
                 return ProtocolFrame(
                     type=MessageType.FORWARD_ACTIVATION,
@@ -266,9 +334,10 @@ class StageExecutionEngine:
             else:
                 # Last stage: compute next token from logits!
                 cfg = self.session_configs.get(request_id)
-                temperature = cfg.temperature if cfg else 0.7
-                top_p = cfg.top_p if cfg else 0.9
-                max_new_tokens = cfg.max_new_tokens if cfg else 256
+                temperature = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
+                top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
+                seed = getattr(cfg, "seed", None)
+                max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 256
                 stop_token_ids = cfg.stop_token_ids if cfg else []
                 step_idx = act_frame.step_index
 
@@ -282,7 +351,13 @@ class StageExecutionEngine:
                 else:
                     last_logits = out
 
-                token_id = self.sampler.sample_next_token(last_logits, temperature=temperature, top_p=top_p)
+                token_id = self.sampler.sample_next_token(
+                    last_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    seed=seed,
+                    step_index=step_idx,
+                )
                 token_text = self.sampler.decode_token(token_id)
                 eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
                 if stop_token_ids:
@@ -300,9 +375,9 @@ class StageExecutionEngine:
 
                 if is_finished:
                     # Clean up session KV cache
+                    self.kv_cache_manager.release_request(request_id)
                     self.session_kv_caches.pop(request_id, None)
                     self.session_configs.pop(request_id, None)
-                    self.session_fast_boot_sequences.pop(request_id, None)
                     self.finished_sessions.add(request_id)
 
                 next_token = NextToken(
@@ -312,8 +387,8 @@ class StageExecutionEngine:
                     token_text=token_text,
                     is_finished=is_finished,
                     finish_reason=finish_reason,
-                    is_verified=not is_fast_boot,
-                    is_experimental=is_fast_boot,
+                    is_verified=True,
+                    is_experimental=False,
                 )
 
                 # Target the first worker (to embed next token) AND Coordinator
@@ -375,12 +450,9 @@ class StageExecutionEngine:
 
         logits = out
         cfg = self.session_configs.get(request_id)
-        temp = cfg.temperature if cfg else 0.7
-        logits = out
-        cfg = self.session_configs.get(request_id)
-        temp = cfg.temperature if cfg else 0.7
-        top_p = cfg.top_p if cfg else 0.9
-        max_tokens = cfg.max_new_tokens if cfg else 256
+        temp = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
+        top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
+        max_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 256
 
         accepted_tokens, correction = self.verifier.verify_candidates(
             cand_frame.candidate_tokens,
@@ -416,10 +488,8 @@ class StageExecutionEngine:
         if is_finished:
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
-            self.session_fast_boot_sequences.pop(request_id, None)
             self.finished_sessions.add(request_id)
 
-        is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(cand_frame, "is_verified", True)
         verified = SpeculativeVerified(
             request_id=request_id,
             step_index=new_step_idx,
@@ -427,8 +497,8 @@ class StageExecutionEngine:
             accepted_texts=accepted_texts,
             is_finished=is_finished,
             finish_reason="stop" if is_eos else ("length" if is_finished else None),
-            is_verified=not is_fast_boot,
-            is_experimental=is_fast_boot,
+            is_verified=True,
+            is_experimental=False,
         )
 
         target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
@@ -517,8 +587,6 @@ class StageExecutionEngine:
         self.session_token_histories[request_id].append(token_frame.token_id)
 
         try:
-            is_fast_boot = getattr(self.stage_model, "fast_boot_active", False) or not getattr(token_frame, "is_verified", True)
-
             # 1. Speculative Path: check for candidate n-grams
             candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
             if candidates:
@@ -538,8 +606,8 @@ class StageExecutionEngine:
                     dtype=self.compression_dtype,
                     scale=scale,
                     payload_b64=b64_payload,
-                    is_verified=not is_fast_boot,
-                    is_experimental=is_fast_boot,
+                    is_verified=True,
+                    is_experimental=False,
                 )
                 return ProtocolFrame(
                     type=MessageType.SPECULATIVE_CANDIDATES,
@@ -564,8 +632,10 @@ class StageExecutionEngine:
                 dtype=self.compression_dtype,
                 scale=scale,
                 payload_b64=b64_payload,
-                is_verified=not is_fast_boot,
-                is_experimental=is_fast_boot,
+                stage_index=self.assignment.layer_start,
+                expected_next_stage=self.assignment.layer_end,
+                is_verified=True,
+                is_experimental=False,
             )
 
             if self.is_last_stage():
@@ -590,10 +660,11 @@ class StageExecutionEngine:
 
     def abort_inference(self, request_id: str):
         """Cancels an active session and cleans up session KV cache and history."""
+        self.cancellation_tokens.cancel(request_id)
+        self.kv_cache_manager.release_request(request_id)
         self.session_kv_caches.pop(request_id, None)
         self.session_configs.pop(request_id, None)
         self.session_token_histories.pop(request_id, None)
-        self.session_fast_boot_sequences.pop(request_id, None)
         self.finished_sessions.add(request_id)
         if HAS_TORCH and torch.cuda.is_available():
             try:

@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from situs.worker.loader import (
     RealTransformerBlock,
     DistributedStageModel,
-    FastBootDraftBlock,
     RotaryEmbedding,
     apply_rotary_pos_emb,
     is_architecture_supported,
@@ -41,7 +40,6 @@ from situs.protocol.messages import (
 )
 from situs.tests.test_architecture_and_numerical_verification import (
     CanonicalReferenceDecoderLayer,
-    GemmaReferenceDecoderLayer,
 )
 
 
@@ -214,94 +212,42 @@ def test_issue2_numerical_parity_with_reference_layer_prefill_and_cached():
     )
     assert parity_cached is True, "Cached autoregressive step must achieve numerical parity with reference"
 
-    # 2. Gemma Architecture Variant Parity
-    gemma_real = RealTransformerBlock(
+    # 2. Strict rejection of architectures without established numerical parity
+    for unverified_arch in ("gemma", "gemma2", "gemma3", "Gemma3ForCausalLM", "qwen", "qwen2", "transformer", "mixtral", "moe"):
+        assert not is_architecture_supported(unverified_arch), f"Expected unverified {unverified_arch} to be rejected"
+        with pytest.raises(ValueError, match="Unsupported model architecture"):
+            RealTransformerBlock(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                intermediate_size=intermediate_size,
+                head_dim=head_dim,
+                architecture=unverified_arch,
+            )
+
+    # 3. Mistral architecture supported and verified
+    assert is_architecture_supported("mistral")
+    mistral_real = RealTransformerBlock(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         intermediate_size=intermediate_size,
         head_dim=head_dim,
-        architecture="gemma3",
+        architecture="mistral",
     )
-    gemma_ref = GemmaReferenceDecoderLayer(
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        intermediate_size=intermediate_size,
-        head_dim=head_dim,
-    )
-    with torch.no_grad():
-        gemma_ref.input_layernorm.copy_(gemma_real.input_layernorm.weight)
-        gemma_ref.q_proj.weight.copy_(gemma_real.q_proj.weight)
-        gemma_ref.k_proj.weight.copy_(gemma_real.k_proj.weight)
-        gemma_ref.v_proj.weight.copy_(gemma_real.v_proj.weight)
-        gemma_ref.o_proj.weight.copy_(gemma_real.o_proj.weight)
-        gemma_ref.post_attention_layernorm.copy_(gemma_real.post_attention_layernorm.weight)
-        gemma_ref.gate_proj.weight.copy_(gemma_real.gate_proj.weight)
-        gemma_ref.up_proj.weight.copy_(gemma_real.up_proj.weight)
-        gemma_ref.down_proj.weight.copy_(gemma_real.down_proj.weight)
-
-    gemma_parity_pre = verify_layer_numerical_parity(gemma_real, gemma_ref, tolerance=1e-3, test_input=prompt_input)
-    assert gemma_parity_pre is True, "Gemma prefill must achieve numerical parity with GemmaReferenceDecoderLayer"
-
-    with torch.no_grad():
-        _, kv_g_real = gemma_real(prompt_input)
-        _, kv_g_ref = gemma_ref(prompt_input)
-    gemma_parity_step = verify_layer_numerical_parity(gemma_real, gemma_ref, tolerance=1e-3, test_input=step_input, past_kv=kv_g_real)
-    assert gemma_parity_step is True, "Gemma cached step must achieve numerical parity with GemmaReferenceDecoderLayer"
-
-    # 3. Rejection of unverified architectures (qwen, transformer placeholder)
-    assert not is_architecture_supported("qwen")
-    assert not is_architecture_supported("qwen2")
-    assert not is_architecture_supported("transformer")
+    assert mistral_real is not None
 
 
 # =====================================================================
-# Issue 3: Fast-Boot Mode Gating & Production Rejection
+# Issue 3: Complete Elimination of Fast-Boot
 # =====================================================================
 
-def test_issue3_fast_boot_mode_rejected_in_production():
-    """Verify that fast_boot mode is rejected when running in production environment."""
-    with patch.dict(os.environ, {"SITUS_ENV": "production"}):
-        # 1. DistributedStageModel rejects fast_boot=True in production
-        with pytest.raises(ValueError, match="Fast-boot mode cannot be enabled in production"):
-            DistributedStageModel(
-                layer_start=0,
-                layer_end=2,
-                total_layers=4,
-                is_first_stage=True,
-                is_last_stage=False,
-                hidden_dim=64,
-                vocab_size=200,
-                num_heads=4,
-                num_kv_heads=2,
-                intermediate_size=128,
-                head_dim=16,
-                architecture="llama",
-                fast_boot=True,
-            )
+def test_issue3_fast_boot_completely_eliminated():
+    """Verify FastBootDraftBlock and all fast_boot flags/parameters are eliminated."""
+    import situs.worker.loader as loader
+    assert not hasattr(loader, "FastBootDraftBlock"), "FastBootDraftBlock must be eliminated completely"
 
-        # 2. WorkerRegistry.partition_model rejects fast_boot=True in production
-        registry = WorkerRegistry()
-        node = WorkerNode(
-            worker_id="w-prod-1",
-            gpu_name="GPU Prod",
-            total_vram_bytes=16 * 1024**3,
-            free_vram_bytes=14 * 1024**3,
-            device_type="cuda",
-            last_heartbeat=0.0,
-        )
-        registry.workers["w-prod-1"] = node
-        with pytest.raises(ValueError, match="Fast-boot mode cannot be enabled in production"):
-            registry.partition_model(
-                model_name="gemma3:4b",
-                total_layers=4,
-                fast_boot=True,
-            )
-
-
-def test_issue3_fast_boot_defaults_to_false():
-    """Verify fast_boot is False by default across model and worker definitions."""
+    # DistributedStageModel has no fast_boot parameters or attributes
     model = DistributedStageModel(
         layer_start=0,
         layer_end=2,
@@ -316,8 +262,47 @@ def test_issue3_fast_boot_defaults_to_false():
         head_dim=16,
         architecture="llama",
     )
-    assert model.fast_boot is False
-    assert model.fast_boot_active is False
+    assert not hasattr(model, "fast_boot")
+    assert not hasattr(model, "fast_boot_active")
+    assert isinstance(model.layers[0], RealTransformerBlock)
+
+    # Reject fast_boot keyword argument
+    with pytest.raises(TypeError):
+        DistributedStageModel(
+            layer_start=0,
+            layer_end=2,
+            total_layers=4,
+            is_first_stage=True,
+            is_last_stage=False,
+            hidden_dim=64,
+            vocab_size=200,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            head_dim=16,
+            architecture="llama",
+            fast_boot=True,
+        )
+
+    # WorkerRegistry.partition_model rejects fast_boot keyword
+    registry = WorkerRegistry()
+    node = WorkerNode(
+        worker_id="w-reg-1",
+        gpu_name="GPU 1",
+        total_vram_bytes=16 * 1024**3,
+        free_vram_bytes=14 * 1024**3,
+        device_type="cuda",
+        last_heartbeat=0.0,
+    )
+    registry.workers["w-reg-1"] = node
+    assert not hasattr(node, "fast_boot")
+
+    with pytest.raises(TypeError):
+        registry.partition_model(
+            model_name="llama-3.2-1b",
+            total_layers=4,
+            fast_boot=True,
+        )
 
 
 # =====================================================================
@@ -481,3 +466,64 @@ def test_issue7_sampler_detects_mixed_nan_and_inf_numpy():
         # 3. All zeros
         arr_zeros = np.zeros(10, dtype=np.float32)
         assert sampler.sample_next_token(arr_zeros) == eos_id
+
+
+def test_multistep_cached_token_by_token_parity():
+    """Verify RoPE offsets and attention output match reference model across multiple cached token steps."""
+    hidden_dim = 64
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 16
+    intermediate_size = 128
+
+    real = RealTransformerBlock(hidden_dim, num_heads, num_kv_heads, intermediate_size, head_dim, "llama")
+    ref = CanonicalReferenceDecoderLayer(hidden_dim, num_heads, num_kv_heads, intermediate_size, head_dim)
+
+    with torch.no_grad():
+        ref.input_layernorm.copy_(real.input_layernorm.weight)
+        ref.q_proj.weight.copy_(real.q_proj.weight)
+        ref.k_proj.weight.copy_(real.k_proj.weight)
+        ref.v_proj.weight.copy_(real.v_proj.weight)
+        ref.o_proj.weight.copy_(real.o_proj.weight)
+        ref.post_attention_layernorm.copy_(real.post_attention_layernorm.weight)
+        ref.gate_proj.weight.copy_(real.gate_proj.weight)
+        ref.up_proj.weight.copy_(real.up_proj.weight)
+        ref.down_proj.weight.copy_(real.down_proj.weight)
+
+    x_prefill = torch.randn(1, 4, hidden_dim)
+    with torch.no_grad():
+        out_real, kv_real = real(x_prefill)
+        out_ref, kv_ref = ref(x_prefill)
+
+    diff = torch.max(torch.abs(out_real - out_ref)).item()
+    assert diff < 1e-4, f"Prefill diff too large: {diff}"
+
+    for step in range(4):
+        tok = torch.randn(1, 1, hidden_dim)
+        with torch.no_grad():
+            out_real, kv_real = real(tok, past_kv=kv_real)
+            out_ref, kv_ref = ref(tok, past_kv=kv_ref)
+        diff = torch.max(torch.abs(out_real - out_ref)).item()
+        assert diff < 1e-4, f"Step {step} diff too large: {diff}"
+
+
+def test_multidim_position_ids_support():
+    """Verify RotaryEmbedding handles 1D, 2D, and 3D position_ids correctly with batch > 1."""
+    block = RealTransformerBlock(64, 4, 2, 128, 16, "llama")
+    x = torch.randn(2, 3, 64)
+
+    # 1D position_ids
+    pos_1d = torch.tensor([0, 1, 2])
+    out_1d, _ = block(x, position_ids=pos_1d)
+    assert out_1d.shape == (2, 3, 64)
+
+    # 2D position_ids [batch, seq_len]
+    pos_2d = torch.tensor([[0, 1, 2], [0, 1, 2]])
+    out_2d, _ = block(x, position_ids=pos_2d)
+    assert out_2d.shape == (2, 3, 64)
+
+    # 3D position_ids [batch, 1, seq_len]
+    pos_3d = torch.tensor([[[0, 1, 2]], [[0, 1, 2]]])
+    out_3d, _ = block(x, position_ids=pos_3d)
+    assert out_3d.shape == (2, 3, 64)
+

@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from situs.worker.loader import (
     RealTransformerBlock,
     DistributedStageModel,
-    FastBootDraftBlock,
     is_architecture_supported,
     verify_layer_numerical_parity,
     RotaryEmbedding,
@@ -121,9 +120,9 @@ def test_distributed_stage_model_requires_explicit_parameters():
         num_kv_heads=2,
         intermediate_size=256,
         head_dim=32,
-        architecture="gemma3",
+        architecture="mistral",
     )
-    assert stage.architecture == "gemma3"
+    assert stage.architecture == "mistral"
     assert stage.hidden_dim == 128
     assert stage.head_dim == 32
 
@@ -372,8 +371,8 @@ def test_verify_layer_numerical_parity_detects_mismatch():
     assert parity is False, "Parity verification must fail when weights differ"
 
 
-def test_gemma_layer_numerical_parity_matching_weights():
-    """Verify that RealTransformerBlock achieves numerical parity with GemmaReferenceDecoderLayer."""
+def test_mistral_layer_numerical_parity_matching_weights():
+    """Verify that RealTransformerBlock achieves numerical parity with CanonicalReferenceDecoderLayer for Mistral."""
     hidden_dim = 128
     num_heads = 4
     num_kv_heads = 2
@@ -386,9 +385,9 @@ def test_gemma_layer_numerical_parity_matching_weights():
         num_kv_heads=num_kv_heads,
         intermediate_size=intermediate_size,
         head_dim=head_dim,
-        architecture="gemma3",
+        architecture="mistral",
     )
-    ref_block = GemmaReferenceDecoderLayer(
+    ref_block = CanonicalReferenceDecoderLayer(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -409,7 +408,7 @@ def test_gemma_layer_numerical_parity_matching_weights():
 
     test_input = torch.randn(1, 4, hidden_dim)
     parity_prefill = verify_layer_numerical_parity(real_block, ref_block, tolerance=1e-3, test_input=test_input)
-    assert parity_prefill is True, "Gemma block must achieve numerical parity with Gemma reference layer on prefill"
+    assert parity_prefill is True, "Mistral block must achieve numerical parity with canonical reference layer on prefill"
 
     # Cached single-token step
     with torch.no_grad():
@@ -417,12 +416,12 @@ def test_gemma_layer_numerical_parity_matching_weights():
         _, kv_ref = ref_block(test_input)
     step_input = torch.randn(1, 1, hidden_dim)
     parity_step = verify_layer_numerical_parity(real_block, ref_block, tolerance=1e-3, test_input=step_input, past_kv=kv_real)
-    assert parity_step is True, "Gemma block must achieve numerical parity on cached autoregressive step"
+    assert parity_step is True, "Mistral block must achieve numerical parity on cached autoregressive step"
 
 
 def test_unverified_architectures_rejected():
-    """Verify that unverified architectures (qwen, transformer placeholder, gpt2, etc.) are strictly rejected."""
-    for bad_arch in ("qwen", "qwen2", "qwen2.5", "transformer", "gpt2", "mpt", "bert"):
+    """Verify that unverified architectures (qwen, gemma, gpt2, moe, etc.) are strictly rejected."""
+    for bad_arch in ("qwen", "qwen2", "qwen2.5", "transformer", "gpt2", "mpt", "bert", "gemma", "gemma2", "gemma3", "moe"):
         assert not is_architecture_supported(bad_arch)
         with pytest.raises(ValueError, match="Unsupported model architecture"):
             RealTransformerBlock(
@@ -527,26 +526,40 @@ def test_scheduler_rejects_insufficient_cluster_memory():
 
 
 # =====================================================================
-# 4. Fast-Boot Gating & Quality Isolation
+# 4. Fast-Boot Removal & Genuine Model Execution
 # =====================================================================
 
-def test_fast_boot_draft_block_metadata():
-    """Verify FastBootDraftBlock is explicitly flagged as unverified experimental draft block."""
-    draft = FastBootDraftBlock(hidden_dim=128)
-    assert draft.is_verified_inference is False
-    assert draft.is_experimental is True
-    assert FastBootDraftBlock.is_verified_inference is False
-    assert FastBootDraftBlock.is_experimental is True
+def test_fast_boot_completely_eliminated():
+    """Verify FastBootDraftBlock does not exist and DistributedStageModel only instantiates RealTransformerBlock."""
+    import situs.worker.loader as loader
+    assert not hasattr(loader, "FastBootDraftBlock"), "FastBootDraftBlock must be eliminated completely"
+
+    # DistributedStageModel should reject fast_boot if passed as unexpected keyword
+    with pytest.raises(TypeError):
+        DistributedStageModel(
+            layer_start=0,
+            layer_end=2,
+            total_layers=4,
+            is_first_stage=True,
+            is_last_stage=False,
+            hidden_dim=128,
+            vocab_size=500,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=256,
+            head_dim=32,
+            architecture="llama",
+            fast_boot=True,
+        )
 
 
-def test_fast_boot_skeleton_propagates_unverified_flags():
-    """Verify that StageExecutionEngine propagates is_verified=False and is_experimental=True during fast-boot."""
+def test_workers_execute_only_genuine_transformer_blocks_with_verified_flags():
+    """Verify that StageExecutionEngine only executes genuine transformer blocks and always emits is_verified=True."""
     total_layers = 4
     hidden_dim = 128
     vocab_size = 500
 
-    # Model in fast-boot mode
-    model_fast = DistributedStageModel(
+    model = DistributedStageModel(
         layer_start=0,
         layer_end=2,
         total_layers=total_layers,
@@ -559,35 +572,37 @@ def test_fast_boot_skeleton_propagates_unverified_flags():
         intermediate_size=256,
         head_dim=32,
         architecture="llama",
-        fast_boot=True,
     )
-    assign_fast = AssignLayers(
-        worker_id="w-fast",
-        model_name="fast-model",
+    assert not hasattr(model, "fast_boot")
+    assert not hasattr(model, "fast_boot_active")
+    assert isinstance(model.layers[0], RealTransformerBlock)
+
+    assign = AssignLayers(
+        worker_id="w-stage1",
+        model_name="verified-model",
         layer_start=0,
         layer_end=2,
         total_layers=total_layers,
         is_first_stage=True,
         is_last_stage=False,
-        next_worker_id="w-last",
-        fast_boot=True,
+        next_worker_id="w-stage2",
     )
-    engine_fast = StageExecutionEngine(model_fast, assign_fast)
+    engine = StageExecutionEngine(model, assign)
 
-    start_frame = engine_fast.start_inference(
+    start_frame = engine.start_inference(
         InferenceStart(
-            request_id="req-fast-draft",
-            model_name="fast-model",
+            request_id="req-verified-1",
+            model_name="verified-model",
             input_ids=[10, 20],
         )
     )
     assert start_frame.type == MessageType.FORWARD_ACTIVATION
     act = ForwardActivation.model_validate(start_frame.payload)
-    assert act.is_verified is False, "ForwardActivation on fast-boot skeleton must be flagged is_verified=False"
-    assert act.is_experimental is True, "ForwardActivation on fast-boot skeleton must be flagged is_experimental=True"
+    assert act.is_verified is True, "ForwardActivation must be flagged is_verified=True"
+    assert act.is_experimental is False, "ForwardActivation must be flagged is_experimental=False"
 
-    # Last stage in fast-boot mode emits unverified NextToken
-    model_last_fast = DistributedStageModel(
+    # Last stage
+    model_last = DistributedStageModel(
         layer_start=2,
         layer_end=4,
         total_layers=total_layers,
@@ -600,23 +615,21 @@ def test_fast_boot_skeleton_propagates_unverified_flags():
         intermediate_size=256,
         head_dim=32,
         architecture="llama",
-        fast_boot=True,
     )
-    assign_last_fast = AssignLayers(
-        worker_id="w-last",
-        model_name="fast-model",
+    assign_last = AssignLayers(
+        worker_id="w-stage2",
+        model_name="verified-model",
         layer_start=2,
         layer_end=4,
         total_layers=total_layers,
         is_first_stage=False,
         is_last_stage=True,
-        first_worker_id="w-fast",
-        fast_boot=True,
+        first_worker_id="w-stage1",
     )
-    engine_last_fast = StageExecutionEngine(model_last_fast, assign_last_fast)
-    token_frame = engine_last_fast.process_forward_activation(act)
+    engine_last = StageExecutionEngine(model_last, assign_last)
+    token_frame = engine_last.process_forward_activation(act)
     assert token_frame is not None
     assert token_frame.type == MessageType.NEXT_TOKEN
     tok = NextToken.model_validate(token_frame.payload)
-    assert tok.is_verified is False, "NextToken emitted from fast-boot skeleton must be flagged is_verified=False"
-    assert tok.is_experimental is True, "NextToken emitted from fast-boot skeleton must be flagged is_experimental=True"
+    assert tok.is_verified is True, "NextToken emitted from genuine model must be flagged is_verified=True"
+    assert tok.is_experimental is False, "NextToken emitted from genuine model must be flagged is_experimental=False"

@@ -33,24 +33,82 @@ SUPPORTED_ARCHITECTURES: Set[str] = {
     "llama",
     "llama2",
     "llama3",
-    "gemma",
-    "gemma2",
-    "gemma3",
     "mistral",
 }
+
+CANONICAL_TENSOR_MAP: Dict[str, str] = {
+    "self_attn.q_proj.weight": "attn_q.weight",
+    "self_attn.k_proj.weight": "attn_k.weight",
+    "self_attn.v_proj.weight": "attn_v.weight",
+    "self_attn.o_proj.weight": "attn_output.weight",
+    "mlp.gate_proj.weight": "ffn_gate.weight",
+    "mlp.up_proj.weight": "ffn_up.weight",
+    "mlp.down_proj.weight": "ffn_down.weight",
+    "input_layernorm.weight": "attn_norm.weight",
+    "post_attention_layernorm.weight": "ffn_norm.weight",
+    # GGUF standardized keys
+    "attn_q.weight": "attn_q.weight",
+    "attn_k.weight": "attn_k.weight",
+    "attn_v.weight": "attn_v.weight",
+    "attn_output.weight": "attn_output.weight",
+    "ffn_gate.weight": "ffn_gate.weight",
+    "ffn_up.weight": "ffn_up.weight",
+    "ffn_down.weight": "ffn_down.weight",
+    "attn_norm.weight": "attn_norm.weight",
+    "ffn_norm.weight": "ffn_norm.weight",
+}
+
+SUPPORTED_QUANTIZATION_SCHEMES: Set[str] = {
+    "fp32", "float32",
+    "fp16", "float16",
+    "bf16", "bfloat16",
+    "int8", "q8_0", "8bit",
+    "int4", "q4_0", "q4_1", "q4_k", "4bit",
+}
+
+
+class UnsupportedQuantizationError(ValueError):
+    """Raised when an incompatible or corrupted quantization scheme is detected."""
+    pass
+
+
+def normalize_canonical_tensor_name(raw_name: str) -> str:
+    """Normalizes arbitrary HuggingFace or GGUF tensor names into unified canonical keys."""
+    clean = raw_name.strip()
+    # Strip leading layer prefixes e.g. "model.layers.0." or "blk.0."
+    import re
+    clean = re.sub(r"^(?:model\.layers\.\d+\.|blk\.\d+\.)", "", clean)
+    return CANONICAL_TENSOR_MAP.get(clean, clean)
+
+
+def validate_quantization_metadata(quant_meta: Dict[str, Any]) -> None:
+    """Strictly validates tensor quantization metadata format before instantiation."""
+    if not isinstance(quant_meta, dict):
+        raise UnsupportedQuantizationError(f"Quantization metadata must be a dictionary, got {type(quant_meta)}")
+    scheme = quant_meta.get("dtype") or quant_meta.get("scheme") or quant_meta.get("format") or quant_meta.get("precision")
+    if not scheme:
+        return
+    norm_scheme = str(scheme).strip().lower()
+    if norm_scheme not in SUPPORTED_QUANTIZATION_SCHEMES:
+        raise UnsupportedQuantizationError(
+            f"Unsupported quantization scheme '{norm_scheme}'. Supported schemes: {sorted(SUPPORTED_QUANTIZATION_SCHEMES)}"
+        )
 
 
 def is_architecture_supported(arch: Optional[str]) -> bool:
     """
     Validates that the architecture is compatible with RealTransformerBlock
-    (RMSNorm, RoPE, and SwiGLU/GeGLU-style MLP with verified numerical parity).
-    Explicitly rejects unsupported architectures such as MoE, MPT, GPT-2,
-    Qwen (unsupported QKV bias), generic placeholder 'transformer', etc.
+    (RMSNorm, RoPE, and SwiGLU-style MLP with verified numerical parity).
+    Explicitly rejects unsupported architectures such as Gemma, Gemma 2/3,
+    Qwen, MoE, MPT, GPT-2, generic placeholder 'transformer', etc.
     """
     if not arch or not isinstance(arch, str):
         return False
     norm = arch.strip().lower()
-    incompatible = ("moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon", "chatglm", "bloom", "opt", "bert", "t5", "qwen", "transformer")
+    incompatible = (
+        "moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon",
+        "chatglm", "bloom", "opt", "bert", "t5", "qwen", "gemma", "transformer"
+    )
     for bad in incompatible:
         if bad in norm:
             return False
@@ -63,20 +121,20 @@ def is_architecture_supported(arch: Optional[str]) -> bool:
 
 
 class RMSNorm(nn.Module if HAS_TORCH else object):
-    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral; with unit-offset for Gemma)."""
-    def __init__(self, dim: int, eps: float = 1e-6, is_gemma: bool = False):
+    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.is_gemma = is_gemma
         if HAS_TORCH:
-            self.weight = nn.Parameter(torch.zeros(dim) if is_gemma else torch.ones(dim))
+            self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        if not HAS_TORCH or not isinstance(x, torch.Tensor):
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
+        if not isinstance(x, torch.Tensor):
             return x
         variance = x.pow(2).mean(-1, keepdim=True)
-        w = (1.0 + self.weight) if self.is_gemma else self.weight
-        return x * torch.rsqrt(variance + self.eps) * w
+        return x * torch.rsqrt(variance + self.eps) * self.weight
 
 
 class RotaryEmbedding(nn.Module if HAS_TORCH else object):
@@ -101,17 +159,18 @@ class RotaryEmbedding(nn.Module if HAS_TORCH else object):
             return x, x
         if position_ids is not None:
             t = position_ids.to(device=x.device, dtype=self.inv_freq.dtype)
+            while t.dim() > 2 and t.shape[1] == 1:
+                t = t.squeeze(1)
             if t.dim() == 2:
                 freqs = t.unsqueeze(-1) * self.inv_freq.to(t.device)
                 emb = torch.cat((freqs, freqs), dim=-1)
                 return emb.cos(), emb.sin()
-            else:
-                t = t.view(-1)
+            t = t.view(-1)
         else:
             if seq_len is None:
                 seq_len = x.shape[1] if x.dim() >= 2 else 1
             t = torch.arange(offset, offset + seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq.to(t.device))
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
@@ -203,10 +262,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         if not HAS_TORCH:
             return
 
-        arch_norm = architecture.strip().lower() if architecture else ""
-        self.is_gemma = "gemma" in arch_norm
-
-        self.input_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=self.is_gemma)
+        self.input_layernorm = RMSNorm(hidden_dim, eps=eps)
 
         # Self-Attention projections (instant zero initialization)
         self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim)
@@ -214,21 +270,25 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim)
         self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim)
 
-        # Feed-Forward Network (SwiGLU for LLaMA/Mistral, GeGLU for Gemma)
-        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=self.is_gemma)
+        # Feed-Forward Network (SwiGLU for LLaMA/Mistral)
+        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps)
         self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size)
         self.up_proj = _fast_linear(hidden_dim, self.intermediate_size)
         self.down_proj = _fast_linear(self.intermediate_size, hidden_dim)
-        if self.is_gemma:
-            self.act_fn = nn.GELU(approximate="tanh")
-        else:
-            self.act_fn = nn.SiLU()
+        self.act_fn = nn.SiLU()
 
         # Rotary Embeddings
         self.rotary = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x, past_kv: Optional[Tuple[Any, Any]] = None):
-        if not HAS_TORCH or not isinstance(x, torch.Tensor):
+    def forward(
+        self,
+        x,
+        past_kv: Optional[Tuple[Any, Any]] = None,
+        position_ids: Optional[Any] = None,
+    ):
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
+        if not isinstance(x, torch.Tensor):
             new_kv = (past_kv or 0) + 1
             return x, new_kv
 
@@ -254,7 +314,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
 
         # Apply Rotary Position Embeddings (RoPE)
         if hasattr(self, "rotary") and self.rotary is not None:
-            cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=past_len)
+            cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=past_len, position_ids=position_ids)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # KV Cache concatenation for autoregressive steps
@@ -435,7 +495,7 @@ def deserialize_and_validate_layer_weights(
     if not isinstance(state_dict, dict) or not state_dict:
         raise ValueError("Deserialized weights payload must be a non-empty dict of tensors")
 
-    # Clean incoming key names
+    # Clean incoming key names and map to canonical names
     clean_incoming = {}
     for k, v in state_dict.items():
         short_k = k
@@ -443,8 +503,10 @@ def deserialize_and_validate_layer_weights(
             short_k = short_k.split("layers.", 1)[1]
             if "." in short_k:
                 short_k = short_k.split(".", 1)[1]
+        canonical_k = normalize_canonical_tensor_name(short_k)
         clean_incoming[short_k] = v
         clean_incoming[k] = v
+        clean_incoming[canonical_k] = v
 
     # Derive architecture dimensions dynamically from verified tensor shapes
     actual_h_dim = hidden_dim
@@ -596,36 +658,6 @@ def verify_layer_numerical_parity(
         return True
 
 
-class FastBootDraftBlock(nn.Module if HAS_TORCH else object):
-    """
-    Experimental low-rank transformer block for fast-boot (~1 MB per layer).
-    Marked EXPERIMENTAL until convergence to full model weights is established.
-    """
-    is_verified_inference: bool = False
-    is_experimental: bool = True
-
-    def __init__(self, hidden_dim: int = 256, rank: int = 64):
-        super().__init__()
-        self.is_verified_inference = False
-        self.is_experimental = True
-        self.hidden_dim = hidden_dim
-        self.rank = min(rank, max(16, hidden_dim // 4))
-        if HAS_TORCH:
-            self.norm = RMSNorm(hidden_dim)
-            self.down_proj = nn.Linear(hidden_dim, self.rank, bias=False)
-            self.act = nn.SiLU()
-            self.up_proj = nn.Linear(self.rank, hidden_dim, bias=False)
-            nn.init.normal_(self.up_proj.weight, std=0.01)
-
-    def forward(self, x, past_kv=None):
-        if not HAS_TORCH or not isinstance(x, torch.Tensor):
-            return x, (past_kv or 0) + 1
-        residual = x
-        out = self.up_proj(self.act(self.down_proj(self.norm(x))))
-        new_kv = (past_kv or 0) + 1
-        return residual + out, new_kv
-
-
 # Alias for backwards compatibility in existing tests
 MockTransformerBlock = RealTransformerBlock
 
@@ -651,7 +683,6 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         architecture: str,
         device: str = "cpu",
         progressive: bool = False,
-        fast_boot: bool = False,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -690,22 +721,13 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             safe_device = "cpu"
         self.device = safe_device
         self.progressive = progressive
-        if fast_boot:
-            env = os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
-            if env in ("production", "prod"):
-                raise ValueError("Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.")
-        self.fast_boot = fast_boot
-        self.fast_boot_active = fast_boot
 
         # JIT Progressive layer readiness tracking
         self._layer_events: Dict[int, threading.Event] = {
             i: threading.Event() for i in range(layer_start, layer_end)
         }
-        if progressive or fast_boot:
+        if progressive:
             self.ready_layers: Set[int] = set()
-            if fast_boot:
-                for ev in self._layer_events.values():
-                    ev.set()
         else:
             self.ready_layers = set(range(layer_start, layer_end))
             for ev in self._layer_events.values():
@@ -722,30 +744,24 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             self.embed_tokens = None
             self.early_exit_head = None
 
-        # 2. Assigned Transformer Layers
+        # 2. Assigned Transformer Layers (always genuine RealTransformerBlock)
         num_layers = layer_end - layer_start
-        if self.fast_boot:
-            self.layers = nn.ModuleList([
-                FastBootDraftBlock(hidden_dim=hidden_dim) for _ in range(num_layers)
-            ])
-        else:
-            self.layers = nn.ModuleList([
-                RealTransformerBlock(
-                    hidden_dim=hidden_dim,
-                    num_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    intermediate_size=self.intermediate_size,
-                    head_dim=self.head_dim,
-                    architecture=self.architecture,
-                    layer_idx=layer_start + i,
-                )
-                for i in range(num_layers)
-            ])
+        self.layers = nn.ModuleList([
+            RealTransformerBlock(
+                hidden_dim=hidden_dim,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                intermediate_size=self.intermediate_size,
+                head_dim=self.head_dim,
+                architecture=self.architecture,
+                layer_idx=layer_start + i,
+            )
+            for i in range(num_layers)
+        ])
 
         # 3. Norm and LM Head (ONLY if last stage)
         if self.is_last_stage:
-            is_gemma = "gemma" in (self.architecture.strip().lower() if self.architecture else "")
-            self.norm = RMSNorm(hidden_dim, is_gemma=is_gemma)
+            self.norm = RMSNorm(hidden_dim)
             self.lm_head = _fast_linear(hidden_dim, vocab_size)
         else:
             self.norm = None
@@ -847,7 +863,6 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             self._layer_events[layer_index].set()
 
         if len(self.ready_layers) >= (self.layer_end - self.layer_start):
-            self.fast_boot_active = False
             logger.info(f"Stage [{self.layer_start}..{self.layer_end}) fully loaded with real model weights!")
 
     def mark_layer_ready(self, layer_index: int, weights: Optional[Any] = None):
@@ -863,8 +878,6 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
     def wait_layer_ready(self, layer_index: int, timeout: float = 10.0) -> bool:
         """Wait until a specific layer is installed and validated before computing it."""
-        if self.fast_boot_active:
-            return True
         if layer_index in self.ready_layers:
             return True
         if layer_index in self._layer_events:
@@ -872,19 +885,24 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         return False
 
     def is_entrance_ready(self) -> bool:
-        if self.fast_boot_active:
-            return True
         return self.layer_start in self.ready_layers
 
     def get_ready_count(self) -> int:
         return len(self.ready_layers)
 
-    def forward_first_stage(self, input_ids: "torch.Tensor", past_kvs: Optional[List[Any]] = None):
+    def forward_first_stage(
+        self,
+        input_ids: "torch.Tensor",
+        past_kvs: Optional[List[Any]] = None,
+        position_ids: Optional[Any] = None,
+    ):
         """First stage: input_ids -> embeddings -> assigned layers -> intermediate activation."""
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
         if not self.is_first_stage:
             raise RuntimeError("Called forward_first_stage on a non-first stage worker")
 
-        if self.embed_tokens is not None and HAS_TORCH:
+        if self.embed_tokens is not None:
             if not isinstance(input_ids, torch.Tensor):
                 if isinstance(input_ids, (list, tuple)):
                     input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=self.device)
@@ -905,13 +923,20 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if not self.wait_layer_ready(layer_idx):
                 raise RuntimeError(f"Layer {layer_idx} is not ready or failed validation before forward execution")
             layer_past_kv = past_kvs[i] if past_kvs else None
-            h, new_kv = layer(h, layer_past_kv)
+            h, new_kv = layer(h, layer_past_kv, position_ids=position_ids)
             new_kvs.append(new_kv)
 
         return h, new_kvs
 
-    def forward_intermediate_stage(self, hidden_states: "torch.Tensor", past_kvs: Optional[List[Any]] = None):
+    def forward_intermediate_stage(
+        self,
+        hidden_states: "torch.Tensor",
+        past_kvs: Optional[List[Any]] = None,
+        position_ids: Optional[Any] = None,
+    ):
         """Middle or last stage: incoming activations -> assigned layers."""
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
         h = hidden_states
         new_kvs = []
         for i, layer in enumerate(self.layers):
@@ -919,7 +944,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if not self.wait_layer_ready(layer_idx):
                 raise RuntimeError(f"Layer {layer_idx} is not ready or failed validation before forward execution")
             layer_past_kv = past_kvs[i] if past_kvs else None
-            h, new_kv = layer(h, layer_past_kv)
+            h, new_kv = layer(h, layer_past_kv, position_ids=position_ids)
             new_kvs.append(new_kv)
 
         if self.is_last_stage:
@@ -1018,7 +1043,6 @@ def load_hf_stage_model(
     device: str = "cpu",
     load_in_8bit: bool = True,
     progressive: bool = False,
-    fast_boot: bool = False,
 ) -> DistributedStageModel:
     """
     Loads real architecture and weights for assigned layers.
@@ -1053,12 +1077,11 @@ def load_hf_stage_model(
         intermediate_size=intermediate_size,
         device=device,
         progressive=progressive,
-        fast_boot=fast_boot,
         head_dim=head_dim,
         architecture=arch,
     )
 
-    if not progressive and not fast_boot and HAS_TORCH:
+    if not progressive and HAS_TORCH:
         from situs.worker.jit_streamer import is_layer_cached, load_layer_from_cache, save_layer_to_cache
         loaded_cached = 0
         for l_idx in range(layer_start, layer_end):

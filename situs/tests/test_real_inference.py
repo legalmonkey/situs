@@ -111,7 +111,6 @@ def test_stage_engine_uses_real_answer_across_turns():
         max_new_tokens=15,
     )
     engine_b.session_configs["req-lightbulb"] = start_msg
-    engine_b.init_fast_boot_sequence("req-lightbulb", prompt, "gemma3:4b")
 
     # Worker A forward
     frame_a = engine_a.start_inference(start_msg)

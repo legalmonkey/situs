@@ -146,7 +146,7 @@ def test_engine_cancellation_and_kv_cleanup():
         num_heads=4,
         num_kv_heads=2,
         head_dim=16,
-        architecture="gemma3",
+        architecture="llama",
         vocab_size=100,
         device="cpu",
     )
@@ -154,9 +154,8 @@ def test_engine_cancellation_and_kv_cleanup():
 
     req_id = "req-cancel-123"
     engine.session_kv_caches[req_id] = [torch.zeros((1, 2, 5, 16))]
-    engine.session_configs[req_id] = InferenceStart(request_id=req_id, model_name="gemma3:4b", input_ids=[1, 2, 3])
+    engine.session_configs[req_id] = InferenceStart(request_id=req_id, model_name="llama-3.2-1b", input_ids=[1, 2, 3])
     engine.session_token_histories[req_id] = [1, 2, 3]
-    engine.session_fast_boot_sequences[req_id] = [1, 2]
 
     assert req_id in engine.session_kv_caches
 
@@ -166,7 +165,6 @@ def test_engine_cancellation_and_kv_cleanup():
     assert req_id not in engine.session_kv_caches
     assert req_id not in engine.session_configs
     assert req_id not in engine.session_token_histories
-    assert req_id not in engine.session_fast_boot_sequences
     assert req_id in engine.finished_sessions
 
 
@@ -208,7 +206,7 @@ def test_real_transformer_block_custom_head_dim():
         num_kv_heads=4,
         intermediate_size=10240,
         head_dim=256,
-        architecture="gemma3",
+        architecture="llama3",
         layer_idx=0,
     )
     assert block.head_dim == 256

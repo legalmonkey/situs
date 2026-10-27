@@ -450,7 +450,6 @@ def test_stage_model_loads_cached_weights_on_startup(tmp_path):
         is_last_stage=False,
         device="cpu",
         progressive=False,
-        fast_boot=False,
     )
     # Layer 0 was found in cache and loaded
     assert stage.is_layer_ready(0)

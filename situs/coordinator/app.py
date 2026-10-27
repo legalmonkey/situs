@@ -161,16 +161,17 @@ def verify_admin_key(request: Request):
 # ==========================================
 
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    role: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1)
 
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = "gemma3:4b"
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
-    max_tokens: Optional[int] = 256
+    messages: List[ChatMessage] = Field(..., min_length=1)
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0)
+    max_tokens: Optional[int] = Field(default=256, ge=0, le=32768)
+    seed: Optional[int] = None
     stream: Optional[bool] = False
 
 
@@ -322,7 +323,6 @@ async def cluster_status():
                 "is_first_stage": w.is_first_stage,
                 "is_last": w.is_last_stage,
                 "is_last_stage": w.is_last_stage,
-                "fast_boot": getattr(w, "fast_boot", False),
             }
             for w in alive
         ],
@@ -333,21 +333,15 @@ async def cluster_status():
 @app.post("/admin/partition")
 async def trigger_partition(
     request: Request,
-    model_name: str = "gemma3:4b",
+    model_name: str = "llama-3.2-1b",
     total_layers: Optional[int] = None,
     progressive: bool = False,
-    fast_boot: bool = False,
     codec: str = "zstd",
 ):
     verify_admin_key(request)
-    if fast_boot and config.is_production:
-        raise HTTPException(
-            status_code=400,
-            detail="Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.",
-        )
     try:
         assignments = registry.partition_model(
-            model_name, total_layers=total_layers, progressive=progressive, fast_boot=fast_boot, codec=codec
+            model_name, total_layers=total_layers, progressive=progressive, codec=codec
         )
         for assign in assignments:
             frame = ProtocolFrame(
@@ -443,7 +437,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             meta = resolve_model_metadata(target_model)
             resolved_layers = meta["total_layers"]
             assignments = registry.partition_model(
-                target_model, total_layers=resolved_layers, fast_boot=False, progressive=False, codec="zstd"
+                target_model, total_layers=resolved_layers, progressive=False, codec="zstd"
             )
             for assign in assignments:
                 frame = ProtocolFrame(
@@ -495,6 +489,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             detail=f"Prompt tokenization failed for model '{target_model}': {e}",
         )
 
+    # Token budget pre-check (Item 9: API Validation & Guardrails)
+    try:
+        meta = resolve_model_metadata(target_model)
+        model_ctx = meta.get("context_length") or meta.get("max_position_embeddings") or 4096
+    except Exception:
+        model_ctx = 4096
+
+    req_tokens = req.max_tokens if req.max_tokens is not None else 256
+    if len(input_ids) + req_tokens > model_ctx:
+        relay.cleanup_response_stream(request_id)
+        sem.release()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt length ({len(input_ids)} tokens) plus max_tokens ({req_tokens}) exceeds model maximum context length ({model_ctx}).",
+        )
+
     # 1. Return SSE Streaming Response
     if req.stream:
         async def event_generator():
@@ -521,6 +531,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     max_new_tokens=req.max_tokens if req.max_tokens is not None else 256,
                     temperature=req.temperature if req.temperature is not None else 0.7,
                     top_p=req.top_p if req.top_p is not None else 0.9,
+                    seed=req.seed,
                 )
                 start_frame = ProtocolFrame(
                     type=MessageType.INFERENCE_START,
@@ -548,6 +559,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 deadline = time.time() + config.request_timeout_s
                 done_yielded = False
                 while True:
+                    # Circuit breaker: detect worker drops mid-generation (Item 4)
+                    broken_worker = next((pw for pw in pipeline if not relay.is_worker_connected(pw.worker_id)), None)
+                    if broken_worker:
+                        logger.error(f"Worker '{broken_worker.worker_id}' disconnected mid-generation.")
+                        abort_frame = ProtocolFrame(
+                            type=MessageType.INFERENCE_ABORT,
+                            source="coordinator",
+                            payload={"request_id": request_id, "reason": f"Worker {broken_worker.worker_id} disconnected mid-generation"},
+                        )
+                        await relay.route_frame(abort_frame)
+                        err_chunk = {"error": f"Worker '{broken_worker.worker_id}' disconnected mid-generation; pipeline broken."}
+                        yield f"data: {json.dumps(err_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
+
                     if await request.is_disconnected():
                         logger.info(f"Client disconnected for request {request_id}. Propagating abort to workers.")
                         abort_frame = ProtocolFrame(
@@ -669,6 +695,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             max_new_tokens=req.max_tokens if req.max_tokens is not None else 256,
             temperature=req.temperature if req.temperature is not None else 0.7,
             top_p=req.top_p if req.top_p is not None else 0.9,
+            seed=req.seed,
         )
         start_frame = ProtocolFrame(
             type=MessageType.INFERENCE_START,
@@ -699,6 +726,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
         try:
             while True:
+                # Circuit breaker: detect worker drops mid-generation (Item 4)
+                broken_worker = next((pw for pw in pipeline if not relay.is_worker_connected(pw.worker_id)), None)
+                if broken_worker:
+                    logger.error(f"Worker '{broken_worker.worker_id}' disconnected mid-generation; aborting request {request_id}.")
+                    abort_frame = ProtocolFrame(
+                        type=MessageType.INFERENCE_ABORT,
+                        source="coordinator",
+                        payload={"request_id": request_id, "reason": f"Worker {broken_worker.worker_id} disconnected mid-generation"},
+                    )
+                    await relay.route_frame(abort_frame)
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Worker '{broken_worker.worker_id}' disconnected mid-generation; pipeline broken.",
+                    )
+
                 if await request.is_disconnected():
                     logger.info(f"Client disconnected for request {request_id}. Propagating abort to workers.")
                     abort_frame = ProtocolFrame(

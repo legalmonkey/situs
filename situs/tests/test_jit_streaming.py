@@ -22,6 +22,7 @@ from situs.worker.jit_streamer import (
     save_layer_to_cache,
     load_layer_from_cache,
     is_layer_cached,
+    generate_mock_layer_bytes,
 )
 
 
@@ -312,21 +313,21 @@ def test_ternary_packing_and_unpacking():
     np.testing.assert_allclose(unpacked, weights, atol=1e-5)
 
 
-def test_fast_boot_skeleton_instant_cold_start():
+def test_progressive_streaming_and_hotswap_without_fast_boot():
     """
-    Verifies Strategy 3 & 4: Both workers start cold without any pre-downloaded weights.
-    Both boot immediately in fast-boot mode (< 20s), generate tokens without waiting,
-    and dynamically hot-swap layers in the background to full precision.
+    Verifies Progressive Streaming: Workers initialize with genuine RealTransformerBlock layers.
+    Before streamed weights arrive, unready layers block/wait. As layer chunks stream in
+    and pass validation, layers become ready and execute genuine forward inference.
     """
     import threading
     import time
-    from situs.worker.loader import FastBootDraftBlock, MockTransformerBlock
+    from situs.worker.loader import RealTransformerBlock
 
     total_layers = 8
     hidden_dim = 128
     vocab_size = 500
 
-    # BOTH WORKERS START COLD with fast_boot=True
+    # Progressive workers without fast boot
     model_a = DistributedStageModel(
         layer_start=0,
         layer_end=4,
@@ -342,7 +343,6 @@ def test_fast_boot_skeleton_instant_cold_start():
         architecture="llama",
         device="cpu",
         progressive=True,
-        fast_boot=True,
     )
     model_b = DistributedStageModel(
         layer_start=4,
@@ -359,12 +359,11 @@ def test_fast_boot_skeleton_instant_cold_start():
         architecture="llama",
         device="cpu",
         progressive=True,
-        fast_boot=True,
     )
 
     assign_a = AssignLayers(
         worker_id="worker-a",
-        model_name="cold-boot-model",
+        model_name="prog-model",
         layer_start=0,
         layer_end=4,
         total_layers=total_layers,
@@ -372,11 +371,10 @@ def test_fast_boot_skeleton_instant_cold_start():
         is_last_stage=False,
         next_worker_id="worker-b",
         progressive=True,
-        fast_boot=True,
     )
     assign_b = AssignLayers(
         worker_id="worker-b",
-        model_name="cold-boot-model",
+        model_name="prog-model",
         layer_start=4,
         layer_end=8,
         total_layers=total_layers,
@@ -384,26 +382,45 @@ def test_fast_boot_skeleton_instant_cold_start():
         is_last_stage=True,
         prev_worker_id="worker-a",
         progressive=True,
-        fast_boot=True,
     )
 
     engine_a = StageExecutionEngine(stage_model=model_a, assignment=assign_a)
     engine_b = StageExecutionEngine(stage_model=model_b, assignment=assign_b)
 
-    # 1. Verify both workers are IMMEDIATELY entrance-ready despite having 0 full layers downloaded
-    assert model_a.is_entrance_ready()
-    assert model_b.is_entrance_ready()
-    assert model_a.fast_boot_active
-    assert model_b.fast_boot_active
-    assert isinstance(model_a.layers[0], FastBootDraftBlock)
-    assert isinstance(model_b.layers[0], FastBootDraftBlock)
+    # 1. Verify all layers are genuine RealTransformerBlock and NOT unverified draft blocks
+    assert isinstance(model_a.layers[0], RealTransformerBlock)
+    assert isinstance(model_b.layers[0], RealTransformerBlock)
+    assert not hasattr(model_a, "fast_boot_active")
+    assert not hasattr(model_b, "fast_boot_active")
+    assert not model_a.is_entrance_ready()
+    assert not model_b.is_entrance_ready()
 
-    # 2. Execute inference IMMEDIATELY (0-second wait cold start!)
-    req_id = "fast-boot-cold-req"
+    # 2. Mark stage A layers ready with mock weights
+    for l_idx in range(0, 4):
+        raw = generate_mock_layer_bytes(layer_idx=l_idx, hidden_dim=hidden_dim)
+        model_a.mark_layer_ready(l_idx, weights=raw)
+
+    assert model_a.is_entrance_ready()
+    assert model_a.get_ready_count() == 4
+
+    # 3. Simulate background network streaming for Stage B
+    streamer_b = ProgressiveJITStreamer(model_name="prog-model", chunk_size=32 * 1024, codec="zstd", enable_wire_compression=True)
+    for l_idx in range(4, 8):
+        raw = generate_mock_layer_bytes(layer_idx=l_idx, hidden_dim=hidden_dim)
+        save_layer_to_cache("prog-model", l_idx, raw)
+        chunks = streamer_b.create_layer_chunks(layer_index=l_idx, total_stage_layers=4)
+        for c in chunks:
+            engine_b.process_layer_chunk(c, source_worker="worker-a")
+
+    assert model_b.is_entrance_ready()
+    assert model_b.get_ready_count() == 4
+
+    # 4. Execute forward inference across both stages with genuine weights
+    req_id = "prog-req-1"
     start_msg = InferenceStart(
         request_id=req_id,
-        model_name="cold-boot-model",
-        input_ids=[101, 205, 309],
+        model_name="prog-model",
+        input_ids=[10, 20, 30],
         max_new_tokens=2,
         temperature=0.0,
     )
@@ -412,20 +429,12 @@ def test_fast_boot_skeleton_instant_cold_start():
     assert frame_a.type == MessageType.FORWARD_ACTIVATION
 
     act_payload = ForwardActivation.model_validate(frame_a.payload)
+    assert act_payload.is_verified is True
+    assert act_payload.is_experimental is False
+
     out_frame = engine_b.process_forward_activation(act_payload)
     assert out_frame is not None
     assert out_frame.type == MessageType.NEXT_TOKEN
     tok_payload = NextToken.model_validate(out_frame.payload)
-    assert tok_payload.token_id >= 0
-
-    # 3. Simulate background network streaming: chunks arrive with zstd wire compression
-    streamer_b = ProgressiveJITStreamer(model_name="cold-boot-model", chunk_size=32 * 1024, codec="zstd", enable_wire_compression=True)
-    for l_idx in range(4, 8):
-        chunks = streamer_b.create_layer_chunks(layer_index=l_idx, total_stage_layers=4)
-        for c in chunks:
-            engine_b.process_layer_chunk(c, source_worker="worker-a")
-
-    # 4. Verify all layers of Stage B hot-swapped to full precision in-place!
-    assert model_b.get_ready_count() == 4
-    assert not model_b.fast_boot_active
-    assert isinstance(model_b.layers[0], MockTransformerBlock)
+    assert tok_payload.is_verified is True
+    assert tok_payload.is_experimental is False

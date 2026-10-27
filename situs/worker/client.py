@@ -258,7 +258,6 @@ class WorkerDaemon:
                                 is_last_stage=assign.is_last_stage,
                                 device=self.config.device,
                                 progressive=assign.progressive,
-                                fast_boot=assign.fast_boot,
                             )
                             from situs.tokenizer import get_or_load_tokenizer
                             tok = await asyncio.to_thread(
@@ -300,14 +299,6 @@ class WorkerDaemon:
                             else:
                                 self.engine.session_configs[start_msg.request_id] = start_msg
                                 self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
-                                if hasattr(self.engine, "init_fast_boot_sequence"):
-                                    prompt_str = getattr(start_msg, "prompt", "") or ""
-                                    if not prompt_str and self.engine.sampler.tokenizer:
-                                        try:
-                                            prompt_str = self.engine.sampler.tokenizer.decode(start_msg.input_ids)
-                                        except Exception:
-                                            prompt_str = ""
-                                    self.engine.init_fast_boot_sequence(start_msg.request_id, prompt_str, start_msg.model_name)
 
                     elif frame.type == MessageType.FORWARD_ACTIVATION:
                         if self.engine:

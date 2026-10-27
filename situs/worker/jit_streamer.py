@@ -311,26 +311,6 @@ class ProgressiveJITStreamer:
             binary_packets.append(packet)
         return binary_packets
 
-    def create_fast_boot_skeleton(
-        self,
-        layer_start: int,
-        layer_end: int,
-        is_first_stage: bool,
-        is_last_stage: bool,
-    ) -> bytes:
-        """
-        Generates lightweight Strategy 3 fast-boot skeleton bytes (~25-35 MB total),
-        allowing both laptops to boot and start serving in under 15-20 seconds over 2 MB/s.
-        """
-        num_layers = layer_end - layer_start
-        seed = f"{self.model_name}_skeleton_{layer_start}_{layer_end}_{is_first_stage}_{is_last_stage}".encode("utf-8")
-        h = hashlib.sha256(seed).digest()
-        # Fast boot skeleton is compact (e.g. 1 MB per draft block)
-        target_size = num_layers * 32 * 1024
-        repeats = (target_size // len(h)) + 1
-        raw_skeleton = (h * repeats)[:target_size]
-        return compress_layer_bytes(raw_skeleton, codec=self.codec)
-
     def stream_stage_layers(
         self,
         layer_start: int,

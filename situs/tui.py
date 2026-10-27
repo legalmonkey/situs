@@ -600,10 +600,7 @@ def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected 
         if w.get("is_last") or w.get("is_last_stage"):
             stage_str += " (Head)"
         dev_label = (w.get("device") or "gpu").lower()
-        if w.get("fast_boot"):
-            stage_str += " [⚡ Fast-Boot]"
-            status_str = "[bold yellow]FAST-BOOT[/bold yellow]"
-        elif "cpu" in dev_label:
+        if "cpu" in dev_label:
             status_str = "[bold yellow]ACTIVE (CPU)[/bold yellow]"
         else:
             status_str = "[bold green]ACTIVE (GPU)[/bold green]"
@@ -1218,7 +1215,7 @@ def execute_slash_command(
         layers = int(parts[1]) if len(parts) > 1 else 32
         try:
             with httpx.Client(timeout=10.0) as client:
-                resp = client.post(f"{coord_url}/admin/partition?model_name={model}&total_layers={layers}&fast_boot=true&codec=zstd")
+                resp = client.post(f"{coord_url}/admin/partition?model_name={model}&total_layers={layers}&codec=zstd")
                 if resp.status_code == 200:
                     data = resp.json()
                     emit(f"[bold green]Successfully partitioned {model} across {len(data.get('partition_plan', []))} workers![/bold green]", "Partition")
@@ -1354,7 +1351,7 @@ def execute_slash_command(
             if is_coordinator_online(coord_url):
                 try:
                     with httpx.Client(timeout=2.0) as client:
-                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={matched['id']}&total_layers={total_layers}&fast_boot=true&codec=zstd")
+                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={matched['id']}&total_layers={total_layers}&codec=zstd")
                         if resp.status_code == 200:
                             repartition_msg = "\n[bold green]✓ Coordinator pipeline automatically rebalanced across connected workers![/bold green]"
                 except Exception:
@@ -1436,7 +1433,7 @@ def execute_slash_command(
             if is_coordinator_online(coord_url):
                 try:
                     with httpx.Client(timeout=2.0) as client:
-                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={target_arg}&total_layers=32&fast_boot=true&codec=zstd")
+                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={target_arg}&total_layers=32&codec=zstd")
                         if resp.status_code == 200:
                             repartition_msg = "\n[bold green]✓ Coordinator pipeline automatically rebalanced across connected workers![/bold green]"
                 except Exception:
@@ -1638,7 +1635,7 @@ def run_opencode_tui(
                 try:
                     norm_c = normalize_fast_url(coord_url)
                     with httpx.Client(timeout=2.0) as client:
-                        client.post(f"{norm_c}/admin/partition?model_name={m['id']}&total_layers={total_layers}&fast_boot=true&codec=zstd")
+                        client.post(f"{norm_c}/admin/partition?model_name={m['id']}&total_layers={total_layers}&codec=zstd")
                 except Exception:
                     pass
                 try:
@@ -2092,7 +2089,7 @@ def run_opencode_tui(
             if pull_speed:
                 frags.append(("#94a3b8", f"{pull_speed}\n"))
 
-        spec_text = "Fast-Boot + Speculative" if session_state.get("speculative", True) else "Disabled"
+        spec_text = "Speculative" if session_state.get("speculative", True) else "Disabled"
         frags.append(("#ffffff", f"Accel: {spec_text}\n\n"))
         if is_coord:
             frags.append(("bold underline #38bdf8", "[Click Model or F2 to Switch]\n", on_sidebar_model_click))

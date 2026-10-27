@@ -27,7 +27,6 @@ class WorkerNode(BaseModel):
     next_worker_id: Optional[str] = None
     prev_worker_id: Optional[str] = None
     first_worker_id: Optional[str] = None
-    fast_boot: bool = False
     compute_speed: Optional[float] = None
     network_latency_ms: Optional[float] = None
     compute_speed_status: str = "unknown"
@@ -465,11 +464,24 @@ def optimal_heterogeneous_partition(
         speeds.append(speed)
 
         # 3. Memory telemetry: available free VRAM with 10% safety margin for runtime buffers
-        avail_vram = max(50 * 1024**2, int(w.free_vram_bytes * 0.9))
+        avail_vram = max(0, int(w.free_vram_bytes * 0.90))
         stage_overhead = (first_overhead if idx == 0 else 0) + (last_overhead if idx == (K - 1) else 0)
-        usable_for_layers = max(bytes_per_layer, avail_vram - min(avail_vram // 2, stage_overhead))
-        max_fit = max(1, int(usable_for_layers // bytes_per_layer))
+        usable_for_layers = avail_vram - stage_overhead
+        if usable_for_layers < bytes_per_layer:
+            max_fit = 0
+            logger.warning(
+                f"Worker {w.worker_id} has insufficient free VRAM ({w.free_vram_bytes / 1024**2:.1f} MB) "
+                f"for stage overhead ({stage_overhead / 1024**2:.1f} MB) and layer ({bytes_per_layer / 1024**2:.1f} MB). Capacity set to 0."
+            )
+        else:
+            max_fit = int(usable_for_layers // bytes_per_layer)
         capacities_layers.append(max_fit)
+
+    if sum(capacities_layers) < total_layers:
+        raise ValueError(
+            f"Insufficient cluster memory: total worker layer capacities sum to {sum(capacities_layers)}, "
+            f"which cannot accommodate {total_layers} required layers."
+        )
 
     # 4. Dynamic Programming: minimize makespan max_k (l_k / speed_k) under capacity limits
     dp = [[math.inf] * (total_layers + 1) for _ in range(K + 1)]
@@ -483,9 +495,9 @@ def optimal_heterogeneous_partition(
         is_last = (k == K)
 
         for i in range(total_layers + 1):
-            min_l = 1 if (total_layers >= K and not is_last) else 0
-            # Search within actual capacity bound (with 50% burst margin before hard fallback)
-            max_search = min(i, max(cap, int(cap * 1.5)))
+            min_l = 1 if (total_layers >= K and not is_last and cap > 0) else 0
+            # Search strictly within actual capacity bound (preventing memory-infeasible allocations)
+            max_search = min(i, cap)
             for l in range(min_l, max_search + 1):
                 prev_i = i - l
                 if dp[k - 1][prev_i] == math.inf:
@@ -610,7 +622,6 @@ class WorkerRegistry:
         model_name: str,
         total_layers: Optional[int] = None,
         progressive: bool = False,
-        fast_boot: bool = False,
         codec: str = "zstd",
         runtime_config: Optional[Dict[str, Any]] = None,
     ) -> List[AssignLayers]:
@@ -619,12 +630,6 @@ class WorkerRegistry:
         Respects heterogeneous device capabilities (VRAM, compute speed) without hardcoding 32 layers.
         Assigns embed_tokens to the first worker and norm+lm_head to the last worker.
         """
-        if fast_boot:
-            import os
-            env = os.getenv("SITUS_ENV", os.getenv("ENV", "development")).strip().lower()
-            if env in ("production", "prod"):
-                raise ValueError("Fast-boot mode cannot be enabled in production inference without a validated weight-backed implementation.")
-
         alive = self.get_alive_workers()
         if not alive:
             raise RuntimeError("No alive workers available to partition model.")
@@ -657,7 +662,6 @@ class WorkerRegistry:
             worker.next_worker_id = next_id
             worker.prev_worker_id = prev_id
             worker.first_worker_id = first_id
-            worker.fast_boot = fast_boot
 
             assignments.append(
                 AssignLayers(
@@ -672,7 +676,6 @@ class WorkerRegistry:
                     prev_worker_id=prev_id,
                     first_worker_id=first_id,
                     progressive=progressive,
-                    fast_boot=fast_boot,
                     codec=codec,
                 )
             )

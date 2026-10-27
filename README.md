@@ -7,7 +7,7 @@
 ## Key Highlights
 
 - **Pipeline Parallelism over WAN**: Minimizes network traffic by partitioning contiguous transformer layers across machines. Avoids tensor parallelism's frequent all-reduce synchronization barriers.
-- **Fast-Boot Skeletons & Dynamic Hot-Swapping (Strategy 3)**: Enables instant cold start in < 1 second on low-bandwidth networks (e.g., 2 MB/s). Initializes shallow draft blocks with identity residual projections while high-fidelity full-precision layers stream in the background and hot-swap dynamically in-place without dropping active sessions.
+- **Progressive JIT Layer Streaming & Dynamic Hot-Swapping (Strategy 3)**: Enables progressive layer assembly on low-bandwidth networks (e.g., 2 MB/s). Initializes genuine transformer layers dynamically in-place as verified weights stream in the background without dropping active sessions.
 - **Wire Quantization Decoupling & Zstandard Binary Framing (Strategy 4)**: Compresses network layer distribution with streaming Zstandard compression and BitNet 1.6 bpw packing, framed over raw 22-byte binary packets (`b"SITC"` header), eliminating Base64 wire overhead and shrinking weight transfer sizes by over 75%.
 - **Zero KV-Cache Network Transfer**: Each worker stores KV caches strictly for its own assigned layers. KV caches *never* cross the network.
 - **Asymmetric Ring Token Loop**:
