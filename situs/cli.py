@@ -130,7 +130,7 @@ def normalize_http_url(url: str) -> str:
 @app.callback(invoke_without_command=True)
 def main_callback(
     ctx: typer.Context,
-    coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
+    coordinator: str = typer.Option("http://127.0.0.1:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
     model: str = typer.Option("gemma3:4b", "--model", "-m", help="Target model identifier"),
 ):
     """Situs: Distributed GPU Pooling Across the Internet."""

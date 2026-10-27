@@ -21,13 +21,26 @@ import datetime
 from urllib.parse import urlparse
 from typing import Optional, List, Dict, Tuple, Any, Callable
 
-# Ensure proper UTF-8 handling on Windows
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+# Ensure proper UTF-8 handling and native virtual terminal sequences on Windows
+def enable_windows_vt_support():
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            hOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_ulong()
+            if kernel32.GetConsoleMode(hOut, ctypes.byref(mode)):
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                kernel32.SetConsoleMode(hOut, mode.value | 0x0004)
+        except Exception:
+            pass
+
+enable_windows_vt_support()
 
 # Silence HTTP request loggers to prevent leaking HTTP GET/POST logs into the TUI
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -103,27 +116,28 @@ RED_SITUS_LOGO = r"""
 
 TAGLINE_TEXT = "D I S T R I B U T E D   A I   C O M P U T E   F O R   E V E R Y O N E"
 
-# Sleek OpenCode / ZenCode Style Palette
+# Sleek Modern Dark-Slate Style Palette (Claude Code / OpenCode aesthetic)
 TUI_STYLE = Style.from_dict({
-    "card.border": "#ffffff",              # White rounded box border (OpenCode card)
-    "card.border.active": "#ffffff bold",
-    "prompt.bar": "#3b82f6 bold",          # Bright blue vertical focus bar (OpenCode accent)
-    "prompt.text": "#ffffff",              # Crisp white input text
-    "text-area": "#ffffff",                # Crisp white typed text in input card
-    "text-area.cursor-line": "#ffffff",
-    "placeholder": "#ffffff italic",       # White placeholder text
-    "status.badge": "#3b82f6 bold",        # "Build" / "Distributed" tag
-    "status.text": "#ffffff",              # Subtitle text
-    "status.ready": "#22c55e",             # Green status indicator
-    "shortcuts": "#ffffff",
-    "shortcuts.key": "#ffffff bold",
-    "bottom-toolbar": "bg:#000000 #ffffff",
+    "card.border": "#475569",              # Subtle slate-600 rounded box border
+    "card.border.active": "#38bdf8",       # Vibrant cyan active focus border
+    "prompt.bar": "#ef4444 bold",          # Situs signature red vertical focus bar
+    "prompt.text": "#f8fafc",              # Crisp modern white input text
+    "text-area": "#f8fafc",                # Crisp modern white typed text in input card
+    "text-area.cursor-line": "#f8fafc",
+    "placeholder": "#64748b italic",       # Muted slate placeholder text
+    "status.badge": "#38bdf8 bold",        # Cyan status tag
+    "status.text": "#94a3b8",              # Subtle slate status text
+    "status.ready": "#22c55e bold",        # Vibrant green status indicator
+    "status.waiting": "#f59e0b bold",      # Warm amber waiting indicator
+    "shortcuts": "#94a3b8",                # Subtle muted shortcuts text
+    "shortcuts.key": "#38bdf8 bold",       # Cyan shortcut keys
+    "bottom-toolbar": "bg:#0b0f19 #94a3b8",# Deep dark slate bottom bar
     "bottom-toolbar.branch": "#ef4444 bold",
-    "bottom-toolbar.version": "#ffffff",
-    "completion-menu": "bg:#0f172a #ffffff",
-    "completion-menu.completion": "bg:#0f172a #ffffff",
-    "completion-menu.completion.current": "bg:#1e293b #ffffff bold",
-    "completion-menu.meta": "bg:#020617 #ffffff italic",
+    "bottom-toolbar.version": "#64748b",
+    "completion-menu": "bg:#0f172a #f8fafc",
+    "completion-menu.completion": "bg:#0f172a #94a3b8",
+    "completion-menu.completion.current": "bg:#1e293b #38bdf8 bold",
+    "completion-menu.meta": "bg:#0b0f19 #64748b italic",
     "completion-menu.meta.current": "bg:#1e293b #93c5fd italic",
 })
 
@@ -399,17 +413,21 @@ _cached_git_branch: Optional[str] = None
 
 
 def normalize_fast_url(url: str) -> str:
-    """Normalize coordinator URL and replace 'localhost' with '127.0.0.1' to eliminate Windows IPv6 DNS hang."""
+    """Normalize coordinator URL and replace 'localhost' / '::1' with '127.0.0.1' to eliminate Windows IPv6 DNS hang."""
     url = url.strip().rstrip("/")
     if "://localhost" in url:
         url = url.replace("://localhost", "://127.0.0.1")
     elif url.startswith("localhost:"):
         url = "127.0.0.1:" + url[10:]
+    elif "://::1" in url or "://[::1]" in url:
+        url = url.replace("://[::1]", "://127.0.0.1").replace("://::1", "://127.0.0.1")
+    if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("ws://") and not url.startswith("wss://"):
+        url = f"http://{url}"
     return url
 
 
-def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
-    """Socket probe checking if a TCP port is open."""
+def is_port_open(host: str, port: int, timeout: float = 0.25) -> bool:
+    """Fast non-blocking socket probe checking if a TCP port is open."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -419,14 +437,14 @@ def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
 
 
 def is_coordinator_online(url: str, timeout: Optional[float] = None) -> bool:
-    """Socket probe checking if the coordinator port is open."""
+    """Fast non-blocking socket probe checking if the coordinator port is open."""
     try:
         normalized = normalize_fast_url(url)
         parsed = urlparse(normalized if "://" in normalized else f"http://{normalized}")
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         if timeout is None:
-            timeout = 0.75 if host in ("127.0.0.1", "localhost", "::1") else 1.5
+            timeout = 0.25 if host in ("127.0.0.1", "localhost", "::1") else 0.5
         return is_port_open(host, port, timeout=timeout)
     except Exception:
         return False
@@ -470,7 +488,7 @@ def get_git_branch() -> str:
 
 
 def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, Any]:
-    """Fetch live cluster status with fast socket check and TTL caching."""
+    """Fetch live cluster status with fast non-blocking TTL caching."""
     global _metadata_cache
     now = time.time()
     normalized = normalize_fast_url(coordinator_url)
@@ -480,9 +498,9 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
     if cached and (now - cached[0]) < ttl:
         return cached[1]
 
-    # 2. HTTP status fetch directly (authoritative status)
+    # 2. HTTP status fetch directly with short timeout
     try:
-        with httpx.Client(timeout=2.0) as client:
+        with httpx.Client(timeout=0.8) as client:
             resp = client.get(f"{normalized}/status")
             if resp.status_code == 200:
                 data = resp.json()
@@ -491,8 +509,8 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
     except Exception:
         pass
 
-    # 3. Socket check fallback to avoid false 'offline' flickers during transient HTTP delays
-    if is_coordinator_online(normalized, timeout=0.6):
+    # 3. Fast socket check fallback
+    if is_coordinator_online(normalized, timeout=0.25):
         if cached:
             _metadata_cache[normalized] = (now, cached[1])
             return cached[1]
@@ -1587,27 +1605,27 @@ def run_opencode_tui(
         for l in RED_SITUS_LOGO.splitlines():
             lines.append(f'<style color="#ef4444"><b>{html.escape(l)}</b></style>')
         lines.append("")
-        lines.append(f'<style color="#ffffff"><b>{html.escape(TAGLINE_TEXT)}</b></style>\n')
-        lines.append('<style color="#ffffff">• <style color="#38bdf8"><b>/coordinator</b></style> - Start background cluster coordinator &amp; WebSocket relay</style>')
-        lines.append('<style color="#ffffff">• <style color="#38bdf8"><b>/join &lt;IP&gt;:8000 [id] [dev]</b></style> - Connect local GPU or remote laptop with custom ID</style>')
-        lines.append('<style color="#ffffff">• <style color="#38bdf8"><b>/models</b></style> - View curated 6GB-10GB distributed models (/model &lt;1-8&gt;)</style>')
-        lines.append('<style color="#ffffff">• <style color="#38bdf8"><b>/status</b></style> - Show active GPUs, VRAM allocations &amp; pipeline stages</style>')
-        lines.append('<style color="#ffffff">• <style color="#38bdf8"><b>/nodes</b></style> - Inspect worker nodes &amp; WebRTC direct transport</style>')
-        lines.append('<style color="#ffffff">• <style color="#38bdf8"><b>/help</b></style> - View all commands, custom worker IDs &amp; model guide</style>\n')
+        lines.append(f'<style color="#f8fafc"><b>{html.escape(TAGLINE_TEXT)}</b></style>\n')
+        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/coordinator</b></style>  Start background cluster coordinator &amp; WebSocket relay</style>')
+        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/join &lt;IP&gt;:8000 [id] [dev]</b></style>  Connect local GPU or remote laptop</style>')
+        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/models</b></style>       View curated distributed models (/model &lt;1-8&gt;)</style>')
+        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/status</b></style>       Show active GPUs, VRAM allocations &amp; pipeline stages</style>')
+        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/nodes</b></style>        Inspect worker nodes &amp; WebRTC direct transport</style>')
+        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/help</b></style>         View all commands &amp; worker guides</style>\n')
         return "\n".join(lines)
 
     history_entries.append(("hero", make_hero_banner(), ""))
 
-    # Completer & Input TextArea (Clean prompt, crisp white text)
+    # Completer & Input TextArea (Clean modern prompt, crisp readable text)
     completer = OpenCodeSlashCompleter()
     input_box = TextArea(
         multiline=True,
-        prompt=[("class:prompt.bar", " │ ")],
+        prompt=[("class:prompt.bar", " ❯ ")],
         completer=completer,
         complete_while_typing=True,
         history=session_history,
         style="class:text-area",
-        input_processors=[],
+        input_processors=[PlaceholderProcessor("Ask anything or type / for commands...")],
     )
 
     app_instance: List[Optional[Application]] = [None]
@@ -1783,36 +1801,36 @@ def run_opencode_tui(
             frags.append(("", "\n"))
         elif role == "user":
             user_html = (
-                f'<style color="#3b82f6"><b>│</b></style> <style color="#ffffff"><b>{html.escape(text)}</b></style>\n'
-                f'<style color="#ffffff">▪ {html.escape(meta)}</style>\n\n'
+                f'<style color="#38bdf8"><b>❯</b></style> <style color="#f8fafc"><b>{html.escape(text)}</b></style>\n'
+                f'<style color="#64748b">  {html.escape(meta)}</style>\n\n'
             )
             frags.extend(to_formatted_text(HTML(user_html)))
         elif role == "assistant":
-            asst_html = f'<style color="#ffffff">{html.escape(text)}</style>\n\n'
+            asst_html = f'<style color="#f8fafc">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(asst_html)))
         elif role == "loading":
             lines = text.strip().split("\n")
             content_html = ""
             for l in lines:
-                content_html += f'<style color="#38bdf8"><b>│</b></style> <style color="#ffffff">{html.escape(l)}</style>\n'
+                content_html += f'<style color="#475569"><b>│</b></style> <style color="#94a3b8">{html.escape(l)}</style>\n'
             tag = f" ({html.escape(meta)})" if meta else ""
             load_html = (
-                f'<style color="#38bdf8"><b>┌─ [Online Model Streaming]</b></style><style color="#e0f2fe"><b>{tag}</b></style>\n'
+                f'<style color="#38bdf8"><b>╭─ [Online Model Streaming]</b></style><style color="#94a3b8"><b>{tag}</b></style>\n'
                 f'{content_html}'
-                f'<style color="#38bdf8"><b>└──────────────────────────────────────────────────────────</b></style>\n\n'
+                f'<style color="#475569"><b>╰──────────────────────────────────────────────────────────</b></style>\n\n'
             )
             try:
                 frags.extend(to_formatted_text(HTML(load_html)))
             except Exception:
                 frags.append(("", f"[{meta}] {text}\n\n"))
         elif role == "metric":
-            metric_html = f'<style color="#ffffff">{html.escape(text)}</style>\n\n'
+            metric_html = f'<style color="#64748b">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(metric_html)))
         elif role == "system":
             if "\x1b[" in text:
                 frags.extend(to_formatted_text(ANSI(text + "\n\n")))
             else:
-                sys_html = f'<style color="#38bdf8">{html.escape(text)}</style>\n\n'
+                sys_html = f'<style color="#94a3b8">{html.escape(text)}</style>\n\n'
                 frags.extend(to_formatted_text(HTML(sys_html)))
         return frags
 
@@ -1910,8 +1928,8 @@ def run_opencode_tui(
             s_tps = session_state.get("stream_tps", 0.0)
             telemetry = f" ({s_tok} tok · {s_tps:.1f} tok/s)" if s_tok > 0 else " (connecting pipeline...)"
             if interrupt_armed[0]:
-                return to_formatted_text(HTML(f'  <style color="#ef4444"><b>● Press Esc or Ctrl+C again to cancel!</b></style> <style color="#ffffff">{telemetry}</style>'))
-            return to_formatted_text(HTML(f'  <style color="#eab308"><b>● Inferencing...</b></style> <style color="#ffffff">{telemetry} (esc to stop)</style>'))
+                return to_formatted_text(HTML(f'  <style color="#ef4444"><b>● Press Esc again to cancel!</b></style> <style color="#94a3b8">{telemetry}</style>'))
+            return to_formatted_text(HTML(f'  <style color="#38bdf8"><b>● Inferencing...</b></style> <style color="#94a3b8">{telemetry} (esc to stop)</style>'))
 
         workers_cnt = session_state.get("workers_count", 0)
         curr_m = session_state.get("model", model)
@@ -1925,26 +1943,25 @@ def run_opencode_tui(
                 return None
             return NotImplemented
 
-        # Meaningful distributed cluster role badge (replaces "Build")
         tot_v = session_state.get("total_vram_gb", 0.0)
         used_v = session_state.get("used_vram_gb", 0.0)
         vram_badge = f" · VRAM: {used_v:.1f}/{tot_v:.1f} GB" if tot_v > 0 else ""
 
         if workers_cnt > 0:
             badge_text = f"  [Pipeline: {workers_cnt} Nodes]"
-            badge_style = "bold #3b82f6"
+            badge_style = "bold #38bdf8"
             stat_text = f" · ● P2P Mesh Active{vram_badge}"
             stat_style = "bold #22c55e"
         elif c_status in ("healthy", "online", "no_workers"):
             badge_text = "  [Coordinator Online]"
-            badge_style = "bold #3b82f6"
+            badge_style = "bold #38bdf8"
             stat_text = " · Waiting for Workers (/join)"
-            stat_style = "#eab308"
+            stat_style = "bold #f59e0b"
         else:
             badge_text = "  [Cluster Offline]"
             badge_style = "bold #ef4444"
             stat_text = " · Start with /coordinator"
-            stat_style = "#ffffff"
+            stat_style = "#94a3b8"
 
         is_coord = session_state.get("is_coordinator", True)
         if is_coord:
@@ -1983,17 +2000,17 @@ def run_opencode_tui(
         is_gen = session_state.get("is_generating", False)
         if not auto_scroll_locked[0] and is_gen:
             return to_formatted_text(HTML(
-                '  <style color="#eab308"><b>↓ Streaming tokens below</b></style> '
-                '<style color="#ffffff">· press <b>End</b> or scroll down to follow</style>'
+                '  <style color="#f59e0b"><b>↓ Streaming tokens below</b></style> '
+                '<style color="#94a3b8">· press <b>End</b> to follow</style>'
             ))
         is_coord = session_state.get("is_coordinator", True)
-        f2_part = '<style color="#38bdf8"><b>f2</b></style> <style color="#ffffff">models</style>   ' if is_coord else ''
+        f2_part = '<style color="#38bdf8"><b>f2</b></style> <style color="#94a3b8">models</style>   ' if is_coord else ''
         return to_formatted_text(HTML(
-            f'  <style color="#38bdf8"><b>tab</b></style> <style color="#ffffff">nodes</style>   '
+            f'  <style color="#38bdf8"><b>tab</b></style> <style color="#94a3b8">nodes</style>   '
             f'{f2_part}'
-            f'<style color="#38bdf8"><b>/</b></style> <style color="#ffffff">commands</style>   '
-            f'<style color="#38bdf8"><b>pgup/dn</b></style> <style color="#ffffff">scroll</style>   '
-            f'<style color="#38bdf8"><b>ctrl+c</b></style> <style color="#ffffff">exit</style>'
+            f'<style color="#38bdf8"><b>/</b></style> <style color="#94a3b8">commands</style>   '
+            f'<style color="#38bdf8"><b>pgup/dn</b></style> <style color="#94a3b8">scroll</style>   '
+            f'<style color="#38bdf8"><b>ctrl+c</b></style> <style color="#94a3b8">exit</style>'
         ))
 
     shortcuts_line = Window(
@@ -2010,46 +2027,41 @@ def run_opencode_tui(
     def get_sidebar_fragments() -> Any:
         frags = []
         frags.append(("bold #38bdf8", "SITUS SWARM\n"))
-        frags.append(("#ffffff", f"{session_start_iso}\n\n"))
+        frags.append(("#94a3b8", f"{session_start_iso}\n\n"))
 
-        active_c = session_state.get("coordinator_url", coordinator_url)
-        meta = fetch_cluster_metadata(active_c, ttl=1.0)
-        w_cnt = meta.get("active_workers_count", session_state.get("workers_count", 0))
-        c_stat = meta.get("status", session_state.get("coord_status", "offline"))
-        total_cluster_vram = meta.get("total_vram_gb", session_state.get("total_vram_gb", 0.0))
-        free_cluster_vram = meta.get("free_vram_gb", session_state.get("free_vram_gb", 0.0))
-        used_cluster_vram = meta.get("used_vram_gb", session_state.get("used_vram_gb", 0.0))
-        pct_cluster = meta.get("vram_usage_pct", 0.0)
+        # Zero I/O on render thread: read directly from state updated by background daemon
+        w_cnt = session_state.get("workers_count", 0)
+        c_stat = session_state.get("coord_status", "offline")
+        total_cluster_vram = session_state.get("total_vram_gb", 0.0)
+        free_cluster_vram = session_state.get("free_vram_gb", 0.0)
+        used_cluster_vram = session_state.get("used_vram_gb", 0.0)
+        pct_cluster = session_state.get("vram_usage_pct", 0.0)
 
-        frags.append(("bold #ffffff", "Cluster View\n"))
+        frags.append(("bold #f8fafc", "Cluster View\n"))
         if w_cnt > 0:
             frags.append(("bold #22c55e", f"● {w_cnt} GPUs Active\n"))
-            frags.append(("#ffffff", f"Pipeline: {w_cnt} Stages\n"))
+            frags.append(("#f8fafc", f"Pipeline: {w_cnt} Stages\n"))
             if total_cluster_vram > 0:
-                frags.append(("#ffffff", f"Pooled VRAM: {used_cluster_vram:.1f}/{total_cluster_vram:.1f} GB ({pct_cluster:.0f}%)\n"))
-                frags.append(("#ffffff", f"Free VRAM: {free_cluster_vram:.1f} GB (GPU Pure)\n"))
+                frags.append(("#94a3b8", f"Pooled VRAM: {used_cluster_vram:.1f}/{total_cluster_vram:.1f} GB ({pct_cluster:.0f}%)\n"))
+                frags.append(("#94a3b8", f"Free VRAM: {free_cluster_vram:.1f} GB (GPU Pure)\n"))
             else:
                 vram_str = session_state.get("vram_desc", f"{total_cluster_vram:.1f} GB")
-                frags.append(("#ffffff", f"VRAM: {vram_str}\n"))
+                frags.append(("#94a3b8", f"VRAM: {vram_str}\n"))
         elif c_stat in ("healthy", "online", "no_workers"):
-            frags.append(("bold #eab308", "● Coordinator Ready\n"))
-            frags.append(("#ffffff", "Waiting for /join\n"))
+            frags.append(("bold #f59e0b", "● Coordinator Ready\n"))
+            frags.append(("#94a3b8", "Waiting for /join\n"))
             vram_str = session_state.get("vram_desc", "8.0 GB")
-            frags.append(("#ffffff", f"Local VRAM: {vram_str}\n"))
+            frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         else:
-            frags.append(("#ffffff", "○ Cluster Offline\n"))
-            frags.append(("#ffffff", "Start with /coordinator\n"))
+            frags.append(("#64748b", "○ Cluster Offline\n"))
+            frags.append(("#94a3b8", "Start with /coordinator\n"))
             vram_str = session_state.get("vram_desc", "8.0 GB")
-            frags.append(("#ffffff", f"Local VRAM: {vram_str}\n"))
+            frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
-        frags.append(("#ffffff", f"{trans_name}\n"))
-        frags.append(("#ffffff", "Wire: Zstd Wire Decoupled\n\n"))
+        frags.append(("#94a3b8", f"{trans_name}\n"))
+        frags.append(("#64748b", "Wire: Zstd Wire Decoupled\n\n"))
 
         is_coord = session_state.get("is_coordinator", True)
-        if not is_coord:
-            coord_m = meta.get("model") or meta.get("active_model")
-            if coord_m:
-                session_state["model"] = coord_m
 
         def on_sidebar_model_click(mouse_event: MouseEvent) -> Any:
             if mouse_event.event_type == MouseEventType.MOUSE_UP and mouse_event.button == MouseButton.LEFT:
@@ -2060,7 +2072,7 @@ def run_opencode_tui(
                 return None
             return NotImplemented
 
-        frags.append(("bold #ffffff", "Model View\n"))
+        frags.append(("bold #f8fafc", "Model View\n"))
         curr_m = session_state.get("model", model)
         m_info = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == curr_m.lower() or m["name"].lower() == curr_m.lower() or curr_m.lower().startswith(m["id"].split(":")[0])), None)
         if m_info:
@@ -2069,16 +2081,16 @@ def run_opencode_tui(
                 frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
             else:
                 frags.append(("bold #38bdf8", f"{disp_title}\n"))
-            frags.append(("#ffffff", f"{m_info['params']} · {m_info['layers']} Layers\n"))
-            frags.append(("#ffffff", f"VRAM: {m_info['vram_gb']} GB\n"))
-            frags.append(("#ffffff", f"{m_info['recommended_split']}\n"))
+            frags.append(("#94a3b8", f"{m_info['params']} · {m_info['layers']} Layers\n"))
+            frags.append(("#94a3b8", f"VRAM: {m_info['vram_gb']} GB\n"))
+            frags.append(("#64748b", f"{m_info['recommended_split']}\n"))
         else:
             disp_title = curr_m if len(curr_m) <= 32 else curr_m[:30] + ".."
             if is_coord:
                 frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
             else:
                 frags.append(("bold #38bdf8", f"{disp_title}\n"))
-            frags.append(("#ffffff", "32 Layers · FP16/INT8\n"))
+            frags.append(("#94a3b8", "32 Layers · FP16/INT8\n"))
 
         if session_state.get("is_pulling"):
             pull_pct = session_state.get("pull_percent", 0.0)
@@ -2704,6 +2716,16 @@ def run_opencode_tui(
                 if abs(tot_vram - session_state.get("total_vram_gb", 0.0)) > 0.05:
                     session_state["total_vram_gb"] = tot_vram
                     session_state["free_vram_gb"] = meta.get("free_vram_gb", 0.0)
+                    changed = True
+
+                used_vram = meta.get("used_vram_gb", 0.0)
+                if abs(used_vram - session_state.get("used_vram_gb", 0.0)) > 0.05:
+                    session_state["used_vram_gb"] = used_vram
+                    changed = True
+
+                pct = meta.get("vram_usage_pct", 0.0)
+                if abs(pct - session_state.get("vram_usage_pct", 0.0)) > 0.5:
+                    session_state["vram_usage_pct"] = pct
                     changed = True
 
                 coord_model = meta.get("model") or meta.get("active_model")
