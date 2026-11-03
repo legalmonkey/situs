@@ -21,6 +21,10 @@ import datetime
 from urllib.parse import urlparse
 from typing import Optional, List, Dict, Tuple, Any, Callable
 
+# Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 # Ensure proper UTF-8 handling and native virtual terminal sequences on Windows
 def enable_windows_vt_support():
     if sys.platform == "win32":
@@ -68,6 +72,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
+from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.output.vt100 import Vt100_Output
@@ -426,12 +431,21 @@ def normalize_fast_url(url: str) -> str:
     return url
 
 
-def is_port_open(host: str, port: int, timeout: float = 0.25) -> bool:
+def is_port_open(host: str, port: int, timeout: float = 0.08) -> bool:
     """Fast non-blocking socket probe checking if a TCP port is open."""
     try:
+        # Resolve to IPv4 to eliminate Windows IPv6 / Dual-stack connect delays
+        if host in ("127.0.0.1", "localhost", "::1"):
+            target_ip = "127.0.0.1"
+        else:
+            try:
+                target_ip = socket.gethostbyname(host)
+            except Exception:
+                target_ip = host
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            return s.connect_ex((host, port)) == 0
+            return s.connect_ex((target_ip, port)) == 0
     except Exception:
         return False
 
@@ -444,7 +458,7 @@ def is_coordinator_online(url: str, timeout: Optional[float] = None) -> bool:
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         if timeout is None:
-            timeout = 0.25 if host in ("127.0.0.1", "localhost", "::1") else 0.5
+            timeout = 0.08 if host in ("127.0.0.1", "localhost", "::1") else 0.25
         return is_port_open(host, port, timeout=timeout)
     except Exception:
         return False
@@ -510,15 +524,15 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
         pass
 
     # 3. Fast socket check fallback
-    if is_coordinator_online(normalized, timeout=0.25):
+    if is_coordinator_online(normalized, timeout=0.08):
         if cached:
             _metadata_cache[normalized] = (now, cached[1])
             return cached[1]
         active_fallback = {
             "status": "healthy",
-            "active_workers_count": 1,
+            "active_workers_count": 0,
             "model": DEFAULT_MODEL,
-            "is_partitioned": True,
+            "is_partitioned": False,
         }
         _metadata_cache[normalized] = (now, active_fallback)
         return active_fallback
@@ -2405,7 +2419,9 @@ def run_opencode_tui(
         # If user entered a command or prompt, ALWAYS execute it (never let model picker swallow Enter)
         if user_input:
             show_model_picker[0] = False
+            # Immediately clear and reset buffer document to guarantee input box is fully cleared
             input_box.text = ""
+            buf.reset(document=Document(text="", cursor_position=0))
             prompt_history.append(user_input)
             prompt_history_idx[0] = len(prompt_history)
             scroll_offset[0] = 0

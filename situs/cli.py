@@ -14,6 +14,10 @@ import platform
 import shutil
 from typing import Optional, List, Dict, Any
 
+# Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 # Ensure proper UTF-8 output across Windows PowerShell and legacy consoles
 if sys.platform == "win32":
     try:

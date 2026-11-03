@@ -9,6 +9,10 @@ import sys
 import logging
 from typing import Optional, List, Any, Dict
 
+# Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 logger = logging.getLogger("situs.tokenizer")
 
 try:
