@@ -241,7 +241,10 @@ class WorkerDaemon:
                 async for message in websocket:
                     frame = ProtocolFrame.model_validate_json(message)
 
-                    if frame.type == MessageType.ASSIGN_LAYERS:
+                    if frame.type == MessageType.WORKER_REGISTERED:
+                        logger.info(f"Coordinator confirmed registration for worker {self.worker_id}")
+
+                    elif frame.type == MessageType.ASSIGN_LAYERS:
                         try:
                             assign = AssignLayers.model_validate(frame.payload)
                             logger.info(
@@ -342,11 +345,18 @@ class WorkerDaemon:
                                 self.engine.abort_inference(req_id)
 
             except websockets.ConnectionClosed as e:
-                logger.warning(f"Connection closed ({e}). Reconnecting in 3 seconds...")
-                await asyncio.sleep(3.0)
+                if getattr(e, "code", None) == 1008:
+                    logger.error(f"Registration rejected by coordinator policy (1008): {getattr(e, 'reason', e)}")
+                    await asyncio.sleep(5.0)
+                else:
+                    logger.warning(f"Connection closed ({e}). Reconnecting in 3 seconds...")
+                    await asyncio.sleep(3.0)
             except Exception as e:
                 logger.error(f"Worker runtime exception: {e}", exc_info=True)
                 await asyncio.sleep(3.0)
+            finally:
+                if 'hb_task' in locals() and not hb_task.done():
+                    hb_task.cancel()
 
 
 def main():

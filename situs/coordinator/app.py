@@ -281,6 +281,17 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
         registry.remove_worker(worker_id)
 
 
+@app.websocket("/ws/worker")
+async def worker_websocket_alias(websocket: WebSocket):
+    worker_id = websocket.query_params.get("worker_id") or websocket.query_params.get("id") or websocket.headers.get("x-worker-id")
+    if not worker_id:
+        await websocket.close(code=1008, reason="Missing worker_id parameter in URL or headers")
+        return
+    await worker_websocket(websocket, worker_id)
+
+
+
+
 # ==========================================
 # Cluster Management & Status
 # ==========================================
@@ -343,6 +354,7 @@ async def trigger_partition(
         assignments = registry.partition_model(
             model_name, total_layers=total_layers, progressive=progressive, codec=codec
         )
+        failed_workers = []
         for assign in assignments:
             frame = ProtocolFrame(
                 type=MessageType.ASSIGN_LAYERS,
@@ -350,7 +362,11 @@ async def trigger_partition(
                 target=assign.worker_id,
                 payload=assign.model_dump(),
             )
-            await relay.send_to_worker(assign.worker_id, frame)
+            sent = await relay.send_to_worker(assign.worker_id, frame)
+            if not sent:
+                failed_workers.append(assign.worker_id)
+        if failed_workers:
+            raise RuntimeError(f"Failed to deliver partition assignment to worker(s): {', '.join(failed_workers)}")
         return {"status": "success", "partitions": [a.model_dump() for a in assignments]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

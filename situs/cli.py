@@ -2,6 +2,7 @@
 
 Provides an elegant, developer-friendly terminal interface for distributed GPU pooling,
 hardware diagnostics, cluster monitoring, and streaming chat in PowerShell or any shell.
+Inspired by modern developer CLIs (gh, uv, vercel, stripe, cargo).
 """
 
 import sys
@@ -12,6 +13,7 @@ import asyncio
 import subprocess
 import platform
 import shutil
+import json
 from typing import Optional, List, Dict, Any
 
 # Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
@@ -48,7 +50,11 @@ except (ImportError, ModuleNotFoundError) as e:
 
 from situs.config import CoordinatorConfig, WorkerConfig
 
-console = Console(legacy_windows=False) if HAS_RICH else None
+# Detect NO_COLOR standard (https://no-color.org)
+_no_color = bool(os.getenv("NO_COLOR") or os.getenv("TERM") == "dumb")
+
+console = Console(legacy_windows=False, no_color=_no_color) if HAS_RICH else None
+err_console = Console(stderr=True, legacy_windows=False, no_color=_no_color) if HAS_RICH else None
 
 SITUS_LOGO_RAW = r"""
   ▄██████    ███    █████████    ███   ███    ▄██████
@@ -59,31 +65,70 @@ SITUS_LOGO_RAW = r"""
 """
 
 TAGLINE_TEXT = "D I S T R I B U T E D   A I   C O M P U T E   F O R   E V E R Y O N E"
+VERSION_STR = "0.1.0"
 
 
-def print_banner():
+def print_banner(compact: bool = False):
     """Print the centered red Situs logo with white borders."""
-    if console:
+    if not console:
+        print(f"SITUS v{VERSION_STR} - Distributed GPU Pooling Across the Internet")
+        return
+
+    term_width = shutil.get_terminal_size((80, 24)).columns
+    if compact or term_width < 70:
+        header_text = "[bold red]S I T U S[/bold red]  [dim]•[/dim]  [bold white]Distributed AI Compute for Everyone[/bold white]"
+        panel = Panel(
+            Align.center(header_text),
+            title=f"[bold red]●[/bold red] [bold yellow]●[/bold yellow] [bold green]●[/bold green] [bold white]situs[/bold white] [dim]v{VERSION_STR}[/dim]",
+            title_align="center",
+            border_style="bold white",
+            padding=(0, 1),
+        )
+        console.print(panel)
+    else:
         header_content = (
             f"[bold red]{SITUS_LOGO_RAW.strip()}[/bold red]\n\n"
             f"[bold white]{TAGLINE_TEXT}[/bold white]"
         )
         panel = Panel(
             Align.center(header_content),
-            title="[bold red]●[/bold red] [bold yellow]●[/bold yellow] [bold green]●[/bold green]                  [bold white]situs[/bold white]                  [white]v0.1.0[/white]",
+            title=f"[bold red]●[/bold red] [bold yellow]●[/bold yellow] [bold green]●[/bold green]                  [bold white]situs[/bold white]                  [white]v{VERSION_STR}[/white]",
             title_align="center",
             border_style="bold white",
             padding=(1, 2),
         )
         console.print(panel)
-    else:
-        print("SITUS - Distributed GPU Pooling Across the Internet")
+
+
+def version_callback(value: bool):
+    """Show the Situs version and exit."""
+    if value:
+        py_ver = f"{platform.python_implementation()} {platform.python_version()}"
+        os_info = f"{platform.system()} {platform.machine()}"
+        if console:
+            console.print(f"[bold red]situs[/bold red] version [bold white]{VERSION_STR}[/bold white] [dim]({py_ver}, {os_info})[/dim]")
+        else:
+            print(f"situs version {VERSION_STR} ({py_ver}, {os_info})")
+        raise typer.Exit()
+
+
+HELP_EPILOG = """
+[bold cyan]Examples:[/bold cyan]
+  $ situs setup                          Run system & GPU hardware diagnostics
+  $ situs coordinator --port 8000        Start cluster coordinator & WebSocket relay
+  $ situs join 192.168.1.50:8000         Connect this machine as a worker node
+  $ situs status                         Inspect cluster health and VRAM allocation
+  $ situs status --watch                 Live auto-refreshing cluster monitor
+  $ situs chat --model gemma3:4b         Launch interactive streaming chat interface
+  $ situs run "Why is sky blue?"         Stream a single prompt across the cluster
+"""
 
 app = typer.Typer(
     name="situs",
     help="Situs: Distributed GPU Pooling Across the Internet",
     no_args_is_help=False,
     add_completion=False,
+    epilog=HELP_EPILOG,
 )
 
 
@@ -134,6 +179,9 @@ def normalize_http_url(url: str) -> str:
 @app.callback(invoke_without_command=True)
 def main_callback(
     ctx: typer.Context,
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-v", callback=version_callback, is_eager=True, help="Show the Situs version and exit."
+    ),
     coordinator: str = typer.Option("http://127.0.0.1:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
     model: str = typer.Option("gemma3:4b", "--model", "-m", help="Target model identifier"),
 ):
@@ -151,27 +199,21 @@ def main_callback(
         run_opencode_tui(coordinator_url=coordinator, model=model)
 
 
-
-
 @app.command("setup")
-def setup():
+def setup(
+    json_output: bool = typer.Option(False, "--json", help="Output diagnostics as structured JSON"),
+):
     """Run comprehensive system & hardware diagnostics (GPU, VRAM, CUDA, network)."""
-    print_banner()
-    if console:
-        console.print("[bold green]Running Situs System Diagnostics...[/bold green]\n")
-
-    table = Table(title="Situs Device Diagnostics", title_style="bold magenta", border_style="cyan")
-    table.add_column("Subsystem", style="bold white", width=18)
-    table.add_column("Detected Specification", style="cyan", width=38)
-    table.add_column("Status", justify="center", width=14)
+    if not json_output:
+        print_banner()
+        if console:
+            console.print("[bold green]Running Situs System Diagnostics...[/bold green]\n")
 
     # 1. OS & Architecture
     os_name = f"{platform.system()} {platform.release()} ({platform.machine()})"
-    table.add_row("Operating System", os_name, "[bold green]PASS[/bold green]")
 
     # 2. Python Environment
-    py_ver = f"{platform.python_version()} ({sys.executable})"
-    table.add_row("Python Runtime", f"v{platform.python_version()}", "[bold green]PASS[/bold green]")
+    py_ver = f"v{platform.python_version()}"
 
     # 3. PyTorch Version & CUDA
     has_torch = False
@@ -185,14 +227,10 @@ def setup():
     except ImportError:
         pass
 
-    if has_torch:
-        table.add_row("PyTorch", torch_ver, "[bold green]PASS[/bold green]")
-    else:
-        table.add_row("PyTorch", "Not installed", "[bold red]FAIL[/bold red]")
-
     # 4. Hardware GPU via PyTorch or nvidia-smi
     gpu_name = "None detected"
     vram_str = "0 MB"
+    vram_gb = 0.0
     cuda_detected = False
     driver_ver = "N/A"
 
@@ -201,7 +239,6 @@ def setup():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         vram_str = f"{vram_gb:.1f} GB VRAM"
         cuda_detected = True
-        table.add_row("GPU Hardware", f"{gpu_name} ({vram_str})", "[bold green]CUDA ACCEL[/bold green]")
     else:
         # Check nvidia-smi fallback
         if shutil.which("nvidia-smi"):
@@ -211,30 +248,22 @@ def setup():
                     capture_output=True,
                     text=True,
                     check=True,
+                    timeout=5.0,
                 )
                 output = res.stdout.strip()
                 if output:
                     parts = [p.strip() for p in output.split(",")]
                     gpu_name = parts[0]
                     vram_mb = float(parts[1]) if len(parts) > 1 else 0
-                    vram_str = f"{vram_mb / 1024:.1f} GB VRAM"
+                    vram_gb = vram_mb / 1024
+                    vram_str = f"{vram_gb:.1f} GB VRAM"
                     driver_ver = parts[2] if len(parts) > 2 else "Unknown"
                     cuda_detected = True
             except Exception:
                 pass
 
-        if cuda_detected:
-            table.add_row(
-                "GPU Hardware",
-                f"{gpu_name} ({vram_str})",
-                "[bold yellow]NVIDIA FOUND[/bold yellow]"
-            )
-        else:
-            table.add_row("GPU Hardware", "CPU Execution Only", "[bold yellow]CPU ONLY[/bold yellow]")
-
     # 5. Local Network IP
     lan_ip = get_local_ip()
-    table.add_row("Local LAN IP", lan_ip, "[bold green]ONLINE[/bold green]")
 
     # 6. WebRTC STUN Check
     webrtc_ok = False
@@ -243,6 +272,40 @@ def setup():
         webrtc_ok = True
     except ImportError:
         pass
+
+    if json_output:
+        diag_data = {
+            "os": os_name,
+            "python_version": platform.python_version(),
+            "pytorch_installed": has_torch,
+            "pytorch_version": torch_ver,
+            "cuda_available": torch_cuda,
+            "gpu_detected": cuda_detected,
+            "gpu_name": gpu_name if (cuda_detected or torch_cuda) else None,
+            "vram_gb": round(vram_gb, 2),
+            "lan_ip": lan_ip,
+            "webrtc_stun_ready": webrtc_ok,
+        }
+        sys.stdout.write(json.dumps(diag_data, indent=2) + "\n")
+        return
+
+    table = Table(title="Situs Device Diagnostics", title_style="bold magenta", border_style="cyan")
+    table.add_column("Subsystem", style="bold white", width=18)
+    table.add_column("Detected Specification", style="cyan", width=38)
+    table.add_column("Status", justify="center", width=14)
+
+    table.add_row("Operating System", os_name, "[bold green]PASS[/bold green]")
+    table.add_row("Python Runtime", py_ver, "[bold green]PASS[/bold green]")
+    table.add_row("PyTorch", torch_ver, "[bold green]PASS[/bold green]" if has_torch else "[bold red]FAIL[/bold red]")
+
+    if torch_cuda:
+        table.add_row("GPU Hardware", f"{gpu_name} ({vram_str})", "[bold green]CUDA ACCEL[/bold green]")
+    elif cuda_detected:
+        table.add_row("GPU Hardware", f"{gpu_name} ({vram_str})", "[bold yellow]NVIDIA FOUND[/bold yellow]")
+    else:
+        table.add_row("GPU Hardware", "CPU Execution Only", "[bold yellow]CPU ONLY[/bold yellow]")
+
+    table.add_row("Local LAN IP", lan_ip, "[bold green]ONLINE[/bold green]")
     table.add_row(
         "P2P WebRTC / STUN",
         "Direct UDP Hole-Punching Ready" if webrtc_ok else "WebSocket Relay Only",
@@ -330,7 +393,19 @@ def start_coordinator(
     except ValueError as e:
         sys.stderr.write(f"\n[Situs Security Configuration Error] {e}\n\n")
         raise typer.Exit(code=1)
-    uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
+    
+    try:
+        uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
+    except KeyboardInterrupt:
+        if console:
+            console.print("\n[yellow]Coordinator stopped cleanly.[/yellow]")
+    except OSError as e:
+        if console:
+            console.print(f"\n[bold red]Network Port Error:[/bold red] Port {port} cannot be bound ({e}).")
+            console.print(f"[dim]💡 Tip: Port {port} is already in use by another process. Try another port: [bold cyan]situs coordinator --port {port + 1}[/bold cyan][/dim]\n")
+        else:
+            sys.stderr.write(f"\nNetwork Port Error: Port {port} cannot be bound ({e})\n")
+        raise typer.Exit(code=1)
 
 
 @app.command("join")
@@ -374,7 +449,6 @@ def join_cluster(
                     worker_id = f"{base_id}-1"
         except Exception:
             worker_id = f"{base_id}-{os.getpid() % 1000}"
-
 
     print_banner()
     if console:
@@ -446,24 +520,129 @@ def join_cluster(
             console.print("\n[yellow]Worker disconnected cleanly.[/yellow]")
 
 
+def build_status_renderable(data: Dict[str, Any], base_url: str):
+    """Build a rich renderable group containing the status panel and worker table."""
+    status_str = data.get("status", "unknown").upper()
+    status_badge = f"[bold green]● {status_str}[/bold green]" if status_str == "HEALTHY" else f"[bold yellow]▲ {status_str}[/bold yellow]"
+    total_vram_gb = data.get("total_vram_gb", 0.0)
+    used_vram_gb = data.get("used_vram_gb", 0.0)
+    vram_usage_pct = data.get("vram_usage_pct", 0.0)
+
+    overview_lines = [
+        f"[bold cyan]Cluster Status:[/bold cyan]  {data.get('status', 'unknown').upper()}",
+        f"[bold cyan]Active Workers:[/bold cyan]  {data.get('active_workers_count', 0)}",
+        f"[bold cyan]Configured Model:[/bold cyan]{data.get('model', 'None')}",
+        f"[bold cyan]Total Layers:[/bold cyan]    {data.get('total_layers', 0)}",
+        f"[bold cyan]Partitioned:[/bold cyan]     {'YES' if data.get('is_partitioned') else 'NO'}",
+    ]
+    if total_vram_gb > 0:
+        overview_lines.append(f"[bold cyan]Cluster VRAM:[/bold cyan]    {used_vram_gb:.1f} / {total_vram_gb:.1f} GB ({vram_usage_pct:.1f}%)")
+
+    status_panel = Panel(
+        "\n".join(overview_lines),
+        title="Cluster Overview",
+        border_style="cyan"
+    )
+
+    workers = data.get("workers", [])
+    if workers:
+        table = Table(title="Registered GPU Worker Nodes", title_style="bold magenta", border_style="cyan")
+        table.add_column("Worker ID", style="bold white", width=18)
+        table.add_column("Pipeline Stage", style="cyan", width=22)
+        table.add_column("Device", style="yellow", width=12)
+        table.add_column("VRAM Usable", style="green", width=14)
+        table.add_column("Transport", style="blue", width=18)
+        table.add_column("Status", justify="center", width=10)
+
+        for w in workers:
+            layers = w.get("assigned_layers", [])
+            if layers:
+                stage_str = f"Layers [{layers[0]}..{layers[-1]}]"
+                if w.get("is_first_stage"):
+                    stage_str += " (Embed)"
+                if w.get("is_last_stage"):
+                    stage_str += " (Head)"
+            else:
+                stage_str = "Unassigned"
+
+            vram_gb = w.get("vram_available_mb", 0) / 1024.0
+            table.add_row(
+                w.get("worker_id", "unknown"),
+                stage_str,
+                w.get("device", "cpu"),
+                f"{vram_gb:.1f} GB",
+                "WebRTC P2P" if w.get("p2p_direct_enabled") else "Relay WS",
+                "[bold green]ACTIVE[/bold green]"
+            )
+        return Panel(
+            Align.left(table),
+            title=f"Situs Cluster at {base_url}",
+            border_style="dim white",
+            subtitle=f"{len(workers)} Active Nodes",
+        )
+    return status_panel
+
+
 @app.command("status")
 def cluster_status(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
+    json_output: bool = typer.Option(False, "--json", help="Output cluster status as JSON"),
+    watch: bool = typer.Option(False, "--watch", "-w", help="Continuously monitor cluster status in real time"),
+    timeout: float = typer.Option(3.0, "--timeout", help="Coordinator HTTP request timeout in seconds"),
 ):
     """Check the live health, registered GPU nodes, VRAM, and pipeline layout."""
     import httpx
 
     base_url = normalize_http_url(coordinator)
+
+    if watch:
+        print_banner(compact=True)
+        if console:
+            console.print(f"[dim]Monitoring cluster at {base_url} (Press Ctrl+C to exit)...[/dim]\n")
+            try:
+                with Live(console=console, auto_refresh=False, refresh_per_second=2) as live:
+                    while True:
+                        try:
+                            resp = httpx.get(f"{base_url}/status", timeout=timeout)
+                            resp.raise_for_status()
+                            data = resp.json()
+                            renderable = build_status_renderable(data, base_url)
+                            live.update(renderable, refresh=True)
+                        except Exception as e:
+                            live.update(Panel(f"[bold red]Failed to poll Coordinator at {base_url}:[/bold red] {e}", border_style="red"), refresh=True)
+                        time.sleep(1.5)
+            except KeyboardInterrupt:
+                console.print("\n[dim]Cluster monitor stopped cleanly.[/dim]")
+                return
+
     try:
-        resp = httpx.get(f"{base_url}/status", timeout=5.0)
-        resp.raise_for_status()
-        data = resp.json()
+        if console and not json_output and console.is_terminal:
+            with console.status(f"[cyan]Connecting to coordinator at {base_url}...[/cyan]", spinner="dots"):
+                resp = httpx.get(f"{base_url}/status", timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+        else:
+            resp = httpx.get(f"{base_url}/status", timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
     except Exception as e:
+        if json_output:
+            sys.stdout.write(json.dumps({"status": "offline", "error": str(e), "coordinator": base_url}, indent=2) + "\n")
+            raise typer.Exit(code=1)
         if console:
             console.print(f"[bold red]Failed to connect to Coordinator at {base_url}:[/bold red] {e}")
+            console.print(
+                "\n[dim]💡 Troubleshooting:\n"
+                "  1. Start the coordinator on this machine: [bold cyan]situs coordinator[/bold cyan]\n"
+                f"  2. Or specify coordinator host: [bold cyan]situs status --coordinator http://<ip>:8000[/bold cyan][/dim]"
+            )
         else:
             print(f"Error connecting to Coordinator: {e}")
         raise typer.Exit(code=1)
+
+    if json_output:
+        sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        return
 
     print_banner()
     if console:
@@ -519,13 +698,14 @@ def partition_model(
     model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
     layers: Optional[int] = typer.Option(None, "--layers", "-l", help="Total transformer layers (auto-detected if omitted)"),
     admin_key: Optional[str] = typer.Option(None, "--admin-key", envvar="SITUS_ADMIN_KEY", help="Administrator authorization key"),
+    json_output: bool = typer.Option(False, "--json", help="Output partition layout as JSON"),
 ):
     """Trigger automated pipeline layer partitioning across registered workers."""
     import httpx
 
     base_url = normalize_http_url(coordinator)
     layer_info = f"{layers} layers" if layers else "auto-detected layers"
-    if console:
+    if console and not json_output:
         console.print(f"[cyan]Partitioning {model} ({layer_info}) across cluster at {base_url}...[/cyan]")
 
     headers = {}
@@ -541,9 +721,24 @@ def partition_model(
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
+        err_msg = str(e)
+        if isinstance(e, httpx.HTTPStatusError):
+            try:
+                detail = e.response.json().get("detail")
+                if detail:
+                    err_msg = detail
+            except Exception:
+                pass
+        if json_output:
+            sys.stdout.write(json.dumps({"error": err_msg}, indent=2) + "\n")
+            raise typer.Exit(code=1)
         if console:
-            console.print(f"[bold red]Partitioning failed:[/bold red] {e}")
+            console.print(f"[bold red]Partitioning failed:[/bold red] {err_msg}")
         raise typer.Exit(code=1)
+
+    if json_output:
+        sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        return
 
     partitions = data.get("partitions") or data.get("partition_plan", [])
     if console:
@@ -595,10 +790,10 @@ def one_shot_run(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
     model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="SITUS_API_KEY", help="Developer API key"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress status notices and only stream token content"),
 ):
     """Run a single prompt and stream tokens to stdout (for piping in PowerShell scripts)."""
     import httpx
-    import json
 
     base_url = normalize_http_url(coordinator)
     payload = {
@@ -609,6 +804,10 @@ def one_shot_run(
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+
+    if not quiet and sys.stderr.isatty():
+        sys.stderr.write(f"\033[90m[situs: streaming from {model} via {base_url}]\033[0m\n")
+        sys.stderr.flush()
 
     try:
         with httpx.Client(base_url=base_url, headers=headers, timeout=60.0) as client:

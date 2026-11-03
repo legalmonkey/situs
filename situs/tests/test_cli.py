@@ -306,3 +306,56 @@ def test_hardware_detection_and_safe_join():
     assert any("Worker Joined" in t or "Worker" in t for t, _ in captured)
 
 
+def test_cli_version():
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert "situs" in result.output
+    assert "0.1.0" in result.output
+
+
+def test_cli_setup_json():
+    import json
+    result = runner.invoke(app, ["setup", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "os" in data
+    assert "python_version" in data
+    assert "lan_ip" in data
+
+
+def test_cli_status_json_offline():
+    import json
+    result = runner.invoke(app, ["status", "--coordinator", "http://127.0.0.1:9999", "--json"])
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert data["status"] == "offline"
+    assert "error" in data
+
+
+def test_cli_examples_in_help():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "Examples:" in result.output
+    assert "situs setup" in result.output
+    assert "situs coordinator" in result.output
+    assert "situs join" in result.output
+
+
+def test_coordinator_port_collision_handled():
+    from unittest.mock import patch
+    with patch("uvicorn.run", side_effect=OSError(10048, "Port in use")):
+        result = runner.invoke(app, ["coordinator", "--port", "8000"])
+        assert result.exit_code == 1
+        assert "Port 8000 cannot be bound" in result.output
+
+
+def test_partition_no_workers_error():
+    import json
+    result = runner.invoke(app, ["partition", "--coordinator", "http://127.0.0.1:9999", "--json"])
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert "error" in data
+
+
+
+
