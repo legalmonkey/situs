@@ -935,13 +935,13 @@ def start_in_process_worker(
         t = threading.Thread(target=runner, daemon=True)
         t.start()
         
-        # Wait synchronously up to 4.0 seconds for confirmed registration with the coordinator
+        # Wait synchronously up to 6.0 seconds for confirmed registration with the coordinator
         is_registered = False
         if hasattr(daemon, "registered_event"):
-            is_registered = daemon.registered_event.wait(timeout=4.0)
+            is_registered = daemon.registered_event.wait(timeout=6.0)
         else:
             start_wait = time.time()
-            while time.time() - start_wait < 4.0:
+            while time.time() - start_wait < 6.0:
                 if getattr(daemon, "is_registered", False):
                     is_registered = True
                     break
