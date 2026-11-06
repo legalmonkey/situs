@@ -189,7 +189,13 @@ def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
     if smi is not None:
         return (smi[1], smi[3], smi[2])
 
-    return (6 * 1024**3, 0, 6 * 1024**3)
+    cim = query_windows_cim_gpus()
+    if cim is not None:
+        return (cim[1], cim[3], cim[2])
+
+    tot_ram, free_ram, _ = get_system_ram_and_cpu()
+    used_ram = max(0, tot_ram - free_ram)
+    return (tot_ram, used_ram, free_ram)
 
 
 def query_windows_cim_gpus() -> Optional[Tuple[str, int, int, int]]:
@@ -223,7 +229,7 @@ def query_windows_cim_gpus() -> Optional[Tuple[str, int, int, int]]:
                         break
 
             if dedicated:
-                gpu_name = dedicated.get("Name", "NVIDIA Dedicated GPU").strip()
+                gpu_name = dedicated.get("Name", "Dedicated GPU").strip()
                 n_up = gpu_name.upper()
                 # Determine accurate VRAM based on model or AdapterRAM
                 est_gb = 6.0

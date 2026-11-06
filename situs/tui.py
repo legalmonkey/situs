@@ -188,7 +188,7 @@ def make_progress_bar(percent: float, width: int = 22) -> str:
 DEFAULT_MODEL = "gemma3:4b"
 
 # Curated 6GB to 16GB models - The optimal sweet spot for distributed multi-node inference.
-# Single 6GB GPUs (like RTX 3050) cannot fit these models alone, but pooling 2+ nodes fits them with high performance.
+# Individual consumer GPUs cannot fit these models alone, but pooling 2+ nodes fits them with high performance.
 DISTRIBUTED_MODELS_6GB_10GB = [
     {
         "id": "llama-3.1:8b-instruct-q8_0",
@@ -232,13 +232,13 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "gemma3:4b",
-        "name": "Google Gemma 3 4B (Installed · Local CUDA GPU)",
+        "name": "Google Gemma 3 4B",
         "vram_gb": 3.4,
         "params": "4.0B",
         "layers": 28,
         "context": "8k",
-        "recommended_split": "1-2x GPUs (Installed · Ready on RTX 3050 VRAM)",
-        "desc": "Google Gemma 3 - Verified and pre-loaded in local NVIDIA GPU VRAM.",
+        "recommended_split": "1-2x GPUs (1.7 GB / GPU)",
+        "desc": "Google Gemma 3 dense lightweight instruction-tuned model.",
     },
     {
         "id": "mistral:7b-instruct-v0.3-q8_0",
@@ -399,7 +399,7 @@ class OpenCodeSlashCompleter(Completer):
                 "/join 127.0.0.1:8000 worker-1 cuda:0",
                 start_position=-len(text),
                 display="/join 127.0.0.1:8000 worker-1 cuda:0",
-                display_meta="Join first worker on RTX GPU"
+                display_meta="Join first worker on CUDA GPU"
             )
             return
 
@@ -603,16 +603,12 @@ def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected 
     for w in workers:
         w_id = w.get("id") or w.get("worker_id", "unknown")
         gpu_desc = w.get("gpu") or w.get("gpu_name") or w.get("device", "GPU")
-        # Sanitize legacy CPU processor strings if a worker was registered with CPU text
+        # Sanitize verbose CPU processor strings if a worker was registered with raw processor text
         if any(bad in gpu_desc for bad in ("Family", "Stepping", "Intel64", "AMD64")):
-            if "AMD" in gpu_desc or "worker-2" in w_id:
-                gpu_desc = "NVIDIA GeForce RTX 4050 Laptop GPU"
-                if "free_gb" in w and float(w["free_gb"]) < 3.0:
-                    w["free_gb"] = 6.0
-            else:
-                gpu_desc = "NVIDIA GeForce RTX 3050 6GB Laptop GPU"
-                if "free_gb" in w and float(w["free_gb"]) < 3.0:
-                    w["free_gb"] = 6.0
+            clean_cpu = gpu_desc.split(",")[0].strip() if "," in gpu_desc else gpu_desc.strip()
+            if len(clean_cpu) > 34:
+                clean_cpu = clean_cpu[:32] + ".."
+            gpu_desc = clean_cpu or "CPU Host"
 
         total_gb = float(w.get("total_gb", 6.0))
         used_gb = float(w.get("used_gb", 0.5))
@@ -678,7 +674,7 @@ def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
     else:
         for w in workers:
             w_id = w.get("id") or w.get("worker_id", "node")
-            gpu_desc = w.get("gpu") or w.get("gpu_name") or "NVIDIA Dedicated GPU"
+            gpu_desc = w.get("gpu") or w.get("gpu_name") or w.get("device") or "Dedicated GPU"
             total_gb = float(w.get("total_gb", 6.0))
             used_gb = float(w.get("used_gb", 0.5))
             pct = float(w.get("usage_pct", (used_gb / max(0.1, total_gb)) * 100))
@@ -1137,7 +1133,7 @@ def execute_slash_command(
         model_guide = Panel(
             "[bold white]Curated 6GB - 10GB Distributed Models[/bold white]\n\n"
             "[bold cyan]The Sweet Spot for Multi-Node Consumer Laptops:[/bold cyan]\n"
-            "Models in the 6GB–10GB range cannot fit standalone in 6GB VRAM GPUs (like RTX 3050), but run with blazing "
+            "Models in the 6GB–10GB range cannot fit standalone in single 6GB VRAM GPUs, but run with blazing "
             "throughput when pooled across 2+ laptops (or 1 GPU + 1 CPU node) using pipeline parallelism.\n\n"
             "[bold cyan]Selection Commands:[/bold cyan]\n"
             "  [bold yellow]/models[/bold yellow]             View full table of curated models with VRAM, parameter & split specs\n"
@@ -1145,10 +1141,11 @@ def execute_slash_command(
             "  [bold yellow]/model 2[/bold yellow]            Select [bold white]Qwen 2.5 7B Instruct[/bold white] (Q8_0, 8.1 GB VRAM)\n"
             "  [bold yellow]/model 3[/bold yellow]            Select [bold white]DeepSeek R1 Distill 7B[/bold white] (Q8_0, 8.2 GB VRAM)\n"
             "  [bold yellow]/model 4[/bold yellow]            Select [bold white]Gemma 2 9B Instruct[/bold white] (Q6_K, 7.8 GB VRAM)\n"
-            "  [bold yellow]/model 5[/bold yellow]            Select [bold white]Mistral 7B Instruct v0.3[/bold white] (Q8_0, 7.7 GB VRAM)\n"
-            "  [bold yellow]/model 6[/bold yellow]            Select [bold white]Qwen 2.5 Coder 7B[/bold white] (Q8_0, 8.1 GB VRAM)\n"
-            "  [bold yellow]/model 7[/bold yellow]            Select [bold white]StarCoder 2 7B[/bold white] (Q8_0, 7.6 GB VRAM)\n"
-            "  [bold yellow]/model 8[/bold yellow]            Select [bold white]Llama 3.2 3B Instruct[/bold white] (Q8_0, 3.8 GB VRAM)\n"
+            "  [bold yellow]/model 5[/bold yellow]            Select [bold white]Google Gemma 3 4B[/bold white] (3.4 GB VRAM)\n"
+            "  [bold yellow]/model 6[/bold yellow]            Select [bold white]Mistral 7B Instruct v0.3[/bold white] (Q8_0, 7.7 GB VRAM)\n"
+            "  [bold yellow]/model 7[/bold yellow]            Select [bold white]Qwen 2.5 Coder 7B[/bold white] (Q8_0, 8.1 GB VRAM)\n"
+            "  [bold yellow]/model 8[/bold yellow]            Select [bold white]StarCoder 2 7B[/bold white] (Q8_0, 7.6 GB VRAM)\n"
+            "  [bold yellow]/model 9[/bold yellow]            Select [bold white]Llama 3.2 3B Instruct[/bold white] (Q8_0, 3.8 GB VRAM)\n"
             "  [bold yellow]/model <name>[/bold yellow]       Select any custom model by ID or name",
             title="Curated 6GB-10GB Models",
             border_style="magenta",
@@ -1437,7 +1434,7 @@ def execute_slash_command(
             "Examples:\n"
             "  [bold yellow]/model 1[/bold yellow]  ->  Llama 3.1 8B Instruct (Q8_0, 8.5 GB VRAM)\n"
             "  [bold yellow]/model 2[/bold yellow]  ->  Qwen 2.5 7B Instruct (Q8_0, 8.1 GB VRAM)\n"
-            "  [bold yellow]/model 5[/bold yellow]  ->  Google Gemma 3 4B (Installed · Local CUDA GPU)\n"
+            "  [bold yellow]/model 5[/bold yellow]  ->  Google Gemma 3 4B (3.4 GB VRAM)\n"
             "  [bold yellow]/model 10[/bold yellow] ->  Qwen 2.5 14B Instruct (15.2 GB VRAM · 15GB model)\n"
             "  [bold yellow]/model 11[/bold yellow] ->  DeepSeek R1 Distill 14B (14.9 GB VRAM · 15GB model)",
             title="Model Selection",
@@ -1550,8 +1547,8 @@ def execute_slash_command(
                                                         app_instance[0].invalidate()
                                                 elif p_type == "model_ready":
                                                     session_state["is_pulling"] = False
-                                                    r_stage = p_chunk.get("stage", "Model Ready on GPU VRAM (100% CUDA)")
-                                                    r_text = f"[✓ Online Model Download Complete · 100% CUDA GPU VRAM Allocated]\n{r_stage}"
+                                                    r_stage = p_chunk.get("stage", "Model Ready in Memory")
+                                                    r_text = f"[✓ Online Model Download Complete]\n{r_stage}"
                                                     if history_entries and history_entries[-1][0] == "loading":
                                                         history_entries[-1] = ("system", r_text, "Model Ready")
                                                     else:
@@ -1712,7 +1709,7 @@ def run_opencode_tui(
         "speed": 0.0,
         "workers_count": 0,
         "coord_status": "offline",
-        "vram_desc": f"{total_gb:.1f} GB ({free_gb:.1f} GB free)" if dev_type == "cuda" else "16.0 GB (CPU)",
+        "vram_desc": f"{total_gb:.1f} GB ({free_gb:.1f} GB free)" if dev_type == "cuda" else f"{total_gb:.1f} GB RAM ({free_gb:.1f} GB free)",
         "gpu_name": gpu_name,
         "is_generating": False,
         "is_coordinator": is_init_coord,
@@ -1829,8 +1826,8 @@ def run_opencode_tui(
                                                     app_instance[0].invalidate()
                                             elif p_type == "model_ready":
                                                 session_state["is_pulling"] = False
-                                                r_stage = p_chunk.get("stage", "Model Ready on GPU VRAM (100% CUDA)")
-                                                r_text = f"[✓ Online Model Download Complete · 100% CUDA GPU VRAM Allocated]\n{r_stage}"
+                                                r_stage = p_chunk.get("stage", "Model Ready in Memory")
+                                                r_text = f"[✓ Online Model Download Complete]\n{r_stage}"
                                                 if history_entries and history_entries[-1][0] == "loading":
                                                     history_entries[-1] = ("system", r_text, "Model Ready")
                                                 else:
@@ -2186,12 +2183,12 @@ def run_opencode_tui(
         elif c_stat in ("healthy", "online", "no_workers"):
             frags.append(("bold #f59e0b", "● Coordinator Ready\n"))
             frags.append(("#94a3b8", "Waiting for /join\n"))
-            vram_str = session_state.get("vram_desc", "8.0 GB")
+            vram_str = session_state.get("vram_desc", "0.0 GB")
             frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         else:
             frags.append(("#64748b", "○ Cluster Offline\n"))
             frags.append(("#94a3b8", "Start with /coordinator\n"))
-            vram_str = session_state.get("vram_desc", "8.0 GB")
+            vram_str = session_state.get("vram_desc", "0.0 GB")
             frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
         frags.append(("#94a3b8", f"{trans_name}\n"))
@@ -2439,8 +2436,8 @@ def run_opencode_tui(
 
                                     elif c_type == "model_ready":
                                         session_state["is_pulling"] = False
-                                        ready_stage = chunk.get("stage", "Model Ready on GPU VRAM (100% CUDA)")
-                                        ready_text = f"[✓ Online Model Download Complete · 100% CUDA GPU VRAM Allocated]\n{ready_stage}"
+                                        ready_stage = chunk.get("stage", "Model Ready in Memory")
+                                        ready_text = f"[✓ Online Model Download Complete]\n{ready_stage}"
                                         if history_entries and history_entries[-1][0] == "loading":
                                             history_entries[-1] = ("system", ready_text, "Model Ready")
                                         else:

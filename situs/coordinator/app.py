@@ -383,7 +383,10 @@ async def trigger_pull(request: Request, model_name: str = "gemma3:4b"):
         yield ": connected\n\n"
         async for progress in stream_pull_model(canonical):
             yield f"data: {json.dumps(progress)}\n\n"
-        yield f"data: {json.dumps({'type': 'model_ready', 'model': canonical, 'stage': 'Model Ready: Loaded into GPU VRAM (100% CUDA)'})}\n\n"
+        from situs.hardware import detect_hardware
+        hw = detect_hardware()
+        mem_loc = "GPU VRAM" if hw.gpu_available or hw.device_type == "cuda" else "System RAM"
+        yield f"data: {json.dumps({'type': 'model_ready', 'model': canonical, 'stage': f'Model Ready: Loaded into {mem_loc}'})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(pull_events(), media_type="text/event-stream")
