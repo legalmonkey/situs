@@ -19,6 +19,61 @@ def is_valid_worker_id(worker_id: str) -> bool:
     return bool(WORKER_ID_REGEX.match(worker_id))
 
 
+def sanitize_coordinator_address(raw: str, default_port: int = 8000) -> str:
+    """Sanitizes user-entered coordinator address, handling accidental spaces in IP/ports and incomplete octets.
+    
+    Examples:
+        '192. 168 . 29.189:8000' -> '192.168.29.189:8000'
+        '192.168.29.189' -> '192.168.29.189:8000'
+        'http : // 192. 168 . 29. 189 : 8000' -> 'http://192.168.29.189:8000'
+        'ws : // 127.0.0.1 : 8000 / ws / worker' -> 'ws://127.0.0.1:8000/ws/worker'
+    """
+    if not raw or not isinstance(raw, str):
+        return f"127.0.0.1:{default_port}"
+    
+    cleaned = raw.strip()
+    # Collapse whitespace adjacent to punctuation commonly found in URLs and IPs
+    cleaned = re.sub(r'\s*([.:/])\s*', r'\1', cleaned)
+
+    # Check for scheme
+    scheme = ""
+    host_part = cleaned
+    for s in ("ws://", "wss://", "http://", "https://"):
+        if cleaned.lower().startswith(s):
+            scheme = s
+            host_part = cleaned[len(s):]
+            break
+
+    # Strip any trailing path like /ws/worker to inspect host:port
+    path_part = ""
+    if "/" in host_part:
+        parts = host_part.split("/", 1)
+        host_port = parts[0]
+        path_part = "/" + parts[1]
+    else:
+        host_port = host_part
+
+    # Detect incomplete IPv4 addresses (e.g. "192.168" or "192.168.29")
+    base_host = host_port.split(":")[0] if ":" in host_port else host_port
+    if re.match(r'^\d+(\.\d+)*$', base_host):
+        octets = base_host.split(".")
+        if len(octets) < 4:
+            raise ValueError(
+                f"Incomplete IPv4 address '{base_host}'. An IPv4 address must contain 4 octets (e.g. 192.168.29.189:{default_port})."
+            )
+
+    # If no port is specified:
+    if ":" not in host_port and not path_part.startswith(":"):
+        is_ip_or_local = base_host.lower() in ("localhost", "127.0.0.1", "0.0.0.0") or (
+            re.match(r'^\d+(\.\d+)*$', base_host) is not None
+        )
+        if is_ip_or_local or not scheme:
+            host_port = f"{host_port}:{default_port}"
+
+    return f"{scheme}{host_port}{path_part}"
+
+
+
 INSECURE_SECRETS = {
     "situs-cluster-secret",
     "admin-secret",

@@ -357,5 +357,59 @@ def test_partition_no_workers_error():
     assert "error" in data
 
 
+def test_sanitize_coordinator_address_spaced_ip():
+    from situs.config import sanitize_coordinator_address
+
+    assert sanitize_coordinator_address("192. 168 . 29.189:8000") == "192.168.29.189:8000"
+    assert sanitize_coordinator_address("192 . 168 . 29 . 189 : 8000") == "192.168.29.189:8000"
+    assert sanitize_coordinator_address("192.168.29.189") == "192.168.29.189:8000"
+    assert sanitize_coordinator_address("http : // 192. 168 . 29 . 189 : 8000") == "http://192.168.29.189:8000"
+    assert sanitize_coordinator_address("ws : // 127.0.0.1 : 8000 / ws / worker") == "ws://127.0.0.1:8000/ws/worker"
+
+    with pytest.raises(ValueError, match="Incomplete IPv4 address"):
+        sanitize_coordinator_address("192.168")
+
+    with pytest.raises(ValueError, match="Incomplete IPv4 address"):
+        sanitize_coordinator_address("192.168.29")
+
+
+def test_parse_join_command_spaced_ip():
+    from situs.tui import parse_join_command
+
+    addr, w_id, dev = parse_join_command("/join 192. 168 . 29.189:8000")
+    assert addr == "192.168.29.189:8000"
+    assert w_id is None
+    assert dev is None
+
+    addr2, w_id2, dev2 = parse_join_command("/join 192. 168 . 29.189:8000 worker-2 cuda:0")
+    assert addr2 == "192.168.29.189:8000"
+    assert w_id2 == "worker-2"
+    assert dev2 == "cuda:0"
+
+    addr3, w_id3, dev3 = parse_join_command("/join 192.168.29.189:8000 --id node-1 --device cpu")
+    assert addr3 == "192.168.29.189:8000"
+    assert w_id3 == "node-1"
+    assert dev3 == "cpu"
+
+
+def test_cli_cuda_command():
+    result = runner.invoke(app, ["cuda"])
+    assert result.exit_code == 0
+    assert "CUDA Diagnostics" in result.output
+
+
+def test_tui_cuda_command():
+    from situs.tui import execute_slash_command
+    messages = []
+    session_state = {}
+    captured = []
+    def log_capture(title, renderable):
+        captured.append((title, str(renderable)))
+
+    assert execute_slash_command("/cuda", "http://localhost:8000", "gemma3:4b", messages, session_state, log_output_fn=log_capture) is True
+    assert any("CUDA" in t for t, _ in captured)
+
+
+
 
 

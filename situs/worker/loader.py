@@ -768,7 +768,12 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             self.lm_head = None
 
         if self.device != "cpu":
-            self.to(self.device)
+            try:
+                self.to(self.device)
+            except Exception as e:
+                logger.warning(f"Could not load stage model onto {self.device} ({e}). Falling back safely to CPU.")
+                self.device = "cpu"
+                self.to("cpu")
 
     def load_embedding_weights(self, weights: Any):
         """Loads verified pre-trained token embedding weights into the first stage."""

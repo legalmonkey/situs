@@ -49,6 +49,9 @@ class WorkerDaemon:
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.p2p_node: Optional[P2PDataChannelNode] = None
         self.is_running = True
+        self.is_connected = False
+        self.is_registered = False
+        self.last_error: Optional[str] = None
         self._cached_hw = None
 
     async def send_signaling_frame(self, msg_dict: dict):
@@ -214,6 +217,7 @@ class WorkerDaemon:
 
         async for websocket in websockets.connect(ws_url, **connect_kwargs):
             self.ws = websocket
+            self.is_connected = True
             try:
                 # 1. Register with Coordinator
                 reg = WorkerRegister(
@@ -242,6 +246,7 @@ class WorkerDaemon:
                     frame = ProtocolFrame.model_validate_json(message)
 
                     if frame.type == MessageType.WORKER_REGISTERED:
+                        self.is_registered = True
                         logger.info(f"Coordinator confirmed registration for worker {self.worker_id}")
 
                     elif frame.type == MessageType.ASSIGN_LAYERS:
@@ -345,6 +350,8 @@ class WorkerDaemon:
                                 self.engine.abort_inference(req_id)
 
             except websockets.ConnectionClosed as e:
+                self.is_connected = False
+                self.last_error = getattr(e, 'reason', str(e))
                 if getattr(e, "code", None) == 1008:
                     logger.error(f"Registration rejected by coordinator policy (1008): {getattr(e, 'reason', e)}")
                     await asyncio.sleep(5.0)
@@ -352,9 +359,12 @@ class WorkerDaemon:
                     logger.warning(f"Connection closed ({e}). Reconnecting in 3 seconds...")
                     await asyncio.sleep(3.0)
             except Exception as e:
+                self.is_connected = False
+                self.last_error = str(e)
                 logger.error(f"Worker runtime exception: {e}", exc_info=True)
                 await asyncio.sleep(3.0)
             finally:
+                self.is_connected = False
                 if 'hb_task' in locals() and not hb_task.done():
                     hb_task.cancel()
 

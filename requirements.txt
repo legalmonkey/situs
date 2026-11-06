@@ -1,3 +1,5 @@
+# PyTorch CUDA wheel repository for hardware acceleration on NVIDIA GPUs
+--extra-index-url https://download.pytorch.org/whl/cu121
 torch
 transformers
 accelerate

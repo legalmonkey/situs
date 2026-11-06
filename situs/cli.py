@@ -147,7 +147,8 @@ def get_local_ip() -> str:
 
 def normalize_ws_url(url: str) -> str:
     """Normalize a user-provided coordinator address into a valid WebSocket URL."""
-    url = url.strip()
+    from situs.config import sanitize_coordinator_address
+    url = sanitize_coordinator_address(url)
     if not url.startswith("ws://") and not url.startswith("wss://"):
         if url.startswith("http://"):
             url = "ws://" + url[7:]
@@ -163,7 +164,8 @@ def normalize_ws_url(url: str) -> str:
 
 def normalize_http_url(url: str) -> str:
     """Normalize a user-provided coordinator address into a valid HTTP URL."""
-    url = url.strip()
+    from situs.config import sanitize_coordinator_address
+    url = sanitize_coordinator_address(url)
     if url.startswith("ws://"):
         url = "http://" + url[5:]
     elif url.startswith("wss://"):
@@ -338,6 +340,61 @@ def setup(
         ))
 
 
+@app.command("cuda")
+def cuda_check():
+    """Diagnose NVIDIA GPU hardware and PyTorch CUDA runtime acceleration."""
+    print_banner()
+    from situs.hardware import detect_hardware
+    hw = detect_hardware(requested_device="auto", bypass_cache=True)
+    
+    try:
+        import torch
+        torch_ver = torch.__version__
+        torch_cuda = torch.cuda.is_available()
+        cuda_arch = torch.version.cuda or "N/A"
+    except ImportError:
+        torch_ver = "Not installed"
+        torch_cuda = False
+        cuda_arch = "N/A"
+
+    if hw.gpu_available:
+        status_panel = Panel(
+            f"[bold green]✓ PyTorch CUDA GPU Acceleration Active[/bold green]\n\n"
+            f"[bold cyan]• Device:[/bold cyan]          {hw.device_name} ({hw.total_memory_gb:.1f} GB VRAM)\n"
+            f"[bold cyan]• Compute Target:[/bold cyan]  {hw.device.upper()}\n"
+            f"[bold cyan]• PyTorch Version:[/bold cyan] {torch_ver} (CUDA {cuda_arch})\n"
+            f"[bold cyan]• Status:[/bold cyan]           CUDA acceleration fully functional. Ready for zero-host-RAM GPU pooling!",
+            title="CUDA Diagnostics",
+            border_style="green",
+        )
+    elif hw.physical_gpu_detected:
+        status_panel = Panel(
+            f"[bold yellow]⚠️  Physical GPU Detected, but PyTorch CUDA Runtime is Missing[/bold yellow]\n\n"
+            f"[bold cyan]• Physical GPU:[/bold cyan]    {hw.physical_gpu_name} ({hw.total_memory_gb:.1f} GB VRAM)\n"
+            f"[bold cyan]• PyTorch Version:[/bold cyan] {torch_ver}\n"
+            f"[bold cyan]• CUDA Working:[/bold cyan]    False (PyTorch was installed with CPU-only binaries)\n\n"
+            f"[bold white]To enable full CUDA acceleration on this laptop, run in PowerShell:[/bold white]\n\n"
+            f"  [bold green]pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall[/bold green]\n\n"
+            f"[dim]After running the command above, re-run 'situs cuda' or 'situs join'.[/dim]",
+            title="CUDA Diagnostics (Action Required)",
+            border_style="yellow",
+        )
+    else:
+        status_panel = Panel(
+            f"[bold cyan]! No Dedicated CUDA GPU Detected[/bold cyan]\n\n"
+            f"[bold cyan]• Host Device:[/bold cyan]     {hw.device_name} ({hw.total_memory_gb:.1f} GB RAM)\n"
+            f"[bold cyan]• PyTorch Version:[/bold cyan] {torch_ver}\n"
+            f"[bold cyan]• Mode:[/bold cyan]            Clean CPU Compute",
+            title="CUDA Diagnostics",
+            border_style="cyan",
+        )
+
+    if console:
+        console.print(status_panel)
+    else:
+        print(f"Device: {hw.device_name}, GPU Available: {hw.gpu_available}")
+
+
 @app.command("coordinator")
 def start_coordinator(
     host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host address to bind to"),
@@ -484,6 +541,19 @@ def join_cluster(
             border_style=border_col,
         )
         console.print(info_panel)
+
+        if hw.physical_gpu_detected and not hw.cuda_runtime_working:
+            cuda_hint = Panel(
+                f"[bold yellow]⚠️  Physical GPU Detected ({hw.physical_gpu_name}), but PyTorch is CPU-Only[/bold yellow]\n\n"
+                f"[white]PyTorch is installed without CUDA acceleration binaries on this system.\n"
+                f"To enable 100% CUDA GPU Acceleration, run this command in PowerShell:[/white]\n\n"
+                f"  [bold green]pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall[/bold green]\n\n"
+                f"[dim]Proceeding in CPU compute mode for this session...[/dim]",
+                title="[bold yellow]CUDA Acceleration Setup[/bold yellow]",
+                border_style="yellow",
+            )
+            console.print(cuda_hint)
+
         console.print("\n[white]Outbound duplex connection established. Waiting for pipeline partition...[/white]\n")
 
     try:

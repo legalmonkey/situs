@@ -7,6 +7,7 @@ and fast streaming token generation metrics.
 
 import sys
 import os
+import re
 import time
 import json
 import shutil
@@ -361,6 +362,7 @@ class OpenCodeSlashCompleter(Completer):
         ("/partition", "Rebalance & partition model layers across GPUs"),
         ("/nodes", "Inspect connected worker nodes & WebRTC P2P latency"),
         ("/doctor", "Run comprehensive hardware & STUN diagnostics"),
+        ("/cuda", "Diagnose GPU & show PyTorch CUDA acceleration install command"),
         ("/models", "List curated 6GB-16GB models for distributed pooling"),
         ("/model", "Select or switch models (e.g. /model 1, /model 2, /model <name>)"),
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
@@ -701,6 +703,70 @@ def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
     return table
 
 
+def parse_join_command(cmd_str: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Parses a /join or /connect command, safely handling spaced IP addresses like
+    '/join 192. 168 . 29.189:8000' and extracting (target_addr, worker_id, device).
+    """
+    from situs.config import sanitize_coordinator_address, is_valid_worker_id
+
+    # Strip command prefix
+    remainder = cmd_str.strip()
+    for prefix in ("/join", "join", "/connect", "connect"):
+        if remainder.startswith(prefix):
+            remainder = remainder[len(prefix):].strip()
+            break
+
+    if not remainder:
+        return "127.0.0.1:8000", None, None
+
+    # Collapse any accidental whitespace surrounding punctuation commonly found in URLs or IPs
+    remainder = re.sub(r'\s*([.:/])\s*', r'\1', remainder)
+
+    tokens = remainder.split()
+    target_addr = "127.0.0.1:8000"
+    custom_worker_id = None
+    custom_device = None
+
+    pos_args = []
+    i = 0
+    while i < len(tokens):
+        arg = tokens[i]
+        if arg in ("--worker-id", "--id", "-w", "-i") and i + 1 < len(tokens):
+            custom_worker_id = tokens[i + 1]
+            i += 2
+        elif arg in ("--device", "-d") and i + 1 < len(tokens):
+            custom_device = tokens[i + 1]
+            i += 2
+        elif arg.startswith("--worker-id=") or arg.startswith("--id="):
+            custom_worker_id = arg.split("=", 1)[1]
+            i += 1
+        elif arg.startswith("--device="):
+            custom_device = arg.split("=", 1)[1]
+            i += 1
+        else:
+            pos_args.append(arg)
+            i += 1
+
+    if len(pos_args) >= 1:
+        target_addr = pos_args[0]
+    if len(pos_args) >= 2 and not custom_worker_id:
+        custom_worker_id = pos_args[1]
+    if len(pos_args) >= 3 and not custom_device:
+        custom_device = pos_args[2]
+
+    # Validate worker ID if explicitly supplied
+    if custom_worker_id and not is_valid_worker_id(custom_worker_id):
+        raise ValueError(
+            f"Invalid worker_id '{custom_worker_id}': Worker ID must contain 1-128 alphanumeric characters, dots, or hyphens."
+        )
+
+    # Sanitize and validate coordinator address
+    target_addr = sanitize_coordinator_address(target_addr)
+
+    return target_addr, custom_worker_id, custom_device
+
+
 def start_in_process_worker(
     coordinator_addr: str = "127.0.0.1:8000",
     model: str = DEFAULT_MODEL,
@@ -710,7 +776,16 @@ def start_in_process_worker(
     """Starts a Worker Daemon in a background daemon thread connecting to the cluster."""
     global _bg_workers
     try:
-        addr = coordinator_addr.strip()
+        from situs.config import sanitize_coordinator_address, WorkerConfig
+        from situs.worker.client import WorkerDaemon
+        from situs.hardware import detect_hardware
+
+        try:
+            sanitized = sanitize_coordinator_address(coordinator_addr)
+        except ValueError as ve:
+            return False, str(ve)
+
+        addr = sanitized
         if not addr.startswith("ws://") and not addr.startswith("wss://"):
             if addr.startswith("http://"):
                 addr = "ws://" + addr[7:]
@@ -721,7 +796,10 @@ def start_in_process_worker(
         if not addr.endswith("/ws/worker"):
             addr = addr.rstrip("/") + "/ws/worker"
 
-        from situs.hardware import detect_hardware
+        parsed_http = addr.replace("ws://", "http://").replace("wss://", "https://")
+        if "/ws/worker" in parsed_http:
+            parsed_http = parsed_http.replace("/ws/worker", "")
+
         hw = detect_hardware(requested_device=device or "auto")
         dev = hw.device
         gpu_name = hw.device_name
@@ -729,31 +807,30 @@ def start_in_process_worker(
         free_b = hw.free_memory_bytes
         dev_type = hw.device_type
 
+        # Verify reachability of coordinator HTTP endpoint before spinning up daemon
+        existing_workers = []
+        try:
+            with httpx.Client(timeout=1.0) as probe_c:
+                st = probe_c.get(f"{parsed_http}/status")
+                if st.status_code == 200:
+                    existing_workers = [w.get("id") or w.get("worker_id") for w in st.json().get("workers", [])]
+        except httpx.ConnectError:
+            return False, f"Cannot connect to Coordinator at {parsed_http} (Connection refused). Is the coordinator running? Start it with /coordinator."
+        except httpx.ConnectTimeout:
+            return False, f"Connection to Coordinator at {parsed_http} timed out. Ensure IP address is correct and port 8000 is open in firewall."
+        except Exception:
+            pass
+
         if not worker_id:
             base_id = f"worker-{socket.gethostname().lower()}"
-            try:
-                parsed_http = addr.replace("ws://", "http://").replace("wss://", "https://")
-                if "/ws/worker" in parsed_http:
-                    parsed_http = parsed_http.replace("/ws/worker", "")
-                with httpx.Client(timeout=0.3) as probe_c:
-                    st = probe_c.get(f"{parsed_http}/status")
-                    if st.status_code == 200:
-                        existing = [w.get("id") or w.get("worker_id") for w in st.json().get("workers", [])]
-                        idx = 1
-                        cand = f"{base_id}-{idx}"
-                        while cand in existing or (idx == 1 and base_id in existing):
-                            idx += 1
-                            cand = f"{base_id}-{idx}"
-                        w_id = cand
-                    else:
-                        w_id = f"{base_id}-{len(_bg_workers) + 1}"
-            except Exception:
-                w_id = f"{base_id}-{len(_bg_workers) + 1}"
+            idx = 1
+            cand = f"{base_id}-{idx}"
+            while cand in existing_workers or (idx == 1 and base_id in existing_workers):
+                idx += 1
+                cand = f"{base_id}-{idx}"
+            w_id = cand
         else:
             w_id = worker_id
-
-        from situs.config import WorkerConfig
-        from situs.worker.client import WorkerDaemon
 
         cfg = WorkerConfig(
             coordinator_url=addr,
@@ -775,12 +852,19 @@ def start_in_process_worker(
         t = threading.Thread(target=runner, daemon=True)
         t.start()
         
-        # Fast non-blocking check: wait up to 0.25s max with 10ms intervals
+        # Wait up to 1.5 seconds with fast 10ms intervals for connection & registration
         start_wait = time.time()
-        while time.time() - start_wait < 0.25:
-            if daemon.ws is not None:
+        connected = False
+        while time.time() - start_wait < 1.5:
+            if getattr(daemon, "is_registered", False) or daemon.ws is not None:
+                connected = True
                 break
+            if getattr(daemon, "last_error", None):
+                return False, f"Worker connection failed: {daemon.last_error}"
             time.sleep(0.01)
+
+        if not connected:
+            return False, f"WebSocket connection to {addr} timed out. Make sure the coordinator is online."
 
         return True, f"Worker {w_id} connected to {addr}"
     except Exception as e:
@@ -1096,37 +1180,20 @@ def execute_slash_command(
         return True
 
     elif root_cmd in ("/join", "join", "/connect", "connect"):
-        target_addr = "127.0.0.1:8000"
-        custom_worker_id = None
-        custom_device = None
-
-        raw_args = parts[1:]
-        i = 0
-        pos_args = []
-        while i < len(raw_args):
-            arg = raw_args[i]
-            if arg in ("--worker-id", "--id", "-w", "-i") and i + 1 < len(raw_args):
-                custom_worker_id = raw_args[i + 1]
-                i += 2
-            elif arg in ("--device", "-d") and i + 1 < len(raw_args):
-                custom_device = raw_args[i + 1]
-                i += 2
-            elif arg.startswith("--worker-id=") or arg.startswith("--id="):
-                custom_worker_id = arg.split("=", 1)[1]
-                i += 1
-            elif arg.startswith("--device="):
-                custom_device = arg.split("=", 1)[1]
-                i += 1
-            else:
-                pos_args.append(arg)
-                i += 1
-
-        if len(pos_args) >= 1:
-            target_addr = pos_args[0]
-        if len(pos_args) >= 2 and not custom_worker_id:
-            custom_worker_id = pos_args[1]
-        if len(pos_args) >= 3 and not custom_device:
-            custom_device = pos_args[2]
+        try:
+            target_addr, custom_worker_id, custom_device = parse_join_command(cmd)
+        except ValueError as ve:
+            err_panel = Panel(
+                f"[bold red]Invalid /join Arguments:[/bold red] {ve}\n\n"
+                f"[bold white]Usage Examples:[/bold white]\n"
+                f"  [cyan]/join 127.0.0.1:8000[/cyan]                     (Connect local node)\n"
+                f"  [cyan]/join 192.168.29.189:8000[/cyan]                (Connect to remote coordinator)\n"
+                f"  [cyan]/join 192.168.29.189:8000 worker-2 cuda:0[/cyan] (Custom ID & device)",
+                title="Command Syntax Error",
+                border_style="red"
+            )
+            emit(err_panel, "Command Syntax Error")
+            return True
 
         current_model = session_state.get("model", model)
         ok, msg = start_in_process_worker(
@@ -1180,6 +1247,7 @@ def execute_slash_command(
         if m.get("model"):
             session_state["model"] = m.get("model")
 
+        cuda_notice = ""
         if hw.gpu_available:
             mode_badge = f"[bold green]CUDA GPU Acceleration ({actual_dev.upper()})[/bold green]"
             detect_title = f"[bold green]✓ GPU Detected — Proceeding with CUDA Acceleration[/bold green]"
@@ -1188,6 +1256,12 @@ def execute_slash_command(
             mode_badge = f"[bold yellow]CPU Execution (Physical GPU: {hw.physical_gpu_name})[/bold yellow]"
             detect_title = f"[bold yellow]! Physical GPU Detected (PyTorch CUDA Missing) — Proceeding on CPU[/bold yellow]"
             border_col = "yellow"
+            cuda_notice = (
+                f"\n\n[bold yellow]⚠️  PHYSICAL GPU FOUND, BUT PYTORCH IS CPU-ONLY[/bold yellow]\n"
+                f"[white]PyTorch is installed without CUDA binaries. To run with 100% GPU acceleration:[/white]\n"
+                f"  [bold green]pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall[/bold green]\n"
+                f"[dim]Run [bold cyan]/cuda[/bold cyan] anytime to test acceleration status.[/dim]"
+            )
         else:
             mode_badge = f"[bold cyan]CPU Compute Mode ({actual_dev.upper()})[/bold cyan]"
             detect_title = f"[bold cyan]! No CUDA GPU Detected — Proceeding with CPU Compute[/bold cyan]"
@@ -1203,12 +1277,60 @@ def execute_slash_command(
             f"[bold cyan]• Diagnostics:[/bold cyan]     {hw.status_message}\n"
             f"[bold cyan]• Transport:[/bold cyan]       WebRTC P2P Direct + Relay Fallback\n"
             f"[bold cyan]• Speculative:[/bold cyan]     Enabled (Prompt-Lookup)\n"
-            f"[bold cyan]• Compression:[/bold cyan]     INT8 Dynamic Quantization\n\n"
+            f"[bold cyan]• Compression:[/bold cyan]     INT8 Dynamic Quantization"
+            f"{cuda_notice}\n\n"
             f"[white]Run [bold cyan]/status[/bold cyan] or press [bold cyan]Tab[/bold cyan] to see registered cluster GPUs.[/white]",
             title="Situs Worker Joined",
             border_style=border_col,
         )
         emit(ok_panel, "Situs Worker Joined")
+        return True
+
+    elif root_cmd in ("/cuda", "cuda"):
+        from situs.hardware import detect_hardware
+        hw = detect_hardware(requested_device="auto", bypass_cache=True)
+        try:
+            import torch
+            torch_ver = torch.__version__
+            torch_cuda = torch.cuda.is_available()
+            cuda_arch = torch.version.cuda or "N/A"
+        except ImportError:
+            torch_ver = "Not installed"
+            torch_cuda = False
+            cuda_arch = "N/A"
+
+        if hw.gpu_available:
+            panel = Panel(
+                f"[bold green]✓ PyTorch CUDA GPU Acceleration Active[/bold green]\n\n"
+                f"[bold cyan]• Device:[/bold cyan]          {hw.device_name} ({hw.total_memory_gb:.1f} GB VRAM)\n"
+                f"[bold cyan]• Compute Target:[/bold cyan]  {hw.device.upper()}\n"
+                f"[bold cyan]• PyTorch Version:[/bold cyan] {torch_ver} (CUDA {cuda_arch})\n"
+                f"[bold cyan]• Status:[/bold cyan]           CUDA acceleration fully functional. Ready for zero-host-RAM GPU pooling!",
+                title="CUDA Diagnostics",
+                border_style="green",
+            )
+        elif hw.physical_gpu_detected:
+            panel = Panel(
+                f"[bold yellow]⚠️  Physical GPU Detected, but PyTorch CUDA Runtime is Missing[/bold yellow]\n\n"
+                f"[bold cyan]• Physical GPU:[/bold cyan]    {hw.physical_gpu_name} ({hw.total_memory_gb:.1f} GB VRAM)\n"
+                f"[bold cyan]• PyTorch Version:[/bold cyan] {torch_ver}\n"
+                f"[bold cyan]• CUDA Working:[/bold cyan]    False (PyTorch was installed with CPU-only binaries)\n\n"
+                f"[bold white]To enable full CUDA acceleration on this laptop, run in PowerShell:[/bold white]\n\n"
+                f"  [bold green]pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall[/bold green]\n\n"
+                f"[dim]After running the command above, re-run /cuda or /join.[/dim]",
+                title="CUDA Diagnostics (Action Required)",
+                border_style="yellow",
+            )
+        else:
+            panel = Panel(
+                f"[bold cyan]! No Dedicated CUDA GPU Detected[/bold cyan]\n\n"
+                f"[bold cyan]• Host Device:[/bold cyan]     {hw.device_name} ({hw.total_memory_gb:.1f} GB RAM)\n"
+                f"[bold cyan]• PyTorch Version:[/bold cyan] {torch_ver}\n"
+                f"[bold cyan]• Mode:[/bold cyan]            Clean CPU Compute",
+                title="CUDA Diagnostics",
+                border_style="cyan",
+            )
+        emit(panel, "CUDA Diagnostics")
         return True
 
     elif root_cmd in ("/status", "status"):
