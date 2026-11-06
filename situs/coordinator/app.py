@@ -26,6 +26,7 @@ from situs.protocol.messages import (
     SpeculativeVerified,
 )
 from situs.tokenizer import get_or_load_tokenizer
+from situs.network.tunnel import get_active_tunnel_url
 
 from starlette.types import Message, Send, Scope, Receive
 from starlette.datastructures import Headers
@@ -314,6 +315,7 @@ async def cluster_status():
         "pure_vram_enforced": True,
         "model": curr_model,
         "active_model": curr_model,
+        "public_tunnel_url": get_active_tunnel_url(),
         "total_layers": getattr(registry, "total_layers", 0),
         "is_partitioned": len(pipeline) > 0 and all(w.assigned_layer_start is not None for w in pipeline),
         "workers": [

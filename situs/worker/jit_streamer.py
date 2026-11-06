@@ -154,16 +154,19 @@ class ProgressiveJITStreamer:
         cache_dir: Optional[pathlib.Path] = None,
         codec: str = "zstd",
         enable_wire_compression: bool = False,
+        allow_synthetic: bool = False,
     ):
         self.model_name = model_name
         self.chunk_size = chunk_size
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.codec = codec
         self.enable_wire_compression = enable_wire_compression
+        self.allow_synthetic = allow_synthetic
 
     def generate_mock_layer_bytes(self, layer_index: int, size_bytes: int = 128 * 1024) -> bytes:
         """
-        Generates real serialized safetensors layer weights with all required transformer block tensors.
+        Generates synthetic safetensors layer weights with required transformer block tensors.
+        Used strictly for automated unit tests and continuous integration harnesses.
         """
         if HAS_TORCH:
             try:
@@ -232,8 +235,13 @@ class ProgressiveJITStreamer:
             cached = load_layer_from_cache(self.model_name, layer_index, self.cache_dir)
             if cached is not None:
                 payload_bytes = cached
-            else:
+            elif self.allow_synthetic or self.model_name.startswith("test") or "test" in self.model_name:
                 payload_bytes = self.generate_mock_layer_bytes(layer_index)
+            else:
+                raise FileNotFoundError(
+                    f"Layer {layer_index} weights for model '{self.model_name}' are not found in cache ({self.cache_dir}). "
+                    "Cannot perform distributed execution without verified model weights."
+                )
 
         # Apply wire-level compression if enabled
         if self.enable_wire_compression:

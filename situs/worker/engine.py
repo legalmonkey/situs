@@ -542,14 +542,14 @@ class StageExecutionEngine:
 
         # Take last accepted token to continue decoding
         last_token = verified_frame.accepted_tokens[-1]
-        dummy_next = NextToken(
+        next_token_frame = NextToken(
             request_id=request_id,
             step_index=verified_frame.step_index,
             token_id=last_token,
             is_verified=verified_frame.is_verified,
             is_experimental=verified_frame.is_experimental,
         )
-        return self.process_next_token(dummy_next)
+        return self.process_next_token(next_token_frame)
 
     def process_next_token(self, token_frame: NextToken) -> Optional[ProtocolFrame]:
         """

@@ -362,6 +362,8 @@ class OpenCodeSlashCompleter(Completer):
         ("/partition", "Rebalance & partition model layers across GPUs"),
         ("/nodes", "Inspect connected worker nodes & WebRTC P2P latency"),
         ("/doctor", "Run comprehensive hardware & STUN diagnostics"),
+        ("/tunnel", "Manage public WAN tunnel for zero-config cross-Wi-Fi clustering"),
+        ("/network", "Inspect network interfaces, IP addresses & cross-Wi-Fi reachability"),
         ("/cuda", "Diagnose GPU & show PyTorch CUDA acceleration install command"),
         ("/models", "List curated 6GB-16GB models for distributed pooling"),
         ("/model", "Select or switch models (e.g. /model 1, /model 2, /model <name>)"),
@@ -477,6 +479,62 @@ def get_local_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_all_interface_ips() -> Dict[str, str]:
+    """Retrieve all active IPv4 network interface addresses (LAN, Wi-Fi, Tailscale, VPN)."""
+    interfaces: Dict[str, str] = {}
+    try:
+        import psutil
+        for name, addrs in psutil.net_if_addrs().items():
+            for sn in addrs:
+                if sn.family == socket.AF_INET and sn.address:
+                    addr = sn.address
+                    if not addr.startswith("127.") and not addr.startswith("169.254."):
+                        interfaces[name] = addr
+    except Exception:
+        pass
+    if not interfaces:
+        lan = get_local_ip()
+        if lan and lan != "127.0.0.1":
+            interfaces["Wi-Fi / LAN"] = lan
+    return interfaces
+
+
+def get_tailscale_or_vpn_ip() -> Optional[Tuple[str, str]]:
+    """Detects if a Tailscale or mesh VPN IP (e.g. 100.x.y.z) is active on this machine."""
+    ifaces = get_all_interface_ips()
+    for name, ip in ifaces.items():
+        if "tailscale" in name.lower() or ip.startswith("100."):
+            return name, ip
+    return None
+
+
+def is_rfc1918_private_ip(host_or_ip: str) -> bool:
+    """Checks whether an address is a non-routable private RFC 1918 IP (192.168.x.x, 10.x.x.x, 172.16-31.x.x)."""
+    import ipaddress
+    clean_host = host_or_ip.strip()
+    if ":" in clean_host and not clean_host.startswith("["):
+        clean_host = clean_host.split(":")[0]
+    clean_host = clean_host.replace("http://", "").replace("https://", "").replace("ws://", "").replace("wss://", "")
+    if "/" in clean_host:
+        clean_host = clean_host.split("/")[0]
+    try:
+        ip = ipaddress.ip_address(clean_host)
+        return ip.is_private and not ip.is_loopback
+    except ValueError:
+        return False
+
+
+def get_subnet_24(ip_str: str) -> Optional[str]:
+    """Returns /24 prefix for comparison, e.g. '192.168.29'."""
+    try:
+        parts = ip_str.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}"
+    except Exception:
+        pass
+    return None
 
 
 def get_git_branch() -> str:
@@ -804,18 +862,47 @@ def start_in_process_worker(
         dev_type = hw.device_type
 
         # Verify reachability of coordinator HTTP endpoint before spinning up daemon
+        target_host = parsed_http.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+        local_ips = list(get_all_interface_ips().values())
+        local_lan = get_local_ip()
+        is_target_private = is_rfc1918_private_ip(target_host)
+        target_subnet = get_subnet_24(target_host)
+        local_subnets = [get_subnet_24(lip) for lip in local_ips if lip]
+        subnet_mismatch = is_target_private and target_subnet and (target_subnet not in local_subnets)
+
         existing_workers = []
         try:
-            with httpx.Client(timeout=1.0) as probe_c:
+            with httpx.Client(timeout=2.5) as probe_c:
                 st = probe_c.get(f"{parsed_http}/status")
                 if st.status_code == 200:
                     existing_workers = [w.get("id") or w.get("worker_id") for w in st.json().get("workers", [])]
-        except httpx.ConnectError:
-            return False, f"Cannot connect to Coordinator at {parsed_http} (Connection refused). Is the coordinator running? Start it with /coordinator."
-        except httpx.ConnectTimeout:
-            return False, f"Connection to Coordinator at {parsed_http} timed out. Ensure IP address is correct and port 8000 is open in firewall."
-        except Exception:
-            pass
+                else:
+                    return False, f"Coordinator at {parsed_http} responded with HTTP status {st.status_code} (expected 200 OK)."
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, OSError) as e:
+            if subnet_mismatch:
+                return False, (
+                    f"Cannot reach Coordinator at {coordinator_addr} ({type(e).__name__}: network unreachable).\n\n"
+                    f"[bold yellow]⚠️  CROSS-WIFI / SUBNET MISMATCH DETECTED:[/bold yellow]\n"
+                    f"• Target IP [bold cyan]{target_host}[/bold cyan] is a private RFC 1918 address on subnet [cyan]{target_subnet}.x[/cyan].\n"
+                    f"• Your machine is on subnet [cyan]{get_subnet_24(local_lan)}.x[/cyan] (local IP: {local_lan}).\n\n"
+                    f"[bold white]Private LAN IPs do NOT route across different Wi-Fi networks or the internet.[/bold white]\n"
+                    f"[bold white]To connect successfully:[/bold white]\n"
+                    f"  1. [bold green]Same Wi-Fi:[/bold green] Connect this laptop to the exact same Wi-Fi network/router as the Coordinator.\n"
+                    f"  2. [bold green]Different Wi-Fi / Remote:[/bold green] Use a mesh VPN like Tailscale on both laptops and join via Tailscale IP (e.g. /join 100.x.y.z:8000), or use a Cloudflare Tunnel.\n"
+                    f"  3. [bold green]Firewall Check:[/bold green] If on the same router, ensure Windows Defender Firewall on the Coordinator allows port 8000."
+                )
+            elif is_target_private:
+                return False, (
+                    f"Cannot reach Coordinator at {coordinator_addr} ({type(e).__name__}: connection unreachable).\n\n"
+                    f"[bold white]Troubleshooting:[/bold white]\n"
+                    f"  1. Make sure the Coordinator is running (`/coordinator` or `situs coordinator`).\n"
+                    f"  2. Check Windows Defender Firewall on the Coordinator (allow port 8000).\n"
+                    f"  3. Verify that both laptops are on the exact same Wi-Fi network."
+                )
+            else:
+                return False, f"Cannot connect to Coordinator at {parsed_http}: {e}"
+        except Exception as e:
+            return False, f"Cannot connect to Coordinator at {parsed_http}: {e}"
 
         if not worker_id:
             base_id = f"worker-{socket.gethostname().lower()}"
@@ -848,19 +935,34 @@ def start_in_process_worker(
         t = threading.Thread(target=runner, daemon=True)
         t.start()
         
-        # Wait up to 1.5 seconds with fast 10ms intervals for connection & registration
-        start_wait = time.time()
-        connected = False
-        while time.time() - start_wait < 1.5:
-            if getattr(daemon, "is_registered", False) or daemon.ws is not None:
-                connected = True
-                break
-            if getattr(daemon, "last_error", None):
-                return False, f"Worker connection failed: {daemon.last_error}"
-            time.sleep(0.01)
+        # Wait synchronously up to 4.0 seconds for confirmed registration with the coordinator
+        is_registered = False
+        if hasattr(daemon, "registered_event"):
+            is_registered = daemon.registered_event.wait(timeout=4.0)
+        else:
+            start_wait = time.time()
+            while time.time() - start_wait < 4.0:
+                if getattr(daemon, "is_registered", False):
+                    is_registered = True
+                    break
+                if getattr(daemon, "connection_error", None) or getattr(daemon, "last_error", None):
+                    break
+                time.sleep(0.02)
 
-        if not connected:
-            return False, f"WebSocket connection to {addr} timed out. Make sure the coordinator is online."
+        if not is_registered or not getattr(daemon, "is_registered", False):
+            if hasattr(daemon, "stop"):
+                daemon.stop()
+            if daemon in _bg_workers:
+                _bg_workers.remove(daemon)
+            err_desc = getattr(daemon, "connection_error", None) or getattr(daemon, "last_error", None) or "Registration timed out"
+            if subnet_mismatch:
+                return False, (
+                    f"Worker failed to register with Coordinator at {addr} ({err_desc}).\n\n"
+                    f"[bold yellow]⚠️  CROSS-WIFI / SUBNET MISMATCH DETECTED:[/bold yellow]\n"
+                    f"Private RFC 1918 IPs cannot route between different Wi-Fi networks.\n"
+                    f"Connect both devices to the same Wi-Fi, or use Tailscale (/join 100.x.y.z:8000)."
+                )
+            return False, f"Worker could not register with Coordinator at {addr} ({err_desc}). Ensure coordinator is running and port 8000 is accessible."
 
         return True, f"Worker {w_id} connected to {addr}"
     except Exception as e:
@@ -1160,20 +1262,107 @@ def execute_slash_command(
         session_state["coordinator_url"] = "http://127.0.0.1:8000"
         session_state["coord_status"] = "online"
 
+        from situs.network.tunnel import start_public_tunnel, get_active_tunnel_url, is_tunnel_active
+        # Automatically establish or retrieve public WAN tunnel
+        tunnel_url = get_active_tunnel_url()
+        if not tunnel_url:
+            emit("[cyan]Establishing ephemeral public WAN tunnel for cross-Wi-Fi clustering...[/cyan]", "Public Ingress")
+            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=6.0)
+            if succ and t_url:
+                tunnel_url = t_url
+
+        wan_section = ""
+        if tunnel_url:
+            wan_section = (
+                f"[bold green]• Public WAN Tunnel:[/bold green]  {tunnel_url}\n"
+                f"[bold green]• Cross-Wi-Fi Join:[/bold green]   /join {tunnel_url}\n"
+            )
+
+        vpn_info = get_tailscale_or_vpn_ip()
+        vpn_section = ""
+        if vpn_info:
+            v_name, v_ip = vpn_info
+            vpn_section = (
+                f"[bold cyan]• Mesh VPN ({v_name}):[/bold cyan]  http://{v_ip}:8000\n"
+                f"[bold white]To pool a laptop on Tailscale:[/bold white] /join {v_ip}:8000\n"
+            )
+
+        cross_wifi_guide = ""
+        if tunnel_url:
+            cross_wifi_guide = (
+                f"\n[bold green]To pool another laptop on DIFFERENT Wi-Fi / Hotspot (Zero Router Config):[/bold green]\n"
+                f"  [bold yellow]/join {tunnel_url}[/bold yellow]\n"
+            )
+        elif vpn_info:
+            v_name, v_ip = vpn_info
+            cross_wifi_guide = (
+                f"\n[bold green]To pool another laptop on DIFFERENT Wi-Fi (via Tailscale):[/bold green]\n"
+                f"  [bold yellow]/join {v_ip}:8000[/bold yellow]\n"
+            )
+        else:
+            cross_wifi_guide = (
+                f"\n[bold yellow]• Cross-Wi-Fi Note:[/bold yellow] Private LAN IP ({lan_ip}) only works on the [bold white]SAME Wi-Fi router[/bold white].\n"
+                f"[dim]Run [bold cyan]/tunnel[/bold cyan] to enable public WAN tunneling, or install Tailscale.[/dim]\n"
+            )
+
         panel = Panel(
             f"[bold green]✓ Situs Coordinator & WebSocket Relay Active[/bold green]\n\n"
             f"[bold cyan]• Local Endpoint:[/bold cyan]    http://127.0.0.1:8000\n"
-            f"[bold cyan]• Network LAN:[/bold cyan]       http://{lan_ip}:8000\n"
+            f"[bold cyan]• Same Wi-Fi LAN:[/bold cyan]    http://{lan_ip}:8000\n"
             f"[bold cyan]• Worker Join URL:[/bold cyan]   ws://{lan_ip}:8000/ws/worker\n"
-            f"[bold cyan]• OpenAI API Base:[/bold cyan]   http://127.0.0.1:8000/v1\n\n"
-            f"[bold white]To pool another laptop on your Wi-Fi, run in its TUI:[/bold white]\n"
-            f"  [bold yellow]/join {lan_ip}:8000[/bold yellow]\n\n"
+            f"[bold cyan]• OpenAI API Base:[/bold cyan]   http://127.0.0.1:8000/v1\n"
+            f"{wan_section}"
+            f"{vpn_section}\n"
+            f"[bold white]To pool another laptop on the SAME Wi-Fi, run in its TUI:[/bold white]\n"
+            f"  [bold yellow]/join {lan_ip}:8000[/bold yellow]\n"
+            f"{cross_wifi_guide}\n"
             f"[bold white]To add this local GPU as Worker 1:[/bold white]\n"
-            f"  [bold yellow]/join 127.0.0.1:8000[/bold yellow]",
+            f"  [bold yellow]/join 127.0.0.1:8000[/bold yellow]\n\n"
+            f"[dim]Run [bold cyan]/tunnel[/bold cyan] to manage WAN tunnel | Run [bold cyan]/network[/bold cyan] to inspect all active interfaces.[/dim]",
             title="Situs Coordinator Active",
             border_style="green",
         )
         emit(panel, "Situs Coordinator Active")
+        return True
+
+    elif root_cmd in ("/tunnel", "tunnel"):
+        from situs.network.tunnel import start_public_tunnel, stop_public_tunnel, get_active_tunnel_url, is_tunnel_active
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub in ("stop", "kill", "close", "off"):
+            stop_public_tunnel()
+            emit("[yellow]Public WAN tunnel has been stopped.[/yellow]", "Public Tunnel")
+            return True
+
+        if sub in ("start", "on", "new") or not is_tunnel_active():
+            emit("[cyan]Establishing Cloudflare Quick Tunnel for cross-Wi-Fi clustering...[/cyan]", "Public Tunnel")
+            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=8.0)
+            if succ and t_url:
+                panel = Panel(
+                    f"[bold green]✓ Public WAN Tunnel Active[/bold green]\n\n"
+                    f"[bold cyan]• Public URL:[/bold cyan]         {t_url}\n"
+                    f"[bold cyan]• Remote Worker Join:[/bold cyan] [bold yellow]/join {t_url}[/bold yellow]\n\n"
+                    f"[white]Anyone on another Wi-Fi network, coffee shop, or cellular hotspot can now connect![/white]\n"
+                    f"[dim]Run [bold cyan]/tunnel stop[/bold cyan] to tear down the tunnel.[/dim]",
+                    title="Public Ingress Tunnel",
+                    border_style="green"
+                )
+                emit(panel, "Public Tunnel Active")
+            else:
+                emit(Panel(f"[bold red]Failed to start tunnel:[/bold red]\n{t_msg}", title="Tunnel Error", border_style="red"), "Tunnel Error")
+            return True
+
+        # Status
+        t_url = get_active_tunnel_url()
+        panel = Panel(
+            f"[bold green]✓ Public WAN Tunnel is Active[/bold green]\n\n"
+            f"[bold cyan]• Public URL:[/bold cyan]         {t_url}\n"
+            f"[bold cyan]• Remote Worker Join:[/bold cyan] [bold yellow]/join {t_url}[/bold yellow]\n\n"
+            f"[dim]Commands: [bold cyan]/tunnel stop[/bold cyan] to disable | [bold cyan]/tunnel start[/bold cyan] to refresh[/dim]",
+            title="Public Ingress Tunnel Status",
+            border_style="green"
+        )
+        emit(panel, "Public Tunnel Status")
         return True
 
     elif root_cmd in ("/join", "join", "/connect", "connect"):
@@ -1401,6 +1590,60 @@ def execute_slash_command(
         else:
             from situs.cli import setup
             setup()
+        return True
+
+    elif root_cmd in ("/network", "network", "/interfaces", "interfaces"):
+        ifaces = get_all_interface_ips()
+        coord_status = "ONLINE (Port 8000)" if is_port_open("127.0.0.1", 8000) else "OFFLINE"
+        table = Table(title="Network Interfaces & Cluster Reachability", border_style="cyan", title_style="bold cyan")
+        table.add_column("Interface", style="bold white", width=24)
+        table.add_column("IPv4 Address", style="bold green", width=18)
+        table.add_column("Scope / Reachability", style="yellow", width=36)
+
+        for name, ip in ifaces.items():
+            if is_rfc1918_private_ip(ip):
+                scope = "Private RFC 1918 (Same Wi-Fi LAN only)"
+            elif ip.startswith("100.") or "tailscale" in name.lower():
+                scope = "[bold green]Mesh VPN (Works across ANY Wi-Fi)[/bold green]"
+            else:
+                scope = "Public / WAN Routable"
+            table.add_row(name, ip, scope)
+
+        from situs.network.tunnel import get_active_tunnel_url
+        active_tunnel = get_active_tunnel_url()
+        if active_tunnel:
+            table.add_row("Cloudflare Tunnel", active_tunnel, "[bold green]Public WAN Tunnel (Cross-Wi-Fi Active)[/bold green]")
+
+        emit(table, "Network Interfaces")
+
+        vpn_info = get_tailscale_or_vpn_ip()
+        lan_ip = get_local_ip()
+        guide_text = (
+            f"[bold white]Coordinator Service:[/bold white] {coord_status}\n\n"
+            f"[bold cyan]1. To pool laptops on the SAME Wi-Fi network:[/bold cyan]\n"
+            f"   Run on the second laptop:  [bold yellow]/join {lan_ip}:8000[/bold yellow]\n\n"
+            f"[bold cyan]2. To pool laptops on DIFFERENT Wi-Fi networks / hotspots:[/bold cyan]\n"
+        )
+        if active_tunnel:
+            guide_text += (
+                f"   [bold green]✓ Public WAN Tunnel is Active ({active_tunnel}):[/bold green]\n"
+                f"   Run on any laptop on ANY Wi-Fi:  [bold yellow]/join {active_tunnel}[/bold yellow]\n\n"
+                f"   [dim]Commands: [bold cyan]/tunnel stop[/bold cyan] to disable | [bold cyan]/tunnel start[/bold cyan] to refresh[/dim]\n"
+            )
+        elif vpn_info:
+            v_name, v_ip = vpn_info
+            guide_text += (
+                f"   [bold green]✓ Tailscale/VPN active on {v_name}:[/bold green]\n"
+                f"   Run on the second laptop:  [bold yellow]/join {v_ip}:8000[/bold yellow]\n"
+            )
+        else:
+            guide_text += (
+                f"   Private IP ({lan_ip}) is NOT reachable from another Wi-Fi router or mobile network.\n"
+                f"   • [bold green]Recommended:[/bold green] Run [bold cyan]/tunnel[/bold cyan] in this interface to establish an instant public tunnel.\n"
+                f"   • [bold green]Alternative:[/bold green] Install [bold white]Tailscale[/bold white] (mesh VPN) on both laptops and join using the 100.x.y.z IP.\n"
+            )
+
+        emit(Panel(guide_text, title="Cross-Wi-Fi Connection Guide", border_style="green"), "Network Reachability")
         return True
 
     elif root_cmd in ("/speculative", "speculative"):
@@ -2559,7 +2802,7 @@ def run_opencode_tui(
                 first_token = clean_lower.split()[0]
                 if first_token in (
                     "coordinator", "join", "status", "partition", "nodes",
-                    "doctor", "setup", "model", "models", "p2p", "speculative",
+                    "doctor", "network", "interfaces", "setup", "model", "models", "p2p", "speculative",
                     "clear", "cls", "help", "exit", "quit", "chat"
                 ):
                     is_cmd = True

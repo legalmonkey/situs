@@ -400,23 +400,44 @@ def start_coordinator(
     host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host address to bind to"),
     port: int = typer.Option(8000, "--port", "-p", help="Port number for coordinator & relay"),
     workers_min: int = typer.Option(2, "--workers-min", help="Minimum workers required before inference"),
+    public: bool = typer.Option(False, "--public", "--tunnel", "-t", help="Create an ephemeral public WAN tunnel for cross-Wi-Fi clustering"),
     worker_auth_token: Optional[str] = typer.Option(None, "--worker-auth-token", "--token", envvar="SITUS_WORKER_AUTH_TOKEN", help="Worker authentication token"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="SITUS_API_KEY", help="OpenAI API key for coordinator gateway"),
     admin_key: Optional[str] = typer.Option(None, "--admin-key", envvar="SITUS_ADMIN_KEY", help="Administrator authorization key"),
 ):
     """Start the Situs Coordinator, WebSocket Relay, and OpenAI API Gateway."""
+    from situs.network.tunnel import start_public_tunnel, stop_public_tunnel, get_active_tunnel_url
     lan_ip = get_local_ip()
+
+    public_tunnel_url = None
+    if public or os.getenv("SITUS_PUBLIC_TUNNEL", "").strip().lower() in ("1", "true", "yes"):
+        if console:
+            console.print("[cyan]Establishing ephemeral public WAN tunnel for cross-Wi-Fi clustering...[/cyan]")
+        succ, t_url, t_msg = start_public_tunnel(port=port, timeout=8.0)
+        if succ and t_url:
+            public_tunnel_url = t_url
+        elif console:
+            console.print(f"[yellow]⚠️  Public tunnel notice:[/yellow] {t_msg}")
 
     print_banner()
     if console:
+        wan_section = ""
+        if public_tunnel_url:
+            wan_section = (
+                f"\n[bold green]• Public WAN Tunnel:[/bold green]   {public_tunnel_url}\n"
+                f"[bold green]• Cross-Wi-Fi Join:[/bold green]    situs join {public_tunnel_url}\n"
+            )
+
         info_panel = Panel(
             f"[bold white]Coordinator & Relay Server Starting[/bold white]\n\n"
             f"[bold cyan]• Local Endpoint:[/bold cyan]    http://localhost:{port}\n"
             f"[bold cyan]• Network Endpoint:[/bold cyan]  http://{lan_ip}:{port}\n"
             f"[bold cyan]• Worker Join URL:[/bold cyan]   ws://{lan_ip}:{port}/ws/worker\n"
-            f"[bold cyan]• OpenAI API Base:[/bold cyan]   http://{lan_ip}:{port}/v1\n\n"
-            f"[bold green]To connect workers from any laptop on your Wi-Fi or Internet:[/bold green]\n"
-            f"  [yellow]situs join {lan_ip}:{port}[/yellow]",
+            f"[bold cyan]• OpenAI API Base:[/bold cyan]   http://{lan_ip}:{port}/v1\n"
+            f"{wan_section}\n"
+            f"[bold green]To connect workers on the SAME Wi-Fi:[/bold green]\n"
+            f"  [yellow]situs join {lan_ip}:{port}[/yellow]\n"
+            + (f"\n[bold white]To connect workers on DIFFERENT Wi-Fi networks:[/bold white]\n  [yellow]situs join {public_tunnel_url}[/yellow]" if public_tunnel_url else "\n[dim]To allow workers on different Wi-Fi networks to connect, restart with --public[/dim]"),
             title="Situs Coordinator Active",
             border_style="green",
         )
@@ -463,6 +484,8 @@ def start_coordinator(
         else:
             sys.stderr.write(f"\nNetwork Port Error: Port {port} cannot be bound ({e})\n")
         raise typer.Exit(code=1)
+    finally:
+        stop_public_tunnel()
 
 
 @app.command("join")

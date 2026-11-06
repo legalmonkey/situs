@@ -8,6 +8,7 @@ import json
 import shutil
 import subprocess
 import asyncio
+import threading
 import logging
 import argparse
 from typing import Optional
@@ -51,8 +52,21 @@ class WorkerDaemon:
         self.is_running = True
         self.is_connected = False
         self.is_registered = False
+        self.registered_event = threading.Event()
+        self.connection_error: Optional[str] = None
         self.last_error: Optional[str] = None
         self._cached_hw = None
+
+    def stop(self):
+        """Signals the daemon to shut down and disconnects WebSocket."""
+        self.is_running = False
+        if self.ws:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self.ws.close())
+            except Exception:
+                pass
 
     async def send_signaling_frame(self, msg_dict: dict):
         if self.ws:
@@ -215,9 +229,12 @@ class WorkerDaemon:
             elif "extra_headers" in sig_params:
                 connect_kwargs["extra_headers"] = dict(auth_headers)
 
-        async for websocket in websockets.connect(ws_url, **connect_kwargs):
-            self.ws = websocket
-            self.is_connected = True
+        try:
+            async for websocket in websockets.connect(ws_url, **connect_kwargs):
+                if not self.is_running:
+                    break
+                self.ws = websocket
+                self.is_connected = True
             try:
                 # 1. Register with Coordinator
                 reg = WorkerRegister(
@@ -247,6 +264,7 @@ class WorkerDaemon:
 
                     if frame.type == MessageType.WORKER_REGISTERED:
                         self.is_registered = True
+                        self.registered_event.set()
                         logger.info(f"Coordinator confirmed registration for worker {self.worker_id}")
 
                     elif frame.type == MessageType.ASSIGN_LAYERS:
@@ -367,6 +385,10 @@ class WorkerDaemon:
                 self.is_connected = False
                 if 'hb_task' in locals() and not hb_task.done():
                     hb_task.cancel()
+        except Exception as conn_err:
+            self.connection_error = str(conn_err)
+            self.last_error = str(conn_err)
+            logger.warning(f"Could not connect to Coordinator at {ws_url}: {conn_err}")
 
 
 def main():

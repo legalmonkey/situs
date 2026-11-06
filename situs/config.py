@@ -63,7 +63,15 @@ def sanitize_coordinator_address(raw: str, default_port: int = 8000) -> str:
             )
 
     # If no port is specified:
-    if ":" not in host_port and not path_part.startswith(":"):
+    # Public tunnel domains (like trycloudflare.com, ngrok-free.app, etc.) operate on standard 443
+    is_public_tunnel_domain = any(base_host.lower().endswith(suffix) for suffix in (
+        ".trycloudflare.com", ".loca.lt", ".pinggy.link", ".ngrok-free.app", ".ngrok.io", ".bore.pub"
+    ))
+
+    if is_public_tunnel_domain:
+        if not scheme:
+            scheme = "https://"
+    elif ":" not in host_port and not path_part.startswith(":"):
         is_ip_or_local = base_host.lower() in ("localhost", "127.0.0.1", "0.0.0.0") or (
             re.match(r'^\d+(\.\d+)*$', base_host) is not None
         )
