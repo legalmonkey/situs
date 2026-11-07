@@ -71,8 +71,18 @@ class EarlyExitHead(nn.Module if HAS_TORCH else object):
             if dtype is None:
                 dtype = torch.float16 if (hidden_dim * vocab_size > 1_000_000) else torch.float32
             dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
-            self.norm = nn.LayerNorm(hidden_dim, dtype=dtype, device=dev)
-            self.proj = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=dtype, device=dev)
+            try:
+                self.norm = nn.LayerNorm(hidden_dim, dtype=dtype, device=dev)
+                self.proj = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=dtype, device=dev)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() and dev != "cpu":
+                    logger.warning(f"CUDA OOM allocating EarlyExitHead on {dev}. Falling back to CPU.")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    self.norm = nn.LayerNorm(hidden_dim, dtype=dtype, device="cpu")
+                    self.proj = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=dtype, device="cpu")
+                else:
+                    raise
 
     def forward(self, h: "torch.Tensor") -> "torch.Tensor":
         if not HAS_TORCH:

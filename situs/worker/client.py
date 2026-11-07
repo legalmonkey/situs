@@ -282,6 +282,11 @@ class WorkerDaemon:
                             self.registered_event.set()
                             logger.info(f"Coordinator confirmed registration for worker {self.worker_id}")
 
+                        elif frame.type == MessageType.WORKER_REMOVED:
+                            logger.info(f"Worker '{self.worker_id}' was removed by coordinator. Stopping daemon cleanly.")
+                            self.is_running = False
+                            break
+
                         elif frame.type == MessageType.ASSIGN_LAYERS:
                             try:
                                 self.engine_ready_event.clear()
@@ -290,6 +295,23 @@ class WorkerDaemon:
                                     f"Assigned layers [{assign.layer_start}..{assign.layer_end}) of {assign.model_name}. "
                                     f"First={assign.is_first_stage}, Last={assign.is_last_stage}"
                                 )
+                                from situs.coordinator.registry import resolve_model_metadata
+                                from situs.worker.loader import is_architecture_supported
+                                try:
+                                    meta = resolve_model_metadata(assign.model_name)
+                                    arch = meta.get("architecture") or meta.get("model_type")
+                                except Exception:
+                                    arch = None
+
+                                if not is_architecture_supported(arch):
+                                    logger.info(
+                                        f"Model '{assign.model_name}' (architecture '{arch}') executes via local engine/Ollama runtime. "
+                                        f"Pipeline assignment [{assign.layer_start}..{assign.layer_end}) recorded for cluster topology."
+                                    )
+                                    self.engine = None
+                                    self.engine_ready_event.set()
+                                    continue
+
                                 stage_model = await asyncio.to_thread(
                                     load_hf_stage_model,
                                     model_name=assign.model_name,

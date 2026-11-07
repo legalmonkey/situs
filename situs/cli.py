@@ -856,6 +856,30 @@ def partition_model(
         console.print(table)
 
 
+@app.command("remove")
+def remove_device(
+    worker_id: str = typer.Argument(..., help="Worker ID to remove from cluster"),
+    coordinator: str = typer.Option("http://127.0.0.1:8000", "--coordinator", "-c", help="Coordinator URL"),
+    admin_key: Optional[str] = typer.Option(None, "--admin-key", help="Admin key if coordinator is protected"),
+):
+    """Remove a worker device from the cluster and automatically rebalance remaining GPUs."""
+    base_url = normalize_coordinator_address(coordinator)
+    headers = {"x-admin-key": admin_key} if admin_key else {}
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.delete(f"{base_url}/admin/workers/{worker_id}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                rem = data.get("remaining_workers", 0)
+                console.print(f"[bold green]✓ Worker '{worker_id}' removed from cluster.[/bold green] ({rem} worker(s) remaining)")
+            elif resp.status_code == 404:
+                console.print(f"[bold yellow]Worker '{worker_id}' not found in cluster.[/bold yellow]")
+            else:
+                console.print(f"[bold red]Failed to remove worker:[/bold red] {resp.text}")
+    except Exception as e:
+        console.print(f"[bold red]Failed to connect to coordinator at {base_url}:[/bold red] {e}")
+
+
 @app.command("chat")
 def interactive_chat(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),

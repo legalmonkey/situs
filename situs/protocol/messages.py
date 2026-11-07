@@ -9,6 +9,7 @@ class MessageType(str, Enum):
     # Registration & Lifecycle
     WORKER_REGISTER = "worker_register"
     WORKER_REGISTERED = "worker_registered"
+    WORKER_REMOVED = "worker_removed"
     ASSIGN_LAYERS = "assign_layers"
     HEARTBEAT = "heartbeat"
     HEARTBEAT_ACK = "heartbeat_ack"

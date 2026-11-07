@@ -202,18 +202,37 @@ def _fast_linear(in_features: int, out_features: int, device: str = "cpu", dtype
     """Safe linear module initialization avoiding PyTorch C++ memory corruption."""
     if not HAS_TORCH:
         return None
-    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
     dt = dtype if dtype is not None else torch.float32
-    return nn.Linear(in_features, out_features, bias=False, dtype=dt, device=dev)
+    linear = nn.Linear.__new__(nn.Linear)
+    super(nn.Linear, linear).__init__()
+    linear.in_features = in_features
+    linear.out_features = out_features
+    linear.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dt, device="cpu"))
+    linear.bias = None
+    if device != "cpu" and torch.cuda.is_available() and "cuda" in str(device):
+        try:
+            linear = linear.to(device)
+        except Exception:
+            pass
+    return linear
 
 
 def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu", dtype: Any = None) -> Any:
     """Safe embedding module initialization avoiding multi-GB host CPU memory allocation."""
     if not HAS_TORCH:
         return None
-    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
     dt = dtype if dtype is not None else torch.float32
-    return nn.Embedding(num_embeddings, embedding_dim, dtype=dt, device=dev)
+    emb = nn.Embedding.__new__(nn.Embedding)
+    super(nn.Embedding, emb).__init__()
+    emb.num_embeddings = num_embeddings
+    emb.embedding_dim = embedding_dim
+    emb.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=dt, device="cpu"))
+    if device != "cpu" and torch.cuda.is_available() and "cuda" in str(device):
+        try:
+            emb = emb.to(device)
+        except Exception:
+            pass
+    return emb
 
 
 class RealTransformerBlock(nn.Module if HAS_TORCH else object):

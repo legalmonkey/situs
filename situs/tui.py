@@ -360,6 +360,7 @@ class OpenCodeSlashCompleter(Completer):
         ("/vram", "Inspect live GPU VRAM usage & memory residency across cluster"),
         ("/gpu", "Inspect live GPU VRAM usage & memory residency across cluster"),
         ("/partition", "Rebalance & partition model layers across GPUs"),
+        ("/remove", "Remove / disconnect a worker node from the cluster: /remove <worker-id>"),
         ("/nodes", "Inspect connected worker nodes & WebRTC P2P latency"),
         ("/doctor", "Run comprehensive hardware & STUN diagnostics"),
         ("/tunnel", "Manage public WAN tunnel for zero-config cross-Wi-Fi clustering"),
@@ -403,6 +404,26 @@ class OpenCodeSlashCompleter(Completer):
                 display="/join 127.0.0.1:8000 worker-1 cuda:0",
                 display_meta="Join first worker on CUDA GPU"
             )
+            return
+
+        if text.startswith(("/remove ", "/kick ", "/drop ")):
+            prefix = text.split(" ", 1)[0]
+            sub = text[len(prefix) + 1:].strip().lower()
+            active_workers = []
+            for cached_data in _metadata_cache.values():
+                if isinstance(cached_data, tuple) and len(cached_data) > 1 and isinstance(cached_data[1], dict):
+                    for w in cached_data[1].get("workers", []):
+                        w_id = w.get("worker_id") or w.get("id")
+                        if w_id and w_id not in active_workers:
+                            active_workers.append(w_id)
+            for w_id in active_workers:
+                if not sub or w_id.lower().startswith(sub):
+                    yield Completion(
+                        f"{prefix} {w_id}",
+                        start_position=-len(text),
+                        display=f"{prefix} {w_id}",
+                        display_meta="Disconnect device from cluster",
+                    )
             return
 
         if text.startswith("/"):
@@ -1558,11 +1579,45 @@ def execute_slash_command(
                 resp = client.post(f"{coord_url}/admin/partition?model_name={model}&total_layers={layers}&codec=zstd")
                 if resp.status_code == 200:
                     data = resp.json()
-                    emit(f"[bold green]Successfully partitioned {model} across {len(data.get('partition_plan', []))} workers![/bold green]", "Partition")
+                    partitions = data.get("partitions") or data.get("partition_plan") or []
+                    emit(f"[bold green]Successfully partitioned {model} across {len(partitions)} workers![/bold green]", "Partition")
                 else:
                     emit(f"[bold red]Partition error:[/bold red] {resp.text}", "Partition Error")
         except Exception as e:
             emit(f"[bold red]Failed to partition:[/bold red] {e}", "Partition Error")
+        return True
+
+    elif root_cmd in ("/remove", "remove", "/kick", "kick", "/drop", "drop"):
+        if len(parts) < 2:
+            emit("[bold yellow]Usage:[/bold yellow] /remove <worker-id>  (e.g. /remove worker-1)", "Remove Worker")
+            return True
+        target_worker = parts[1].strip()
+        coord_url = session_state.get("coordinator_url", coordinator_url)
+        norm_c = normalize_fast_url(coord_url)
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.delete(f"{norm_c}/admin/workers/{target_worker}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    remaining = data.get("remaining_workers", data.get("remaining_workers_count", 0))
+                    emit(
+                        f"[bold green]✓ Successfully removed worker node '{target_worker}' from cluster.[/bold green]\n"
+                        f"[dim]Remaining workers active: {remaining}. Model pipeline rebalanced automatically.[/dim]",
+                        "Worker Removed",
+                    )
+                    _metadata_cache.clear()
+                    if "cluster_workers" in session_state:
+                        session_state["cluster_workers"] = [
+                            w for w in session_state.get("cluster_workers", [])
+                            if (w.get("worker_id") or w.get("id")) != target_worker
+                        ]
+                    session_state["workers_count"] = remaining
+                elif resp.status_code == 404:
+                    emit(f"[bold red]Worker node '{target_worker}' was not found in the cluster.[/bold red] Run [bold cyan]/nodes[/bold cyan] to see active IDs.", "Remove Worker Error")
+                else:
+                    emit(f"[bold red]Failed to remove worker '{target_worker}':[/bold red] {resp.text}", "Remove Worker Error")
+        except Exception as e:
+            emit(f"[bold red]Failed to reach coordinator to remove worker:[/bold red] {e}", "Remove Worker Error")
         return True
 
     elif root_cmd in ("/nodes", "nodes"):
@@ -1870,9 +1925,10 @@ def show_nodes_view(coordinator_url: str, log_output_fn: Optional[Callable[[str,
         table = render_workers_table(workers, title="Connected GPU Worker Nodes")
         if log_output_fn is not None:
             log_output_fn("Connected GPU Worker Nodes", table)
+            log_output_fn("Tip", "[dim]Tip: As coordinator, disconnect any device using [bold cyan]/remove <worker-id>[/bold cyan][/dim]")
         else:
             console.print(table)
-            console.print()
+            console.print("[dim]Tip: As coordinator, disconnect any device using [bold cyan]/remove <worker-id>[/bold cyan][/dim]\n")
     else:
         panel = Panel(
             "[bold yellow]No external workers currently connected.[/bold yellow]\n\n"
@@ -1956,6 +2012,7 @@ def run_opencode_tui(
         "gpu_name": gpu_name,
         "is_generating": False,
         "is_coordinator": is_init_coord,
+        "cluster_workers": [],
     }
 
     # Initial cluster probe
@@ -1964,6 +2021,9 @@ def run_opencode_tui(
     session_state["coord_status"] = meta.get("status", "offline")
     session_state["total_vram_gb"] = meta.get("total_vram_gb", 0.0)
     session_state["free_vram_gb"] = meta.get("free_vram_gb", 0.0)
+    session_state["used_vram_gb"] = meta.get("used_vram_gb", 0.0)
+    session_state["vram_usage_pct"] = meta.get("vram_usage_pct", 0.0)
+    session_state["cluster_workers"] = meta.get("workers", [])
     if not is_init_coord and meta.get("model"):
         session_state["model"] = meta.get("model")
 
@@ -2400,6 +2460,55 @@ def run_opencode_tui(
         shortcuts_line,
     ])
 
+    def show_temporary_notice(text: str, duration: float = 2.5) -> None:
+        history_entries.append(("info", f"[bold yellow]Notice:[/bold yellow] {text}", ""))
+        if app_instance[0]:
+            app_instance[0].invalidate()
+
+    def _async_remove_worker_cli(target_worker: str) -> None:
+        def _worker_drop():
+            coord_url = session_state.get("coordinator_url", coordinator_url)
+            norm_c = normalize_fast_url(coord_url)
+            try:
+                with httpx.Client(timeout=8.0) as client:
+                    resp = client.delete(f"{norm_c}/admin/workers/{target_worker}")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        remaining = data.get("remaining_workers", data.get("remaining_workers_count", 0))
+                        history_entries.append((
+                            "agent",
+                            f"[bold green]✓ Removed worker node '{target_worker}' from cluster.[/bold green] ({remaining} remaining)",
+                            ""
+                        ))
+                        _metadata_cache.clear()
+                        session_state["cluster_workers"] = [
+                            w for w in session_state.get("cluster_workers", [])
+                            if (w.get("worker_id") or w.get("id")) != target_worker
+                        ]
+                        session_state["workers_count"] = remaining
+                    elif resp.status_code == 404:
+                        history_entries.append((
+                            "error",
+                            f"[bold red]Worker '{target_worker}' not found in cluster.[/bold red]",
+                            ""
+                        ))
+                    else:
+                        history_entries.append((
+                            "error",
+                            f"[bold red]Failed to remove worker '{target_worker}':[/bold red] {resp.text}",
+                            ""
+                        ))
+            except Exception as ex:
+                history_entries.append((
+                    "error",
+                    f"[bold red]Error communicating with coordinator:[/bold red] {ex}",
+                    ""
+                ))
+            if app_instance[0]:
+                app_instance[0].invalidate()
+
+        threading.Thread(target=_worker_drop, daemon=True).start()
+
     def get_sidebar_fragments() -> Any:
         frags = []
         frags.append(("bold #38bdf8", "SITUS SWARM\n"))
@@ -2480,9 +2589,76 @@ def run_opencode_tui(
         spec_text = "Speculative" if session_state.get("speculative", True) else "Disabled"
         frags.append(("#ffffff", f"Accel: {spec_text}\n\n"))
         if is_coord:
-            frags.append(("bold underline #38bdf8", "[Click Model or F2 to Switch]\n", on_sidebar_model_click))
+            frags.append(("bold underline #38bdf8", "[Click Model or F2 to Switch]\n\n", on_sidebar_model_click))
         else:
-            frags.append(("italic #94a3b8", "[Managed by Coordinator]\n"))
+            frags.append(("italic #94a3b8", "[Managed by Coordinator]\n\n"))
+
+        # Live Cluster Nodes & Assigned Pipeline Stages
+        frags.append(("bold #f8fafc", "Active Nodes & Stages\n"))
+        frags.append(("#475569", "────────────────────────────────────\n"))
+        workers = session_state.get("cluster_workers", [])
+        if not workers:
+            frags.append(("#94a3b8", " No workers connected\n"))
+            frags.append(("#64748b", " Run /join to pool GPUs\n\n"))
+        else:
+            for w in workers:
+                w_id = str(w.get("worker_id") or w.get("id") or "worker")
+                w_disp = w_id if len(w_id) <= 15 else w_id[:13] + ".."
+
+                # Pipeline Stage
+                layer_range = w.get("layer_range")
+                if layer_range and layer_range != "unassigned":
+                    stage_str = f"L[{layer_range}]"
+                elif w.get("assigned_layers"):
+                    stage_str = f"L[{w['assigned_layers'][0]}..{w['assigned_layers'][-1]}]"
+                else:
+                    stage_str = "Unassigned"
+
+                if (w.get("is_first") or w.get("is_first_stage")) and (w.get("is_last") or w.get("is_last_stage")):
+                    stage_str += " (Full)"
+                elif w.get("is_first") or w.get("is_first_stage"):
+                    stage_str += " (Embed)"
+                elif w.get("is_last") or w.get("is_last_stage"):
+                    stage_str += " (Head)"
+
+                # Hardware and VRAM
+                gpu_desc = w.get("gpu") or w.get("gpu_name") or w.get("device", "GPU")
+                if any(bad in gpu_desc for bad in ("Family", "Stepping", "Intel64", "AMD64")):
+                    gpu_desc = gpu_desc.split(",")[0].strip() if "," in gpu_desc else gpu_desc.strip()
+                gpu_short = gpu_desc.replace("NVIDIA GeForce ", "").replace("Laptop GPU", "Lap")
+                if len(gpu_short) > 22:
+                    gpu_short = gpu_short[:20] + ".."
+
+                total_gb = float(w.get("total_gb", 0.0))
+                used_gb = float(w.get("used_gb", 0.0))
+                vram_str = f"{used_gb:.1f}/{total_gb:.1f}GB" if total_gb > 0 else ""
+
+                # Header line: ● worker-id  [✕ Remove]
+                frags.append(("bold #22c55e", "● "))
+                frags.append(("bold #ffffff", f"{w_disp} "))
+                if is_coord:
+                    def make_remove_cb(target_id: str):
+                        def on_remove_click(mouse_event: MouseEvent) -> Any:
+                            if mouse_event.event_type == MouseEventType.MOUSE_UP and mouse_event.button == MouseButton.LEFT:
+                                _async_remove_worker_cli(target_id)
+                                return None
+                            return NotImplemented
+                        return on_remove_click
+
+                    frags.append(("bold #ef4444 underline", "[✕ Remove]", make_remove_cb(w_id)))
+                frags.append(("", "\n"))
+
+                # Line 2: stage + vram
+                stage_color = "#38bdf8" if "Unassigned" not in stage_str else "#eab308"
+                frags.append((stage_color, f"  {stage_str}"))
+                if vram_str:
+                    frags.append(("#94a3b8", f" · {vram_str}\n"))
+                else:
+                    frags.append(("", "\n"))
+
+                # Line 3: gpu hardware
+                frags.append(("#64748b", f"  {gpu_short}\n\n"))
+
         return frags
 
     def get_sidebar_footer() -> Any:
@@ -2724,14 +2900,19 @@ def run_opencode_tui(
 
                 if not cancel_event.is_set() and tok_cnt > 0:
                     meta_latest = fetch_cluster_metadata(normalized)
+                    p_stages = meta_latest.get("pipeline_stages") or []
                     w_cnt = meta_latest.get("active_workers_count", session_state.get("workers_count", 1))
                     session_state["total_vram_gb"] = meta_latest.get("total_vram_gb", 0.0)
                     session_state["free_vram_gb"] = meta_latest.get("free_vram_gb", 0.0)
                     session_state["used_vram_gb"] = meta_latest.get("used_vram_gb", 0.0)
+                    session_state["cluster_workers"] = meta_latest.get("workers", [])
                     used_v = meta_latest.get("used_vram_gb", 0.0)
                     tot_v = meta_latest.get("total_vram_gb", 0.0)
                     v_str = f" (VRAM: {used_v:.1f}/{tot_v:.1f} GB)" if tot_v > 0 else ""
-                    t_mode = "WebRTC P2P Direct" if session_state.get("p2p", True) else "WebSocket Relay"
+                    if len(p_stages) <= 1:
+                        t_mode = "Single-Node CUDA Direct"
+                    else:
+                        t_mode = "WebRTC P2P Direct" if session_state.get("p2p", True) else "WebSocket Relay"
                     badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs{v_str} | {t_mode}"
                     history_entries.append(("metric", badge, ""))
                     messages.append({"role": "assistant", "content": full_resp})
@@ -3111,6 +3292,11 @@ def run_opencode_tui(
                     if coord_model.lower() != session_state.get("model", "").lower():
                         session_state["model"] = coord_model
                         changed = True
+
+                curr_workers = meta.get("workers", [])
+                if curr_workers != session_state.get("cluster_workers"):
+                    session_state["cluster_workers"] = curr_workers
+                    changed = True
 
                 if changed and app_instance[0]:
                     app_instance[0].invalidate()

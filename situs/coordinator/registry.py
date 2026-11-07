@@ -597,6 +597,16 @@ class WorkerRegistry:
             last_heartbeat=time.time(),
             is_alive=True,
         )
+        existing = self.workers.get(reg.worker_id)
+        if existing and existing.assigned_layer_start is not None:
+            node.assigned_layer_start = existing.assigned_layer_start
+            node.assigned_layer_end = existing.assigned_layer_end
+            node.is_first_stage = existing.is_first_stage
+            node.is_last_stage = existing.is_last_stage
+            node.next_worker_id = existing.next_worker_id
+            node.prev_worker_id = existing.prev_worker_id
+            node.first_worker_id = existing.first_worker_id
+
         self.workers[reg.worker_id] = node
         logger.info(f"Registered worker {reg.worker_id} ({reg.gpu_name}, {reg.free_vram_bytes / 1e9:.2f} GB free)")
         return node

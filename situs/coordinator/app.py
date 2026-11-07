@@ -25,6 +25,7 @@ from situs.protocol.messages import (
     InferenceStart,
     NextToken,
     SpeculativeVerified,
+    AssignLayers,
 )
 from situs.tokenizer import get_or_load_tokenizer
 from situs.network.tunnel import get_active_tunnel_url
@@ -178,6 +179,52 @@ class ChatCompletionRequest(BaseModel):
 
 
 # ==========================================
+# Cluster Pipeline Partition & Assignment Helper
+# ==========================================
+
+async def rebalance_and_assign_layers(
+    model_name: Optional[str] = None,
+    total_layers: Optional[int] = None,
+    progressive: bool = False,
+    codec: str = "zstd",
+) -> List[AssignLayers]:
+    """
+    Rebalances and partitions the active model across all currently connected alive workers,
+    and transmits verified ASSIGN_LAYERS protocol frames to each worker stage.
+    """
+    alive = registry.get_alive_workers()
+    if not alive:
+        logger.info("rebalance_and_assign_layers called with no alive workers.")
+        return []
+
+    target = model_name or registry.active_model or "gemma3:4b"
+    try:
+        meta = resolve_model_metadata(target)
+        resolved_layers = total_layers if (total_layers is not None and total_layers > 0) else meta.get("total_layers", 28)
+    except Exception as e:
+        logger.warning(f"Could not resolve metadata for '{target}': {e}. Using default 28 layers.")
+        resolved_layers = total_layers if (total_layers is not None and total_layers > 0) else 28
+
+    assignments = registry.partition_model(
+        target, total_layers=resolved_layers, progressive=progressive, codec=codec
+    )
+    failed_workers = []
+    for assign in assignments:
+        frame = ProtocolFrame(
+            type=MessageType.ASSIGN_LAYERS,
+            source="coordinator",
+            target=assign.worker_id,
+            payload=assign.model_dump(),
+        )
+        sent = await relay.send_to_worker(assign.worker_id, frame)
+        if not sent:
+            failed_workers.append(assign.worker_id)
+    if failed_workers:
+        logger.warning(f"Failed to deliver partition assignment to worker(s): {', '.join(failed_workers)}")
+    return assignments
+
+
+# ==========================================
 # WebSocket Worker Endpoint
 # ==========================================
 
@@ -248,6 +295,14 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
                 )
                 await relay.send_to_worker(worker_id, ack)
 
+                # Rebalance and assign pipeline stages across all alive workers immediately
+                try:
+                    target_model = registry.active_model or (reg.supported_models[0] if reg.supported_models else "gemma3:4b")
+                    await rebalance_and_assign_layers(target_model)
+                    logger.info(f"Rebalanced pipeline across {len(registry.get_alive_workers())} worker(s) on registration of '{worker_id}'")
+                except Exception as e:
+                    logger.warning(f"Auto-partition on registration of worker '{worker_id}' skipped/failed: {e}")
+
             elif not is_registered:
                 logger.warning(
                     f"Worker '{worker_id}' attempted to send '{frame.type}' before completing registration. Dropping frame."
@@ -277,10 +332,20 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
         logger.warning(f"Worker {worker_id} disconnected from WebSocket")
         relay.disconnect_worker(worker_id)
         registry.remove_worker(worker_id)
+        if registry.get_alive_workers():
+            try:
+                await rebalance_and_assign_layers(registry.active_model)
+            except Exception as e:
+                logger.warning(f"Auto-partition on worker disconnect failed: {e}")
     except Exception as e:
         logger.error(f"Error on worker {worker_id} connection: {e}")
         relay.disconnect_worker(worker_id)
         registry.remove_worker(worker_id)
+        if registry.get_alive_workers():
+            try:
+                await rebalance_and_assign_layers(registry.active_model)
+            except Exception as e:
+                logger.warning(f"Auto-partition on worker error failed: {e}")
 
 
 @app.websocket("/ws/worker")
@@ -354,22 +419,9 @@ async def trigger_partition(
 ):
     verify_admin_key(request)
     try:
-        assignments = registry.partition_model(
-            model_name, total_layers=total_layers, progressive=progressive, codec=codec
+        assignments = await rebalance_and_assign_layers(
+            model_name=model_name, total_layers=total_layers, progressive=progressive, codec=codec
         )
-        failed_workers = []
-        for assign in assignments:
-            frame = ProtocolFrame(
-                type=MessageType.ASSIGN_LAYERS,
-                source="coordinator",
-                target=assign.worker_id,
-                payload=assign.model_dump(),
-            )
-            sent = await relay.send_to_worker(assign.worker_id, frame)
-            if not sent:
-                failed_workers.append(assign.worker_id)
-        if failed_workers:
-            raise RuntimeError(f"Failed to deliver partition assignment to worker(s): {', '.join(failed_workers)}")
         return {"status": "success", "partitions": [a.model_dump() for a in assignments]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -393,6 +445,87 @@ async def trigger_pull(request: Request, model_name: str = "gemma3:4b"):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(pull_events(), media_type="text/event-stream")
+
+
+@app.delete("/admin/workers/{worker_id}")
+@app.post("/admin/workers/{worker_id}/remove")
+async def remove_worker_endpoint(request: Request, worker_id: str):
+    verify_admin_key(request)
+    alive_workers = registry.get_alive_workers()
+    target_node = next((w for w in alive_workers if w.worker_id == worker_id), None)
+    if not target_node and worker_id not in registry.workers:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Worker '{worker_id}' not found in active cluster.",
+        )
+
+    logger.info(f"Coordinator operator removing worker '{worker_id}' from cluster.")
+
+    # 1. Notify worker daemon to stop cleanly
+    notify_frame = ProtocolFrame(
+        type=MessageType.WORKER_REMOVED,
+        source="coordinator",
+        target=worker_id,
+        payload={"worker_id": worker_id, "reason": "Worker removed by coordinator operator"},
+    )
+    await relay.send_to_worker(worker_id, notify_frame)
+
+    # 2. Close active WebSocket connection if present
+    ws = relay.active_connections.get(worker_id)
+    if ws:
+        try:
+            await ws.close(code=1000, reason="Worker removed by coordinator operator")
+        except Exception:
+            pass
+
+    # 3. Disconnect from relay and remove from registry
+    relay.disconnect_worker(worker_id)
+    registry.remove_worker(worker_id)
+
+    # 4. Automatically rebalance remaining alive workers
+    remaining = registry.get_alive_workers()
+    rebalanced = False
+    if remaining:
+        try:
+            await rebalance_and_assign_layers(registry.active_model)
+            rebalanced = True
+        except Exception as e:
+            logger.warning(f"Rebalancing after removing worker '{worker_id}' failed: {e}")
+
+    return {
+        "status": "success",
+        "removed_worker": worker_id,
+        "remaining_workers": len(remaining),
+        "rebalanced": rebalanced,
+        "pipeline_stages": [w.worker_id for w in registry.get_pipeline_order()],
+    }
+
+
+@app.get("/admin/workers")
+async def list_admin_workers(request: Request):
+    verify_admin_key(request)
+    alive = registry.get_alive_workers()
+    pipeline = registry.get_pipeline_order()
+    return {
+        "status": "success",
+        "count": len(alive),
+        "workers": [
+            {
+                "worker_id": w.worker_id,
+                "gpu_name": w.gpu_name,
+                "device_type": w.device_type,
+                "total_vram_bytes": w.total_vram_bytes,
+                "free_vram_bytes": w.free_vram_bytes,
+                "assigned_layer_start": w.assigned_layer_start,
+                "assigned_layer_end": w.assigned_layer_end,
+                "is_first_stage": w.is_first_stage,
+                "is_last_stage": w.is_last_stage,
+                "is_alive": w.is_alive,
+            }
+            for w in alive
+        ],
+        "pipeline_stages": [w.worker_id for w in pipeline],
+    }
 
 
 # ==========================================
@@ -463,23 +596,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
     model_is_local = is_model_downloaded(target_model)
 
-    if model_is_local and (len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model)):
+    needs_partition = (
+        len(pipeline) < 1
+        or len(pipeline) != len(alive)
+        or any(w.assigned_layer_start is None for w in alive)
+        or (registry.active_model is not None and registry.active_model != target_model)
+        or (len(pipeline) > 0 and (pipeline[0].assigned_layer_start != 0 or pipeline[-1].assigned_layer_end < getattr(registry, "total_layers", 1)))
+    )
+
+    if model_is_local and needs_partition:
         if len(alive) >= 1:
             try:
-                meta = resolve_model_metadata(target_model)
-                resolved_layers = meta["total_layers"]
-                assignments = registry.partition_model(
-                    target_model, total_layers=resolved_layers, progressive=False, codec="zstd"
-                )
-                for assign in assignments:
-                    frame = ProtocolFrame(
-                        type=MessageType.ASSIGN_LAYERS,
-                        source="coordinator",
-                        target=assign.worker_id,
-                        payload=assign.model_dump(),
-                    )
-                    await relay.send_to_worker(assign.worker_id, frame)
-                await asyncio.sleep(0.1)
+                await rebalance_and_assign_layers(target_model)
+                await asyncio.sleep(0.05)
                 pipeline = registry.get_pipeline_order()
             except Exception as e:
                 logger.error(f"Cluster partition failed for model '{target_model}': {e}", exc_info=True)
@@ -515,24 +644,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     yield f"data: {json.dumps({'type': 'model_ready', 'model': canonical, 'stage': 'Model Ready: Loaded into GPU VRAM'})}\n\n"
 
                 # Re-check and partition cluster dynamically if needed
-                if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
-                    current_alive = registry.get_alive_workers()
+                current_alive = registry.get_alive_workers()
+                needs_partition_stream = (
+                    len(pipeline) < 1
+                    or len(pipeline) != len(current_alive)
+                    or any(w.assigned_layer_start is None for w in current_alive)
+                    or (registry.active_model is not None and registry.active_model != target_model)
+                    or (len(pipeline) > 0 and (pipeline[0].assigned_layer_start != 0 or pipeline[-1].assigned_layer_end < getattr(registry, "total_layers", 1)))
+                )
+                if needs_partition_stream:
                     if len(current_alive) >= 1:
                         try:
-                            meta = resolve_model_metadata(target_model)
-                            resolved_layers = meta["total_layers"]
-                            assignments = registry.partition_model(
-                                target_model, total_layers=resolved_layers, progressive=False, codec="zstd"
-                            )
-                            for assign in assignments:
-                                frame = ProtocolFrame(
-                                    type=MessageType.ASSIGN_LAYERS,
-                                    source="coordinator",
-                                    target=assign.worker_id,
-                                    payload=assign.model_dump(),
-                                )
-                                await relay.send_to_worker(assign.worker_id, frame)
-                            await asyncio.sleep(0.15)
+                            await rebalance_and_assign_layers(target_model)
+                            await asyncio.sleep(0.05)
                             pipeline = registry.get_pipeline_order()
                         except Exception as e:
                             logger.error(f"Dynamic partition failed: {e}", exc_info=True)
@@ -563,8 +687,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     return
 
                 # Single-node GPU acceleration path: when 1 worker or local node is active,
-                # use direct CUDA GPU streaming via Ollama for instant VRAM-accelerated inference.
-                if len(pipeline) <= 1:
+                # or when model architecture requires local engine (e.g. Gemma3), use direct CUDA streaming via Ollama.
+                from situs.worker.loader import is_architecture_supported
+                meta = resolve_model_metadata(target_model)
+                arch = meta.get("architecture") or meta.get("model_type")
+                arch_supported = is_architecture_supported(arch)
+
+                if len(pipeline) <= 1 or not arch_supported:
                     canonical = normalize_ollama_model(target_model)
                     ensure_ollama_running()
                     try:
@@ -792,7 +921,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             raise HTTPException(status_code=400, detail=f"Prompt tokenization failed: {e}")
 
         # Single-node GPU acceleration path: direct execution via local Ollama daemon
-        if len(pipeline) <= 1:
+        from situs.worker.loader import is_architecture_supported
+        meta = resolve_model_metadata(target_model)
+        arch = meta.get("architecture") or meta.get("model_type")
+        arch_supported = is_architecture_supported(arch)
+
+        if len(pipeline) <= 1 or not arch_supported:
             from situs.inference_backend import query_ollama
             direct_ans = await asyncio.to_thread(query_ollama, prompt, target_model)
             if direct_ans:
