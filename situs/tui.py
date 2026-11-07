@@ -20,7 +20,7 @@ import io
 import logging
 import datetime
 from urllib.parse import urlparse
-from typing import Optional, List, Dict, Tuple, Any, Callable
+from typing import Optional, List, Dict, Tuple, Any, Callable, Union
 
 # Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -67,7 +67,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.application import Application
 from prompt_toolkit.widgets import TextArea
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer, DynamicContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.layout import Layout
@@ -106,45 +106,47 @@ class ScrollableHistoryControl(FormattedTextControl):
 try:
     import torch
     HAS_TORCH = True
-except ImportError:
+except (ImportError, OSError, Exception):
     HAS_TORCH = False
 
 console = Console(legacy_windows=False)
 
 # Centered modern block logo for Situs
-RED_SITUS_LOGO = r"""
-  ▄██████    ███    █████████    ███   ███    ▄██████
-  ███        ███       ███       ███   ███    ███    
-  ███████    ███       ███       ███   ███    ███████
-      ███    ███       ███       ███   ███        ███
-  ██████▀    ███       ███       ▀███████▀    ██████▀
-""".strip()
+RED_SITUS_LOGO = (
+    "███████╗██╗████████╗██╗   ██╗███████╗\n"
+    "██╔════╝██║╚══██╔══╝██║   ██║██╔════╝\n"
+    "███████╗██║   ██║   ██║   ██║███████╗\n"
+    "╚════██║██║   ██║   ██║   ██║╚════██║\n"
+    "███████║██║   ██║   ╚██████╔╝███████║\n"
+    "╚══════╝╚═╝   ╚═╝    ╚═════╝ ╚══════╝"
+)
 
-TAGLINE_TEXT = "D I S T R I B U T E D   A I   C O M P U T E   F O R   E V E R Y O N E"
+TAGLINE_TEXT = "D I S T R I B U T E D   G P U   S W A R M   R U N T I M E"
 
-# Sleek Modern Dark-Slate Style Palette (Claude Code / OpenCode aesthetic)
+# High-Precision KiloCode Palette: Pitch Black (#000000) & Hot Pink (#ff2a85)
 TUI_STYLE = Style.from_dict({
-    "card.border": "#475569",              # Subtle slate-600 rounded box border
-    "card.border.active": "#38bdf8",       # Vibrant cyan active focus border
-    "prompt.bar": "#ef4444 bold",          # Situs signature red vertical focus bar
-    "prompt.text": "#f8fafc",              # Crisp modern white input text
-    "text-area": "#f8fafc",                # Crisp modern white typed text in input card
-    "text-area.cursor-line": "#f8fafc",
-    "placeholder": "#64748b italic",       # Muted slate placeholder text
-    "status.badge": "#38bdf8 bold",        # Cyan status tag
-    "status.text": "#94a3b8",              # Subtle slate status text
+    "": "bg:#000000 #e2e8f0",               # Pure pitch-black terminal canvas
+    "card.border": "#22101b",              # Subtle dark plum border
+    "card.border.active": "#ff2a85",       # Vibrant hot-pink active focus border
+    "prompt.bar": "#ff2a85 bold",          # Vertical hot-pink focus bar (Kilo style)
+    "prompt.text": "#ffffff",              # Crisp modern white input text
+    "text-area": "bg:#000000 #ffffff",     # Crisp modern white typed text in input card
+    "text-area.cursor-line": "#ffffff",
+    "placeholder": "#6b7280 italic",       # Muted placeholder text
+    "status.badge": "#ff2a85 bold",        # Pink status tag
+    "status.text": "#ff70a6",              # Soft rose status text
     "status.ready": "#22c55e bold",        # Vibrant green status indicator
     "status.waiting": "#f59e0b bold",      # Warm amber waiting indicator
-    "shortcuts": "#94a3b8",                # Subtle muted shortcuts text
-    "shortcuts.key": "#38bdf8 bold",       # Cyan shortcut keys
-    "bottom-toolbar": "bg:#0b0f19 #94a3b8",# Deep dark slate bottom bar
-    "bottom-toolbar.branch": "#ef4444 bold",
-    "bottom-toolbar.version": "#64748b",
-    "completion-menu": "bg:#0f172a #f8fafc",
-    "completion-menu.completion": "bg:#0f172a #94a3b8",
-    "completion-menu.completion.current": "bg:#1e293b #38bdf8 bold",
-    "completion-menu.meta": "bg:#0b0f19 #64748b italic",
-    "completion-menu.meta.current": "bg:#1e293b #93c5fd italic",
+    "shortcuts": "#6b7280",                # Subtle muted shortcuts text
+    "shortcuts.key": "#ff70a6 bold",       # Soft pink shortcut keys
+    "bottom-toolbar": "bg:#000000 #6b7280",# Pitch-black bottom bar
+    "bottom-toolbar.branch": "#ff2a85 bold",
+    "bottom-toolbar.version": "#ff70a6",
+    "completion-menu": "bg:#0b080e #ffffff",
+    "completion-menu.completion": "bg:#0b080e #ff70a6",
+    "completion-menu.completion.current": "bg:#2a1220 #ff2a85 bold",
+    "completion-menu.meta": "bg:#050508 #6b7280 italic",
+    "completion-menu.meta.current": "bg:#2a1220 #fda4af italic",
 })
 
 
@@ -168,12 +170,16 @@ _bg_workers: List[Any] = []
 
 class PlaceholderProcessor(Processor):
     """Renders dim placeholder text inside the prompt_toolkit TextArea only when buffer is empty."""
-    def __init__(self, placeholder_text: str):
+    def __init__(self, placeholder_text: Union[str, List[Tuple[str, str]], Callable[[], Any]]):
         self.placeholder_text = placeholder_text
 
     def apply_transformation(self, ti: TransformationInput) -> Transformation:
         if not ti.document.text:
-            return Transformation(to_formatted_text([("class:placeholder", self.placeholder_text)]))
+            val = self.placeholder_text() if callable(self.placeholder_text) else self.placeholder_text
+            if isinstance(val, list):
+                return Transformation(to_formatted_text(val))
+            elif isinstance(val, str):
+                return Transformation(to_formatted_text([("class:placeholder", val)]))
         return Transformation(ti.fragments)
 
 
@@ -327,13 +333,13 @@ def render_models_table() -> Table:
     """Renders a formatted table of curated distributed models (6GB to 16GB)."""
     table = Table(
         title="Curated Distributed Models (6GB - 16GB Multi-GPU Pipeline)",
-        border_style="cyan",
-        title_style="bold cyan"
+        border_style="#ff2a85",
+        title_style="bold #ff2a85"
     )
-    table.add_column("#", justify="center", style="bold yellow", width=3)
+    table.add_column("#", justify="center", style="bold #ff70a6", width=3)
     table.add_column("Model Name", style="bold white", width=32)
     table.add_column("VRAM", justify="right", style="green", width=9)
-    table.add_column("Params", justify="center", style="cyan", width=8)
+    table.add_column("Params", justify="center", style="#ff70a6", width=8)
     table.add_column("Layers", justify="center", style="magenta", width=7)
     table.add_column("Recommended Split", style="yellow", width=28)
     table.add_column("Description", style="white", width=40)
@@ -670,9 +676,9 @@ def detect_hardware_gpu(requested_device: Optional[str] = "auto") -> Tuple[str, 
 
 def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected GPU Worker Nodes") -> Table:
     """Renders a formatted table of connected GPU workers supporting all status schema variations."""
-    table = Table(title=title, border_style="bold white", title_style="bold cyan")
+    table = Table(title=title, border_style="bold #ff2a85", title_style="bold #ff2a85")
     table.add_column("Worker ID", style="bold white", width=16)
-    table.add_column("Pipeline Stage", style="cyan", width=20)
+    table.add_column("Pipeline Stage", style="bold #ff70a6", width=20)
     table.add_column("Hardware", style="yellow", width=34)
     table.add_column("Live VRAM", style="green", width=20)
     table.add_column("Residency", style="magenta", width=16)
@@ -724,8 +730,8 @@ def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
     """Renders a comprehensive live GPU VRAM telemetry monitor across all cluster nodes."""
     table = Table(
         title="Live GPU VRAM Monitor (Cluster Hardware & Memory Residency)",
-        border_style="bold cyan",
-        title_style="bold cyan",
+        border_style="bold #ff2a85",
+        title_style="bold #ff2a85",
     )
     table.add_column("Node ID", style="bold white", width=16)
     table.add_column("Physical GPU Device", style="bold yellow", width=34)
@@ -774,7 +780,7 @@ def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
     used_cluster = meta.get("used_vram_gb", 0.0)
     pct_cluster = meta.get("vram_usage_pct", 0.0)
     if tot_cluster > 0:
-        table.caption = f"[bold white]Pooled Cluster:[/bold white] [bold cyan]{used_cluster:.2f} GB[/bold cyan] used of [bold green]{tot_cluster:.2f} GB[/bold green] ({pct_cluster:.1f}%) · [bold green]100% GPU VRAM Exclusive (Zero Host RAM Offload)[/bold green]"
+        table.caption = f"[bold white]Pooled Cluster:[/bold white] [bold #ff70a6]{used_cluster:.2f} GB[/bold #ff70a6] used of [bold green]{tot_cluster:.2f} GB[/bold green] ({pct_cluster:.1f}%) · [bold green]100% GPU VRAM Exclusive (Zero Host RAM Offload)[/bold green]"
     return table
 
 
@@ -1025,11 +1031,11 @@ def prompt_in_centered_box(
     coord_status = cluster_meta.get("status", "offline")
 
     if workers_cnt > 0:
-        badge_html = f'<style color="#3b82f6"><b>Pipeline: {workers_cnt} Nodes</b></style> · <style color="#38bdf8"><b><u>{model_name}</u></b></style> <style color="#ffffff">({workers_cnt} GPU{"s" if workers_cnt > 1 else ""})</style> · <style color="#22c55e">● P2P Mesh Active</style>'
+        badge_html = f'<style color="#ff2a85"><b>Cluster</b></style> <style color="#ffffff"><b>{model_name}</b></style> <style color="#94a3b8">· {workers_cnt} Nodes Active ·</style> <style color="#22c55e">● P2P Mesh Active</style>'
     elif coord_status in ("healthy", "no_workers", "online"):
-        badge_html = f'<style color="#3b82f6"><b>Coordinator Online</b></style> · <style color="#38bdf8"><b><u>{model_name}</u></b></style> · <style color="#eab308">Waiting for Workers (/join)</style>'
+        badge_html = f'<style color="#ff2a85"><b>Cluster</b></style> <style color="#ffffff"><b>{model_name}</b></style> · <style color="#eab308">Waiting for Workers (/join)</style>'
     else:
-        badge_html = f'<style color="#ef4444"><b>Cluster Offline</b></style> · <style color="#38bdf8"><b><u>{model_name}</u></b></style> · <style color="#ffffff">Start with /coordinator</style>'
+        badge_html = f'<style color="#ff2a85"><b>Cluster</b></style> <style color="#ffffff"><b>{model_name}</b></style> · <style color="#6b7280">Offline (Start with /coordinator)</style>'
 
     status_line_html = "  " + badge_html
 
@@ -1070,10 +1076,10 @@ def prompt_in_centered_box(
     )
 
     shortcuts_html = (
-        "  <style color='#38bdf8'><b>tab</b></style> <style color='#ffffff'>nodes</style>   "
-        "<style color='#38bdf8'><b>ctrl+m</b></style> <style color='#ffffff'>models</style>   "
-        "<style color='#38bdf8'><b>/</b></style> <style color='#ffffff'>commands</style>   "
-        "<style color='#38bdf8'><b>ctrl+c</b></style> <style color='#ffffff'>exit</style>"
+        "  <style color='#ff70a6'><b>tab</b></style> <style color='#6b7280'>nodes</style>   "
+        "<style color='#ff70a6'><b>f2</b></style> <style color='#6b7280'>models</style>   "
+        "<style color='#ff70a6'><b>/</b></style> <style color='#6b7280'>commands</style>   "
+        "<style color='#6b7280'><b>ctrl+c</b> exit</style>"
     )
 
     shortcuts_view = VSplit([
@@ -1083,8 +1089,8 @@ def prompt_in_centered_box(
     ], height=1)
 
     footer_view = VSplit([
-        Window(content=FormattedTextControl(HTML(" <style color='#38bdf8'><b>SITUS DISTRIBUTED AI</b></style>"))),
-        Window(content=FormattedTextControl(HTML("<style color='#22c55e'>●</style> <style color='#ffffff'>Cluster v0.1.0</style> ")), align="RIGHT")
+        Window(content=FormattedTextControl(HTML(" <style color='#6b7280'>~/situs/cluster:HEAD</style>"))),
+        Window(content=FormattedTextControl(HTML(f"<style color='#22c55e'>●</style> <style color='#6b7280'>swarm active ({workers_cnt} nodes)</style> " if workers_cnt > 0 else "<style color='#6b7280'>local</style> ")), align="RIGHT")
     ], height=1)
 
     elements = []
@@ -1098,14 +1104,14 @@ def prompt_in_centered_box(
         logo_html_parts = []
         for l in logo_lines:
             pad_l = max(0, (cols - len(l)) // 2)
-            logo_html_parts.append((" " * pad_l) + f'<style color="#ef4444"><b>{l}</b></style>')
+            logo_html_parts.append((" " * pad_l) + f'<style color="#ff2a85"><b>{l}</b></style>')
         centered_logo_html = "\n".join(logo_html_parts)
         elements.append(Window(content=FormattedTextControl(HTML(centered_logo_html)), height=len(logo_lines)))
-        elements.append(Window(height=2))
+        elements.append(Window(height=1))
 
         # Centered tagline
         pad_tag = max(0, (cols - len(TAGLINE_TEXT)) // 2)
-        centered_tag_html = (" " * pad_tag) + f'<style color="#ffffff"><b>{TAGLINE_TEXT}</b></style>'
+        centered_tag_html = (" " * pad_tag) + f'<style color="#ff70a6"><b>{TAGLINE_TEXT}</b></style>'
         elements.append(Window(content=FormattedTextControl(HTML(centered_tag_html)), height=1))
         elements.append(Window(height=2))
     else:
@@ -1224,8 +1230,8 @@ def execute_slash_command(
         return True
 
     elif root_cmd in ("/help", "help", "?", "/", ""):
-        table = Table(title="Situs In-Interface Commands", border_style="cyan", title_style="bold cyan")
-        table.add_column("Command", style="bold cyan", width=24)
+        table = Table(title="Situs In-Interface Commands", border_style="#ff2a85", title_style="bold #ff2a85")
+        table.add_column("Command", style="bold #ff70a6", width=24)
         table.add_column("Description", style="white", width=55)
         for c, desc in OpenCodeSlashCompleter.COMMANDS:
             table.add_row(c, desc)
@@ -1235,30 +1241,30 @@ def execute_slash_command(
         # Custom Worker IDs Guide Panel
         worker_guide = Panel(
             "[bold white]Multi-Worker & Custom Worker ID Guide[/bold white]\n\n"
-            "[bold cyan]Why use Custom Worker IDs?[/bold cyan]\n"
+            "[bold #ff70a6]Why use Custom Worker IDs?[/bold #ff70a6]\n"
             "• Explicit worker IDs prevent node collisions and make cluster topology transparent.\n"
             "• [bold green]Connect two workers from the same laptop:[/bold green] Run Worker 1 on GPU ([bold yellow]cuda:0[/bold yellow]) "
             "and Worker 2 on CPU memory ([bold yellow]cpu[/bold yellow]) to pool system RAM and VRAM together!\n"
             "• If omitted, Situs auto-assigns collision-free IDs: [bold yellow]worker-<host>-1[/bold yellow], [bold yellow]worker-<host>-2[/bold yellow], etc.\n\n"
-            "[bold cyan]Commands inside this TUI Interface:[/bold cyan]\n"
+            "[bold #ff70a6]Commands inside this TUI Interface:[/bold #ff70a6]\n"
             "  [bold yellow]/join 127.0.0.1:8000 worker-1 cuda:0[/bold yellow]   (Connect local GPU worker)\n"
             "  [bold yellow]/join 127.0.0.1:8000 worker-2 cpu[/bold yellow]      (Connect second worker on CPU)\n"
             "  [bold yellow]/join 192.168.1.15:8000 laptop-2 cuda:0[/bold yellow] (Connect remote laptop over Wi-Fi)\n\n"
-            "[bold cyan]From an external PowerShell / Terminal (CLI):[/bold cyan]\n"
+            "[bold #ff70a6]From an external PowerShell / Terminal (CLI):[/bold #ff70a6]\n"
             "  [bold yellow]situs join http://127.0.0.1:8000 --worker-id worker-2 --device cpu[/bold yellow]\n"
             "  [bold yellow]situs join http://192.168.1.15:8000 --worker-id laptop-2-gpu --device cuda:0[/bold yellow]",
             title="Custom Worker IDs & Multi-Worker Setup",
-            border_style="green",
+            border_style="#ff2a85",
         )
         emit(worker_guide, "Worker ID Guide")
 
         # 6GB-10GB Model Guide Panel
         model_guide = Panel(
             "[bold white]Curated 6GB - 10GB Distributed Models[/bold white]\n\n"
-            "[bold cyan]The Sweet Spot for Multi-Node Consumer Laptops:[/bold cyan]\n"
+            "[bold #ff70a6]The Sweet Spot for Multi-Node Consumer Laptops:[/bold #ff70a6]\n"
             "Models in the 6GB–10GB range cannot fit standalone in single 6GB VRAM GPUs, but run with blazing "
             "throughput when pooled across 2+ laptops (or 1 GPU + 1 CPU node) using pipeline parallelism.\n\n"
-            "[bold cyan]Selection Commands:[/bold cyan]\n"
+            "[bold #ff70a6]Selection Commands:[/bold #ff70a6]\n"
             "  [bold yellow]/models[/bold yellow]             View full table of curated models with VRAM, parameter & split specs\n"
             "  [bold yellow]/model 1[/bold yellow]            Select [bold white]Llama 3.1 8B Instruct[/bold white] (Q8_0, 8.5 GB VRAM)\n"
             "  [bold yellow]/model 2[/bold yellow]            Select [bold white]Qwen 2.5 7B Instruct[/bold white] (Q8_0, 8.1 GB VRAM)\n"
@@ -1650,7 +1656,7 @@ def execute_slash_command(
     elif root_cmd in ("/network", "network", "/interfaces", "interfaces"):
         ifaces = get_all_interface_ips()
         coord_status = "ONLINE (Port 8000)" if is_port_open("127.0.0.1", 8000) else "OFFLINE"
-        table = Table(title="Network Interfaces & Cluster Reachability", border_style="cyan", title_style="bold cyan")
+        table = Table(title="Network Interfaces & Cluster Reachability", border_style="#ff2a85", title_style="bold #ff2a85")
         table.add_column("Interface", style="bold white", width=24)
         table.add_column("IPv4 Address", style="bold green", width=18)
         table.add_column("Scope / Reachability", style="yellow", width=36)
@@ -1728,7 +1734,7 @@ def execute_slash_command(
         emit(table, "Curated Multi-GPU Distributed Models")
         prompt_panel = Panel(
             "[bold white]To select a model to run on Situs:[/bold white]\n"
-            f"Type [bold cyan]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold cyan] or [bold cyan]/model <name>[/bold cyan]\n\n"
+            f"Type [bold #ff70a6]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold #ff70a6] or [bold #ff70a6]/model <name>[/bold #ff70a6]\n\n"
             "Examples:\n"
             "  [bold yellow]/model 1[/bold yellow]  ->  Llama 3.1 8B Instruct (Q8_0, 8.5 GB VRAM)\n"
             "  [bold yellow]/model 2[/bold yellow]  ->  Qwen 2.5 7B Instruct (Q8_0, 8.1 GB VRAM)\n"
@@ -1736,7 +1742,7 @@ def execute_slash_command(
             "  [bold yellow]/model 10[/bold yellow] ->  Qwen 2.5 14B Instruct (15.2 GB VRAM · 15GB model)\n"
             "  [bold yellow]/model 11[/bold yellow] ->  DeepSeek R1 Distill 14B (14.9 GB VRAM · 15GB model)",
             title="Model Selection",
-            border_style="cyan",
+            border_style="#ff2a85",
         )
         emit(prompt_panel, "Select Model")
         return True
@@ -1748,30 +1754,30 @@ def execute_slash_command(
             if not session_state.get("is_coordinator", True):
                 hint_line = "[italic #94a3b8]Model is synchronized with Coordinator node.[/italic #94a3b8]"
             else:
-                hint_line = f"[white]Type [bold cyan]/models[/bold cyan] to view all {len(DISTRIBUTED_MODELS_6GB_10GB)} models, or [bold cyan]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold cyan] to switch.[/white]"
+                hint_line = f"[white]Type [bold #ff70a6]/models[/bold #ff70a6] to view all {len(DISTRIBUTED_MODELS_6GB_10GB)} models, or [bold #ff70a6]/model <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold #ff70a6] to switch.[/white]"
             if matched:
                 model_panel = Panel(
                     f"[bold white]Active Distributed Model:[/bold white] [bold green]{matched['name']}[/bold green] ({matched['id']})\n"
-                    f"[bold cyan]• VRAM Footprint:[/bold cyan]     {matched['vram_gb']} GB\n"
-                    f"[bold cyan]• Parameter Count:[/bold cyan]    {matched['params']}\n"
-                    f"[bold cyan]• Transformer Layers:[/bold cyan] {matched['layers']}\n"
-                    f"[bold cyan]• Context Window:[/bold cyan]     {matched['context']}\n"
-                    f"[bold cyan]• Recommended Split:[/bold cyan]  {matched['recommended_split']}\n"
-                    f"[bold cyan]• Description:[/bold cyan]        {matched['desc']}\n\n"
+                    f"[bold #ff70a6]• VRAM Footprint:[/bold #ff70a6]     {matched['vram_gb']} GB\n"
+                    f"[bold #ff70a6]• Parameter Count:[/bold #ff70a6]    {matched['params']}\n"
+                    f"[bold #ff70a6]• Transformer Layers:[/bold #ff70a6] {matched['layers']}\n"
+                    f"[bold #ff70a6]• Context Window:[/bold #ff70a6]     {matched['context']}\n"
+                    f"[bold #ff70a6]• Recommended Split:[/bold #ff70a6]  {matched['recommended_split']}\n"
+                    f"[bold #ff70a6]• Description:[/bold #ff70a6]        {matched['desc']}\n\n"
                     f"{hint_line}",
                     title="Active Model Status",
-                    border_style="cyan"
+                    border_style="#ff2a85"
                 )
             else:
                 model_panel = Panel(
                     f"[bold white]Active Model:[/bold white] {curr_model}\n"
-                    f"[bold cyan]• Quantization:[/bold cyan] Q8_0 (~4.0 GB weight VRAM)\n"
-                    f"[bold cyan]• Layers:[/bold cyan] 32 Transformer Blocks\n"
-                    f"[bold cyan]• Hidden Size:[/bold cyan] 2048\n"
-                    f"[bold cyan]• Architecture:[/bold cyan] Decoder-only Causal LM with Pipeline Parallelism\n\n"
+                    f"[bold #ff70a6]• Quantization:[/bold #ff70a6] Q8_0 (~4.0 GB weight VRAM)\n"
+                    f"[bold #ff70a6]• Layers:[/bold #ff70a6] 32 Transformer Blocks\n"
+                    f"[bold #ff70a6]• Hidden Size:[/bold #ff70a6] 2048\n"
+                    f"[bold #ff70a6]• Architecture:[/bold #ff70a6] Decoder-only Causal LM with Pipeline Parallelism\n\n"
                     f"{hint_line}",
                     title="Active Model Status",
-                    border_style="cyan"
+                    border_style="#ff2a85"
                 )
             emit(model_panel, "Active Model")
             return True
@@ -1999,6 +2005,8 @@ def run_opencode_tui(
     # State tracking
     is_init_coord = (_bg_coordinator_server is not None or "127.0.0.1" in coordinator_url or "localhost" in coordinator_url)
     session_state: Dict[str, Any] = {
+        "active_screen": "startup",
+        "last_query": "",
         "speculative": True,
         "p2p": True,
         "system_prompt": system_prompt,
@@ -2035,33 +2043,26 @@ def run_opencode_tui(
     # History entries: list of (role, text_content, meta_str)
     history_entries: List[Tuple[str, str, str]] = []
 
-    def make_hero_banner() -> str:
-        lines = []
-        lines.append("")
-        for l in RED_SITUS_LOGO.splitlines():
-            lines.append(f'<style color="#ef4444"><b>{html.escape(l)}</b></style>')
-        lines.append("")
-        lines.append(f'<style color="#f8fafc"><b>{html.escape(TAGLINE_TEXT)}</b></style>\n')
-        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/coordinator</b></style>  Start background cluster coordinator &amp; WebSocket relay</style>')
-        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/join &lt;IP&gt;:8000 [id] [dev]</b></style>  Connect local GPU or remote laptop</style>')
-        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/models</b></style>       View curated distributed models (/model &lt;1-8&gt;)</style>')
-        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/status</b></style>       Show active GPUs, VRAM allocations &amp; pipeline stages</style>')
-        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/nodes</b></style>        Inspect worker nodes &amp; WebRTC direct transport</style>')
-        lines.append('<style color="#94a3b8">• <style color="#38bdf8"><b>/help</b></style>         View all commands &amp; worker guides</style>\n')
-        return "\n".join(lines)
-
-    history_entries.append(("hero", make_hero_banner(), ""))
+    def get_dynamic_placeholder() -> Any:
+        if session_state.get("active_screen", "startup") == "startup":
+            return [
+                ("#cbd5e1", "Ask anything... "),
+                ("#64748b italic", '"What is the tech stack of this cluster?"'),
+            ]
+        return [
+            ("class:placeholder", "Ask anything or type / for commands..."),
+        ]
 
     # Completer & Input TextArea (Clean modern prompt, crisp readable text)
     completer = OpenCodeSlashCompleter()
     input_box = TextArea(
         multiline=True,
-        prompt=[("class:prompt.bar", " ❯ ")],
+        prompt=[("class:prompt.bar", "▌ ")],
         completer=completer,
         complete_while_typing=True,
         history=session_history,
         style="class:text-area",
-        input_processors=[PlaceholderProcessor("Ask anything or type / for commands...")],
+        input_processors=[PlaceholderProcessor(get_dynamic_placeholder)],
     )
 
     app_instance: List[Optional[Application]] = [None]
@@ -2177,7 +2178,8 @@ def run_opencode_tui(
         cached_history_len[0] = 0
         if renderable is None and title == "CLEAR":
             history_entries.clear()
-            history_entries.append(("hero", make_hero_banner(), ""))
+            session_state["active_screen"] = "startup"
+            session_state["last_query"] = ""
             cached_history_frags.clear()
             cached_history_len[0] = 0
             cached_history_ver[0] = -1
@@ -2186,6 +2188,10 @@ def run_opencode_tui(
             if app_instance[0]:
                 app_instance[0].invalidate()
             return
+
+        session_state["active_screen"] = "active"
+        if title:
+            session_state["last_query"] = title
 
         if isinstance(renderable, str):
             if "\x1b[" in renderable:
@@ -2237,36 +2243,36 @@ def run_opencode_tui(
             frags.append(("", "\n"))
         elif role == "user":
             user_html = (
-                f'<style color="#38bdf8"><b>❯</b></style> <style color="#f8fafc"><b>{html.escape(text)}</b></style>\n'
-                f'<style color="#64748b">  {html.escape(meta)}</style>\n\n'
+                f'<style color="#ff2a85"><b>❯</b></style> <style color="#ffffff"><b>{html.escape(text)}</b></style>\n'
+                f'<style color="#ff70a6">  {html.escape(meta)}</style>\n\n'
             )
             frags.extend(to_formatted_text(HTML(user_html)))
         elif role == "assistant":
-            asst_html = f'<style color="#f8fafc">{html.escape(text)}</style>\n\n'
+            asst_html = f'<style color="#e2e8f0">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(asst_html)))
         elif role == "loading":
             lines = text.strip().split("\n")
             content_html = ""
             for l in lines:
-                content_html += f'<style color="#475569"><b>│</b></style> <style color="#94a3b8">{html.escape(l)}</style>\n'
+                content_html += f'<style color="#2b1420"><b>│</b></style> <style color="#ff70a6">{html.escape(l)}</style>\n'
             tag = f" ({html.escape(meta)})" if meta else ""
             load_html = (
-                f'<style color="#38bdf8"><b>╭─ [Online Model Streaming]</b></style><style color="#94a3b8"><b>{tag}</b></style>\n'
+                f'<style color="#ff2a85"><b>╭─ [Online Model Streaming]</b></style><style color="#ff70a6"><b>{tag}</b></style>\n'
                 f'{content_html}'
-                f'<style color="#475569"><b>╰──────────────────────────────────────────────────────────</b></style>\n\n'
+                f'<style color="#2b1420"><b>╰──────────────────────────────────────────────────────────</b></style>\n\n'
             )
             try:
                 frags.extend(to_formatted_text(HTML(load_html)))
             except Exception:
                 frags.append(("", f"[{meta}] {text}\n\n"))
         elif role == "metric":
-            metric_html = f'<style color="#64748b">{html.escape(text)}</style>\n\n'
+            metric_html = f'<style color="#ff70a6">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(metric_html)))
         elif role == "system":
             if "\x1b[" in text:
                 frags.extend(to_formatted_text(ANSI(text + "\n\n")))
             else:
-                sys_html = f'<style color="#94a3b8">{html.escape(text)}</style>\n\n'
+                sys_html = f'<style color="#ff70a6">{html.escape(text)}</style>\n\n'
                 frags.extend(to_formatted_text(HTML(sys_html)))
         return frags
 
@@ -2364,8 +2370,8 @@ def run_opencode_tui(
             s_tps = session_state.get("stream_tps", 0.0)
             telemetry = f" ({s_tok} tok · {s_tps:.1f} tok/s)" if s_tok > 0 else " (connecting pipeline...)"
             if interrupt_armed[0]:
-                return to_formatted_text(HTML(f'  <style color="#ef4444"><b>● Press Esc again to cancel!</b></style> <style color="#94a3b8">{telemetry}</style>'))
-            return to_formatted_text(HTML(f'  <style color="#38bdf8"><b>● Inferencing...</b></style> <style color="#94a3b8">{telemetry} (esc to stop)</style>'))
+                return to_formatted_text(HTML(f'  <style color="#ff2a85"><b>● Press Esc again to cancel!</b></style> <style color="#94a3b8">{telemetry}</style>'))
+            return to_formatted_text(HTML(f'  <style color="#ff70a6"><b>● Inferencing...</b></style> <style color="#94a3b8">{telemetry} (esc to stop)</style>'))
 
         workers_cnt = session_state.get("workers_count", 0)
         curr_m = session_state.get("model", model)
@@ -2381,39 +2387,41 @@ def run_opencode_tui(
 
         tot_v = session_state.get("total_vram_gb", 0.0)
         used_v = session_state.get("used_vram_gb", 0.0)
-        vram_badge = f" · VRAM: {used_v:.1f}/{tot_v:.1f} GB" if tot_v > 0 else ""
+        vram_badge = f" ({used_v:.1f}/{tot_v:.1f} GB)" if tot_v > 0 else ""
+
+        cols = _get_active_columns()
+        trans_lbl = "WebRTC P2P" if session_state.get("p2p", True) else "Relay WS"
+
+        badge_text = "  Cluster"
+        badge_style = "bold #ff2a85"
 
         if workers_cnt > 0:
-            badge_text = f"  [Pipeline: {workers_cnt} Nodes]"
-            badge_style = "bold #38bdf8"
-            stat_text = f" · ● P2P Mesh Active{vram_badge}"
-            stat_style = "bold #22c55e"
+            if cols >= 90:
+                stat_text = f" · {workers_cnt} Nodes Active{vram_badge} · {trans_lbl}"
+            else:
+                stat_text = f" · {workers_cnt} Nodes{vram_badge} · {trans_lbl}"
+            stat_style = "#94a3b8"
         elif c_status in ("healthy", "online", "no_workers"):
-            badge_text = "  [Coordinator Online]"
-            badge_style = "bold #38bdf8"
-            stat_text = " · Waiting for Workers (/join)"
+            stat_text = " · Waiting for Workers (/join)" if cols >= 82 else " · Waiting (/join)"
             stat_style = "bold #f59e0b"
         else:
-            badge_text = "  [Cluster Offline]"
-            badge_style = "bold #ef4444"
-            stat_text = " · Start with /coordinator"
+            stat_text = " · Offline (Start with /coordinator)" if cols >= 85 else " · Offline (/coordinator)"
             stat_style = "#94a3b8"
 
         is_coord = session_state.get("is_coordinator", True)
         if is_coord:
             model_parts = [
-                ("bold underline #38bdf8", f"{disp_name}", on_model_click),
-                ("bold #38bdf8", " [switch ▾]", on_model_click),
+                ("bold #ffffff", f" {disp_name}", on_model_click),
+                ("bold #ff70a6", " [switch ▾] ", on_model_click),
             ]
         else:
             model_parts = [
-                ("bold #38bdf8", f"{disp_name}"),
-                ("bold #64748b", " [Synced]"),
+                ("bold #ffffff", f" {disp_name}"),
+                ("bold #64748b", " [Synced] "),
             ]
 
         return [
             (badge_style, badge_text),
-            ("", " · "),
             *model_parts,
             (stat_style, stat_text),
         ]
@@ -2426,12 +2434,6 @@ def run_opencode_tui(
         Window(height=1),
     ])
 
-    card_box = HSplit([
-        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1),
-        VSplit([Window(width=1, char="│", style="class:card.border"), card_inner, Window(width=1, char="│", style="class:card.border")]),
-        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1),
-    ], height=7)
-
     def get_shortcuts_formatted():
         is_gen = session_state.get("is_generating", False)
         if not auto_scroll_locked[0] and is_gen:
@@ -2440,25 +2442,20 @@ def run_opencode_tui(
                 '<style color="#94a3b8">· press <b>End</b> to follow</style>'
             ))
         is_coord = session_state.get("is_coordinator", True)
-        f2_part = '<style color="#38bdf8"><b>f2</b></style> <style color="#94a3b8">models</style>   ' if is_coord else ''
+        f2_part = '<style color="#ff70a6"><b>f2</b></style> <style color="#6b7280">models</style>   ' if is_coord else ''
         return to_formatted_text(HTML(
-            f'  <style color="#38bdf8"><b>tab</b></style> <style color="#94a3b8">nodes</style>   '
+            f'  <style color="#475569">········</style> <style color="#64748b">esc</style> <style color="#475569">interrupt</style>   '
+            f'<style color="#ff70a6"><b>tab</b></style> <style color="#6b7280">nodes</style>   '
             f'{f2_part}'
-            f'<style color="#38bdf8"><b>/</b></style> <style color="#94a3b8">commands</style>   '
-            f'<style color="#38bdf8"><b>pgup/dn</b></style> <style color="#94a3b8">scroll</style>   '
-            f'<style color="#38bdf8"><b>ctrl+c</b></style> <style color="#94a3b8">exit</style>'
+            f'<style color="#ff70a6"><b>/</b></style> <style color="#6b7280">commands</style>   '
+            f'<style color="#64748b"><b>pgup/dn</b></style> <style color="#475569">scroll</style>   '
+            f'<style color="#64748b"><b>ctrl+c</b></style> <style color="#475569">exit</style>'
         ))
 
     shortcuts_line = Window(
         content=FormattedTextControl(get_shortcuts_formatted),
         height=1,
     )
-
-    left_pane = HSplit([
-        history_win,
-        card_box,
-        shortcuts_line,
-    ])
 
     def show_temporary_notice(text: str, duration: float = 2.5) -> None:
         history_entries.append(("info", f"[bold yellow]Notice:[/bold yellow] {text}", ""))
@@ -2511,9 +2508,6 @@ def run_opencode_tui(
 
     def get_sidebar_fragments() -> Any:
         frags = []
-        frags.append(("bold #38bdf8", "SITUS SWARM\n"))
-        frags.append(("#94a3b8", f"{session_start_iso}\n\n"))
-
         # Zero I/O on render thread: read directly from state updated by background daemon
         w_cnt = session_state.get("workers_count", 0)
         c_stat = session_state.get("coord_status", "offline")
@@ -2522,13 +2516,18 @@ def run_opencode_tui(
         used_cluster_vram = session_state.get("used_vram_gb", 0.0)
         pct_cluster = session_state.get("vram_usage_pct", 0.0)
 
-        frags.append(("bold #f8fafc", "Cluster View\n"))
+        # SECTION 1: CLUSTER POOL
+        frags.append(("bold #ffffff", "CLUSTER POOL\n"))
         if w_cnt > 0:
             frags.append(("bold #22c55e", f"● {w_cnt} GPUs Active\n"))
-            frags.append(("#f8fafc", f"Pipeline: {w_cnt} Stages\n"))
             if total_cluster_vram > 0:
-                frags.append(("#94a3b8", f"Pooled VRAM: {used_cluster_vram:.1f}/{total_cluster_vram:.1f} GB ({pct_cluster:.0f}%)\n"))
-                frags.append(("#94a3b8", f"Free VRAM: {free_cluster_vram:.1f} GB (GPU Pure)\n"))
+                frags.append(("#94a3b8", "Pooled VRAM: "))
+                frags.append(("bold #ffffff", f"{used_cluster_vram:.1f}/{total_cluster_vram:.1f} GB "))
+                frags.append(("bold #ff70a6", f"({pct_cluster:.0f}%)\n"))
+                bar = make_progress_bar(pct_cluster, width=16)
+                frags.append(("bold #ff2a85", f"{bar}\n"))
+                frags.append(("#94a3b8", "Available Free: "))
+                frags.append(("bold #22c55e", f"{free_cluster_vram:.1f} GB (GPU Pure)\n"))
             else:
                 vram_str = session_state.get("vram_desc", f"{total_cluster_vram:.1f} GB")
                 frags.append(("#94a3b8", f"VRAM: {vram_str}\n"))
@@ -2543,9 +2542,11 @@ def run_opencode_tui(
             vram_str = session_state.get("vram_desc", "0.0 GB")
             frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
-        frags.append(("#94a3b8", f"{trans_name}\n"))
-        frags.append(("#64748b", "Wire: Zstd Wire Decoupled\n\n"))
+        frags.append(("#94a3b8", "Interconnect: "))
+        frags.append(("#e2e8f0", f"{trans_name}\n"))
+        frags.append(("#2a1220", "────────────────────────────────────\n\n"))
 
+        # SECTION 2: ACTIVE MODEL
         is_coord = session_state.get("is_coordinator", True)
 
         def on_sidebar_model_click(mouse_event: MouseEvent) -> Any:
@@ -2557,25 +2558,32 @@ def run_opencode_tui(
                 return None
             return NotImplemented
 
-        frags.append(("bold #f8fafc", "Model View\n"))
+        frags.append(("bold #ffffff", "ACTIVE MODEL  "))
+        if is_coord:
+            frags.append(("bold underline #ff2a85", "[F2 Switch]\n", on_sidebar_model_click))
+        else:
+            frags.append(("italic #64748b", "[Coordinator]\n"))
+
         curr_m = session_state.get("model", model)
         m_info = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == curr_m.lower() or m["name"].lower() == curr_m.lower() or curr_m.lower().startswith(m["id"].split(":")[0])), None)
         if m_info:
             disp_title = m_info["name"] if len(m_info["name"]) <= 32 else m_info["name"][:30] + ".."
             if is_coord:
-                frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
+                frags.append(("bold #ff70a6", f"{disp_title}\n", on_sidebar_model_click))
             else:
-                frags.append(("bold #38bdf8", f"{disp_title}\n"))
-            frags.append(("#94a3b8", f"{m_info['params']} · {m_info['layers']} Layers\n"))
-            frags.append(("#94a3b8", f"VRAM: {m_info['vram_gb']} GB\n"))
-            frags.append(("#64748b", f"{m_info['recommended_split']}\n"))
+                frags.append(("bold #ff70a6", f"{disp_title}\n"))
+            frags.append(("#94a3b8", "Configuration: "))
+            frags.append(("#e2e8f0", f"{m_info['params']} · {m_info['layers']} Layers\n"))
+            frags.append(("#94a3b8", "Model VRAM: "))
+            frags.append(("bold #ffffff", f"{m_info['vram_gb']} GB\n"))
         else:
             disp_title = curr_m if len(curr_m) <= 32 else curr_m[:30] + ".."
             if is_coord:
-                frags.append(("bold underline #38bdf8", f"{disp_title}\n", on_sidebar_model_click))
+                frags.append(("bold #ff70a6", f"{disp_title}\n", on_sidebar_model_click))
             else:
-                frags.append(("bold #38bdf8", f"{disp_title}\n"))
-            frags.append(("#94a3b8", "32 Layers · FP16/INT8\n"))
+                frags.append(("bold #ff70a6", f"{disp_title}\n"))
+            frags.append(("#94a3b8", "Configuration: "))
+            frags.append(("#e2e8f0", "32 Layers · FP16/INT8\n"))
 
         if session_state.get("is_pulling"):
             pull_pct = session_state.get("pull_percent", 0.0)
@@ -2587,19 +2595,21 @@ def run_opencode_tui(
                 frags.append(("#94a3b8", f"{pull_speed}\n"))
 
         spec_text = "Speculative" if session_state.get("speculative", True) else "Disabled"
-        frags.append(("#ffffff", f"Accel: {spec_text}\n\n"))
-        if is_coord:
-            frags.append(("bold underline #38bdf8", "[Click Model or F2 to Switch]\n\n", on_sidebar_model_click))
-        else:
-            frags.append(("italic #94a3b8", "[Managed by Coordinator]\n\n"))
+        frags.append(("#94a3b8", "Acceleration: "))
+        frags.append(("bold #22c55e", f"{spec_text}\n"))
+        frags.append(("#2a1220", "────────────────────────────────────\n\n"))
 
-        # Live Cluster Nodes & Assigned Pipeline Stages
-        frags.append(("bold #f8fafc", "Active Nodes & Stages\n"))
-        frags.append(("#475569", "────────────────────────────────────\n"))
+        # SECTION 3: WORKER NODES & STAGES
         workers = session_state.get("cluster_workers", [])
+        w_sub = f"{len(workers)} Stages" if workers else ""
+        frags.append(("bold #ffffff", "Active Nodes & Stages"))
+        if w_sub:
+            frags.append(("#6b7280", f"  {w_sub}"))
+        frags.append(("", "\n"))
+        frags.append(("#2a1220", "────────────────────────────────────\n"))
         if not workers:
             frags.append(("#94a3b8", " No workers connected\n"))
-            frags.append(("#64748b", " Run /join to pool GPUs\n\n"))
+            frags.append(("#6b7280", " Run /join to pool GPUs\n\n"))
         else:
             for w in workers:
                 w_id = str(w.get("worker_id") or w.get("id") or "worker")
@@ -2645,11 +2655,11 @@ def run_opencode_tui(
                             return NotImplemented
                         return on_remove_click
 
-                    frags.append(("bold #ef4444 underline", "[✕ Remove]", make_remove_cb(w_id)))
+                    frags.append(("bold #ff2a85 underline", "[✕ Remove]", make_remove_cb(w_id)))
                 frags.append(("", "\n"))
 
                 # Line 2: stage + vram
-                stage_color = "#38bdf8" if "Unassigned" not in stage_str else "#eab308"
+                stage_color = "bold #ff70a6" if "Unassigned" not in stage_str else "#eab308"
                 frags.append((stage_color, f"  {stage_str}"))
                 if vram_str:
                     frags.append(("#94a3b8", f" · {vram_str}\n"))
@@ -2663,9 +2673,9 @@ def run_opencode_tui(
 
     def get_sidebar_footer() -> Any:
         return [
-            ("bold #38bdf8", "SITUS DISTRIBUTED\n"),
-            ("bold #22c55e", "● "),
-            ("#ffffff", "GPU Pooling v0.1.0\n"),
+            ("bold #ffffff", "SITUS DISTRIBUTED\n"),
+            ("bold #ff2a85", "● "),
+            ("#6b7280", "GPU Pooling v0.1.0\n"),
         ]
 
     sidebar_pane = HSplit([
@@ -2674,16 +2684,170 @@ def run_opencode_tui(
         Window(content=FormattedTextControl(get_sidebar_footer), height=2, wrap_lines=True),
     ], width=38)
 
-    # Condition: show sidebar on wide screens (>= 85 columns)
-    is_wide = Condition(lambda: shutil.get_terminal_size().columns >= 85)
+    def _get_active_columns():
+        if app_instance[0] and hasattr(app_instance[0], "output") and app_instance[0].output:
+            try:
+                return app_instance[0].output.get_size().columns
+            except Exception:
+                pass
+        return shutil.get_terminal_size().columns
+
+    # Condition: show sidebar on standard and wide screens (>= 80 columns)
+    is_wide = Condition(lambda: _get_active_columns() >= 80)
     divider = ConditionalContainer(content=Window(width=1, char="│", style="class:card.border"), filter=is_wide)
     sidebar_cond = ConditionalContainer(content=sidebar_pane, filter=is_wide)
 
-    main_split = VSplit([
-        left_pane,
+    # ── Screen 1 (Startup Screen): Exact Kilo CLI 1:1 Clean Centered Layout ─────────
+    def get_centered_logo():
+        cols = _get_active_columns()
+        logo_lines = RED_SITUS_LOGO.strip().splitlines()
+        res = []
+        for l in logo_lines:
+            pad = max(0, (cols - len(l)) // 2)
+            res.append(("", " " * pad))
+            res.append(("bold #ff2a85", l + "\n"))
+        return res
+
+    def get_centered_tagline():
+        cols = _get_active_columns()
+        pad = max(0, (cols - len(TAGLINE_TEXT)) // 2)
+        return [
+            ("", " " * pad),
+            ("bold #ff70a6", TAGLINE_TEXT),
+        ]
+
+    def get_startup_shortcuts_formatted():
+        is_coord = session_state.get("is_coordinator", True)
+        f2_part = '<style color="#ff70a6"><b>f2</b></style> <style color="#6b7280">models</style>   ' if is_coord else ''
+        return to_formatted_text(HTML(
+            f'<style color="#ff70a6"><b>tab</b></style> <style color="#6b7280">nodes</style>   '
+            f'{f2_part}'
+            f'<style color="#ff70a6"><b>/</b></style> <style color="#6b7280">commands</style>'
+        ))
+
+    def _get_responsive_card_dim() -> D:
+        cols = _get_active_columns()
+        if cols >= 88:
+            target = max(86, min(112, int(cols * 0.70)))
+        else:
+            target = max(40, cols - 4)
+        return D(min=min(target, 76), max=target, preferred=target)
+
+    def get_bottom_bar_left():
+        return to_formatted_text(HTML(" <style color='#64748b'>~/situs/cluster:HEAD</style>"))
+
+    def get_bottom_bar_right():
+        w_cnt = session_state.get("workers_count", 0)
+        if w_cnt > 0:
+            return to_formatted_text(HTML(f"<style color='#22c55e'>●</style> <style color='#94a3b8'>swarm active ({w_cnt} nodes)</style> "))
+        return to_formatted_text(HTML("<style color='#64748b'>local</style> "))
+
+    startup_card_box = HSplit([
+        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1),
+        VSplit([Window(width=1, char="│", style="class:card.border"), card_inner, Window(width=1, char="│", style="class:card.border")]),
+        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1),
+    ], width=_get_responsive_card_dim, height=7)
+
+    startup_card_row = VSplit([
+        Window(width=D()),
+        startup_card_box,
+        Window(width=D()),
+    ], height=7)
+
+    startup_shortcuts_line = VSplit([
+        Window(width=D()),
+        Window(content=FormattedTextControl(get_startup_shortcuts_formatted), width=_get_responsive_card_dim, align="RIGHT"),
+        Window(width=D()),
+    ], height=1)
+
+    startup_bottom_bar = VSplit([
+        Window(content=FormattedTextControl(get_bottom_bar_left), height=1),
+        Window(content=FormattedTextControl(get_bottom_bar_right), height=1, align="RIGHT"),
+    ], height=1)
+
+    startup_view = HSplit([
+        Window(height=D(min=0, weight=1)),
+        Window(content=FormattedTextControl(get_centered_logo), height=len(RED_SITUS_LOGO.strip().splitlines())),
+        Window(height=1),
+        Window(content=FormattedTextControl(get_centered_tagline), height=1),
+        Window(height=1),
+        startup_card_row,
+        Window(height=1),
+        startup_shortcuts_line,
+        Window(height=D(min=0, weight=1.2)),
+        startup_bottom_bar,
+    ])
+
+    # ── Screen 2 (Active Screen): Top Session Bar + Dual-Pane Workspace ─────────
+    def get_top_session_bar_left():
+        last_q = session_state.get("last_query", "")
+        if not last_q:
+            last_q = "Cluster Session"
+        if len(last_q) > 42:
+            last_q = last_q[:40] + ".."
+        return to_formatted_text(HTML(f" <style color='#ff2a85'><b>#</b></style> <style color='#ffffff'><b>{html.escape(last_q)}</b></style>"))
+
+    def get_top_session_bar_right():
+        s_tok = session_state.get("stream_tokens", 0)
+        s_tps = session_state.get("stream_tps", 0.0)
+        tot_tok = session_state.get("tokens", 0)
+        tot_tps = session_state.get("speed", 0.0)
+        disp_tok = s_tok if s_tok > 0 else tot_tok
+        disp_tps = s_tps if s_tps > 0 else tot_tps
+
+        used_v = session_state.get("used_vram_gb", 0.0)
+        tot_v = session_state.get("total_vram_gb", 0.0)
+        pct_v = session_state.get("vram_usage_pct", 0.0)
+        vram_str = f"{used_v:.1f}/{tot_v:.1f} GB ({pct_v:.0f}%)" if tot_v > 0 else "0.0 GB"
+        trans = "p2p direct" if session_state.get("p2p", True) else "relay ws"
+
+        tok_part = f"<style color='#ffffff'><b>{disp_tok} tok</b></style>" if disp_tok > 0 else "<style color='#64748b'>ready</style>"
+        tps_part = f"<style color='#ff70a6'><b>{disp_tps:.1f} t/s</b></style>" if disp_tps > 0 else ""
+        dot = "<style color='#475569'>·</style>"
+
+        parts = [tok_part]
+        if tps_part:
+            parts.extend([dot, tps_part])
+        parts.extend([dot, f"<style color='#94a3b8'>{vram_str}</style>", dot, f"<style color='#22c55e'>{trans}</style> "])
+        return to_formatted_text(HTML(" ".join(parts)))
+
+    top_session_bar = VSplit([
+        Window(content=FormattedTextControl(get_top_session_bar_left), height=1),
+        Window(content=FormattedTextControl(get_top_session_bar_right), height=1, align="RIGHT"),
+    ], height=1)
+
+    top_session_sep = Window(height=1, char="─", style="class:card.border")
+
+    active_card_box = HSplit([
+        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1),
+        VSplit([Window(width=1, char="│", style="class:card.border"), card_inner, Window(width=1, char="│", style="class:card.border")]),
+        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1),
+    ], height=7)
+
+    active_left_pane = HSplit([
+        history_win,
+        active_card_box,
+        shortcuts_line,
+    ])
+
+    active_main_split = VSplit([
+        active_left_pane,
         divider,
         sidebar_cond,
     ])
+
+    active_view = HSplit([
+        top_session_bar,
+        top_session_sep,
+        active_main_split,
+    ])
+
+    def get_current_main_view():
+        if session_state.get("active_screen", "startup") == "startup":
+            return startup_view
+        return active_view
+
+    main_container = DynamicContainer(get_current_main_view)
 
     # Interactive Model Selection Dropdown Popup
     def get_model_menu_fragments():
@@ -2709,8 +2873,8 @@ def run_opencode_tui(
         # Header (82 cols total)
         header_title = "╭── Select Distributed Model (6GB - 16GB Multi-GPU Pipeline) "
         header_dashes = ("─" * (82 - len(header_title) - 1)) + "╮\n"
-        frags.append(("bold #38bdf8", header_title, close_handler))
-        frags.append(("bold #38bdf8", header_dashes, close_handler))
+        frags.append(("bold #ff2a85", header_title, close_handler))
+        frags.append(("bold #ff2a85", header_dashes, close_handler))
 
         # Model rows (each exactly 82 cols)
         for i, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
@@ -2718,21 +2882,21 @@ def run_opencode_tui(
             is_focused = (i - 1 == picker_focus_idx[0])
 
             cur_str = "▶ " if is_focused else "  "
-            cur_style = "bold #38bdf8" if is_focused else "#ffffff"
+            cur_style = "bold #ff2a85" if is_focused else "#ffffff"
 
             num_str = f"[{i:>2}] "
-            num_style = "bold #38bdf8" if is_focused else "#ffffff"
+            num_style = "bold #ff70a6" if is_focused else "#6b7280"
 
             marker_str = "● " if is_active else "  "
-            marker_style = "bold #22c55e" if is_active else "#ffffff"
+            marker_style = "bold #22c55e" if is_active else "#334155"
 
             m_name = m["name"]
             name_str = f"{m_name[:31]:<31} "
-            name_style = "bold #ffffff" if (is_focused or is_active) else "#ffffff"
+            name_style = "bold #ffffff" if (is_focused or is_active) else "#cbd5e1"
 
             m_vram = m["vram_gb"]
             vram_str = f"{m_vram:>4.1f} GB · "
-            vram_style = "bold #38bdf8" if is_focused else "#38bdf8"
+            vram_style = "bold #ff70a6" if is_focused else "#94a3b8"
 
             split = m["recommended_split"]
             if "2-3x" in split:
@@ -2740,25 +2904,25 @@ def run_opencode_tui(
             elif "2x 6GB" in split:
                 split = split.replace(" / GPU", "/GPU")
             split_str = f"{split[:27]:<27}"
-            split_style = "bold #ffffff" if is_focused else "#ffffff"
+            split_style = "bold #ffffff" if is_focused else "#64748b"
 
             h = make_handler(i)
 
-            frags.append(("bold #38bdf8", "│ ", h))
+            frags.append(("bold #ff2a85", "│ ", h))
             frags.append((cur_style, cur_str, h))
             frags.append((num_style, num_str, h))
             frags.append((marker_style, marker_str, h))
             frags.append((name_style, name_str, h))
             frags.append((vram_style, vram_str, h))
             frags.append((split_style, split_str, h))
-            frags.append(("bold #38bdf8", " │\n", h))
+            frags.append(("bold #ff2a85", " │\n", h))
 
         # Hint & footer
         hint_str = "│  ↑/↓: Navigate  ·  Enter / Click: Select  ·  1-9: Quick  ·  Esc: Close         │\n"
-        frags.append(("#38bdf8", hint_str, close_handler))
+        frags.append(("#ff70a6", hint_str, close_handler))
 
         footer_str = "╰" + ("─" * 80) + "╯"
-        frags.append(("bold #38bdf8", footer_str, close_handler))
+        frags.append(("bold #ff2a85", footer_str, close_handler))
 
         return frags
 
@@ -2775,7 +2939,7 @@ def run_opencode_tui(
     )
 
     root = FloatContainer(
-        content=main_split,
+        content=main_container,
         floats=[
             Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=8)),
             model_menu_float,
@@ -2786,6 +2950,8 @@ def run_opencode_tui(
 
     def run_stream_inference(prompt_text: str):
         session_state["is_generating"] = True
+        session_state["active_screen"] = "active"
+        session_state["last_query"] = prompt_text
         session_state["stream_tokens"] = 0
         session_state["stream_tps"] = 0.0
         interrupt_armed[0] = False
@@ -2802,6 +2968,17 @@ def run_opencode_tui(
             last_render_t = 0.0
             tok_cnt = 0
             full_resp = ""
+
+            # Target model & stage banner in conversation history
+            w_cnt = session_state.get("workers_count", 0)
+            curr_m = session_state.get("model", model)
+            m_info = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == curr_m.lower() or m["name"].lower() == curr_m.lower()), None)
+            disp_m = m_info["name"] if m_info else curr_m
+            disp_layers = m_info["layers"] if m_info else 32
+            stages_txt = f"Pipeline Stage 1 & {w_cnt}" if w_cnt > 1 else ("Pipeline Stage 1" if w_cnt == 1 else "Standalone Local Stage")
+            hdr_line = f"← {stages_txt} · {disp_m} ({disp_layers} Layers)"
+            history_entries.append(("system", f"[dim]← {stages_txt} · [bold white]{disp_m}[/bold white] ({disp_layers} Layers)[/dim]", ""))
+
             payload = {
                 "model": session_state.get("model", model),
                 "messages": messages,
@@ -2962,6 +3139,8 @@ def run_opencode_tui(
         # If user entered a command or prompt, ALWAYS execute it (never let model picker swallow Enter)
         if user_input:
             show_model_picker[0] = False
+            session_state["active_screen"] = "active"
+            session_state["last_query"] = user_input
             # Immediately clear and reset buffer document to guarantee input box is fully cleared
             input_box.text = ""
             buf.reset(document=Document(text="", cursor_position=0))
@@ -3122,6 +3301,8 @@ def run_opencode_tui(
             event.app.invalidate()
             return
         if not buf.text:
+            session_state["active_screen"] = "active"
+            session_state["last_query"] = "/nodes"
             history_entries.append(("user", "/nodes", "Command"))
             show_nodes_view(session_state.get("coordinator_url", coordinator_url), log_output_fn=log_output_fn)
             event.app.invalidate()
