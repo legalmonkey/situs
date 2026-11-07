@@ -63,23 +63,23 @@ class EarlyExitHead(nn.Module if HAS_TORCH else object):
     PPSD (Pipeline-Parallel Self-Speculation) early exit projection head.
     Projects intermediate stage hidden states directly to vocabulary logits.
     """
-    def __init__(self, hidden_dim: int = 2048, vocab_size: int = 32000):
+    def __init__(self, hidden_dim: int = 2048, vocab_size: int = 32000, device: str = "cpu", dtype: Any = None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         if HAS_TORCH:
-            self.norm = nn.LayerNorm(hidden_dim)
-            self.proj = nn.Linear.__new__(nn.Linear)
-            super(nn.Linear, self.proj).__init__()
-            self.proj.in_features = hidden_dim
-            self.proj.out_features = vocab_size
-            self.proj.weight = nn.Parameter(torch.zeros(vocab_size, hidden_dim, dtype=torch.float32))
-            self.proj.bias = None
+            if dtype is None:
+                dtype = torch.float16 if (hidden_dim * vocab_size > 1_000_000) else torch.float32
+            dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
+            self.norm = nn.LayerNorm(hidden_dim, dtype=dtype, device=dev)
+            self.proj = nn.Linear(hidden_dim, vocab_size, bias=False, dtype=dtype, device=dev)
 
     def forward(self, h: "torch.Tensor") -> "torch.Tensor":
         if not HAS_TORCH:
             return h
-        return self.proj(self.norm(h))
+        target_dtype = getattr(self.norm.weight, "dtype", h.dtype)
+        h_cast = h.to(target_dtype)
+        return self.proj(self.norm(h_cast))
 
 
 class SpeculativeVerifier:

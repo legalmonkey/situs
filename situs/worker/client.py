@@ -47,6 +47,7 @@ class WorkerDaemon:
         self.config = config
         self.worker_id = config.worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.engine: Optional[StageExecutionEngine] = None
+        self.engine_ready_event = asyncio.Event()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.p2p_node: Optional[P2PDataChannelNode] = None
         self.is_running = True
@@ -85,6 +86,17 @@ class WorkerDaemon:
         """Processes an incoming ProtocolFrame from either WebSocket or P2P DataChannel."""
         try:
             frame = ProtocolFrame.model_validate_json(message)
+            if frame.type in (
+                MessageType.FORWARD_ACTIVATION,
+                MessageType.NEXT_TOKEN,
+                MessageType.SPECULATIVE_CANDIDATES,
+                MessageType.SPECULATIVE_VERIFIED,
+            ):
+                try:
+                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    pass
+
             if frame.type == MessageType.FORWARD_ACTIVATION and self.engine:
                 act_frame = ForwardActivation.model_validate(frame.payload)
                 out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
@@ -272,6 +284,7 @@ class WorkerDaemon:
 
                         elif frame.type == MessageType.ASSIGN_LAYERS:
                             try:
+                                self.engine_ready_event.clear()
                                 assign = AssignLayers.model_validate(frame.payload)
                                 logger.info(
                                     f"Assigned layers [{assign.layer_start}..{assign.layer_end}) of {assign.model_name}. "
@@ -299,6 +312,7 @@ class WorkerDaemon:
                                     compression_dtype=self.config.compression_dtype,
                                     tokenizer=tok,
                                 )
+                                self.engine_ready_event.set()
 
                                 # Initialize WebRTC direct P2P connection to partner worker
                                 target_id = assign.next_worker_id or assign.prev_worker_id
@@ -319,6 +333,10 @@ class WorkerDaemon:
                                 await self.p2p_node.handle_signaling_message(frame.payload)
 
                         elif frame.type == MessageType.INFERENCE_START:
+                            try:
+                                await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                            except asyncio.TimeoutError:
+                                logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within 60s")
                             if self.engine:
                                 start_msg = InferenceStart.model_validate(frame.payload)
                                 if self.engine.is_first_stage():
@@ -330,6 +348,10 @@ class WorkerDaemon:
                                     self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
 
                         elif frame.type == MessageType.FORWARD_ACTIVATION:
+                            try:
+                                await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                            except asyncio.TimeoutError:
+                                logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within 60s")
                             if self.engine:
                                 act_frame = ForwardActivation.model_validate(frame.payload)
                                 out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)

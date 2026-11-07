@@ -9,6 +9,9 @@ import re
 import json
 import logging
 import time
+import os
+import shutil
+import subprocess
 from typing import Optional, List, Dict, Any, AsyncGenerator, Callable
 import httpx
 
@@ -16,6 +19,80 @@ logger = logging.getLogger("situs.inference_backend")
 
 # Ollama local daemon endpoints
 OLLAMA_ENDPOINTS = ["http://127.0.0.1:11434", "http://localhost:11434"]
+
+
+def ensure_ollama_running() -> bool:
+    """Verifies Ollama daemon is reachable. If not, attempts to spawn 'ollama serve' in background."""
+    for ep in OLLAMA_ENDPOINTS:
+        try:
+            with httpx.Client(timeout=1.0) as client:
+                r = client.get(f"{ep}/api/tags")
+                if r.status_code == 200:
+                    return True
+        except Exception:
+            pass
+
+    # Find ollama binary
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        win_path = os.path.expanduser(r"~\AppData\Local\Programs\Ollama\ollama.exe")
+        if os.path.isfile(win_path):
+            ollama_bin = win_path
+
+    if not ollama_bin:
+        return False
+
+    try:
+        logger.info(f"Spawning Ollama daemon in background using '{ollama_bin}'...")
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        subprocess.Popen([ollama_bin, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        for _ in range(50):
+            time.sleep(0.3)
+            for ep in OLLAMA_ENDPOINTS:
+                try:
+                    with httpx.Client(timeout=1.5) as client:
+                        r = client.get(f"{ep}/api/tags")
+                        if r.status_code == 200:
+                            logger.info("Ollama daemon started successfully.")
+                            return True
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"Failed to auto-start Ollama: {e}")
+    return False
+
+
+def is_model_downloaded(model_name: str) -> bool:
+    """Checks whether the requested model is downloaded in local Ollama or safetensors/GGUF files."""
+    try:
+        from situs.worker.loader import find_local_safetensors_files
+        sfiles = find_local_safetensors_files(model_name)
+        if sfiles:
+            return True
+    except Exception:
+        pass
+
+    ensure_ollama_running()
+    canonical = normalize_ollama_model(model_name)
+    for ep in OLLAMA_ENDPOINTS:
+        try:
+            installed = get_installed_ollama_models(ep)
+            if not installed:
+                continue
+            for m in installed:
+                if m.lower() == canonical.lower() or m.lower() == model_name.lower():
+                    return True
+                if ":" not in canonical and m.lower().startswith(f"{canonical.lower()}:"):
+                    return True
+                if m.endswith(":latest") and m.split(":")[0].lower() == canonical.lower():
+                    return True
+                if canonical.split(":")[0].lower() == m.split(":")[0].lower():
+                    return True
+        except Exception:
+            pass
+    return False
 
 # Mapping from friendly / quantized / full names to canonical Ollama library tags
 CANONICAL_MODEL_TAGS: Dict[str, str] = {
@@ -133,6 +210,7 @@ async def stream_pull_model(
     Asynchronously streams online model pulling progress from Ollama API.
     Yields structured progress dictionaries for live progress bars.
     """
+    ensure_ollama_running()
     canonical_model = normalize_ollama_model(model_name)
     start_t = time.time()
     last_comp = 0

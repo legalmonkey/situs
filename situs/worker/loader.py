@@ -98,9 +98,8 @@ def validate_quantization_metadata(quant_meta: Dict[str, Any]) -> None:
 def is_architecture_supported(arch: Optional[str]) -> bool:
     """
     Validates that the architecture is compatible with RealTransformerBlock
-    (RMSNorm, RoPE, and SwiGLU-style MLP with verified numerical parity).
-    Explicitly rejects unsupported architectures such as Gemma, Gemma 2/3,
-    Qwen, MoE, MPT, GPT-2, generic placeholder 'transformer', etc.
+    (RMSNorm, RoPE, and SwiGLU/GeGLU-style MLP with verified numerical parity).
+    Explicitly rejects incompatible non-decoder architectures such as MoE, MPT, GPT-2, etc.
     """
     if not arch or not isinstance(arch, str):
         return False
@@ -199,19 +198,22 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-def _fast_linear(in_features: int, out_features: int) -> Any:
-    """Fast linear module initialization avoiding multi-second random uniform generation on CPU."""
+def _fast_linear(in_features: int, out_features: int, device: str = "cpu", dtype: Any = None) -> Any:
+    """Safe linear module initialization avoiding PyTorch C++ memory corruption."""
     if not HAS_TORCH:
         return None
-    linear = nn.Linear.__new__(nn.Linear)
-    super(nn.Linear, linear).__init__()
-    linear.in_features = in_features
-    linear.out_features = out_features
-    # Initialize with small normal variance rather than all-zeros to prevent uniform degenerate logits
-    std = 0.02 / math.sqrt(max(1, in_features))
-    linear.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=torch.float32) * std)
-    linear.bias = None
-    return linear
+    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
+    dt = dtype if dtype is not None else torch.float32
+    return nn.Linear(in_features, out_features, bias=False, dtype=dt, device=dev)
+
+
+def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu", dtype: Any = None) -> Any:
+    """Safe embedding module initialization avoiding multi-GB host CPU memory allocation."""
+    if not HAS_TORCH:
+        return None
+    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
+    dt = dtype if dtype is not None else torch.float32
+    return nn.Embedding(num_embeddings, embedding_dim, dtype=dt, device=dev)
 
 
 class RealTransformerBlock(nn.Module if HAS_TORCH else object):
@@ -233,6 +235,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         architecture: str,
         eps: float = 1e-6,
         layer_idx: int = 0,
+        device: str = "cpu",
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -258,24 +261,28 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.head_dim = head_dim
         self.intermediate_size = intermediate_size
         self.layer_idx = layer_idx
+        self.device = device
 
         if not HAS_TORCH:
             return
 
         self.input_layernorm = RMSNorm(hidden_dim, eps=eps)
 
-        # Self-Attention projections (instant zero initialization)
-        self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim)
-        self.k_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim)
-        self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim)
-        self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim)
+        # Self-Attention projections (instant zero initialization directly on target device)
+        self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim, device=self.device)
+        self.k_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device)
+        self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device)
+        self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device)
 
-        # Feed-Forward Network (SwiGLU for LLaMA/Mistral)
+        # Feed-Forward Network (SwiGLU for LLaMA/Mistral/Qwen, GeGLU for Gemma)
         self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps)
-        self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size)
-        self.up_proj = _fast_linear(hidden_dim, self.intermediate_size)
-        self.down_proj = _fast_linear(self.intermediate_size, hidden_dim)
-        self.act_fn = nn.SiLU()
+        self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device)
+        self.up_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device)
+        self.down_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device)
+        if "gemma" in str(architecture).lower():
+            self.act_fn = nn.GELU(approximate="tanh")
+        else:
+            self.act_fn = nn.SiLU()
 
         # Rotary Embeddings
         self.rotary = RotaryEmbedding(self.head_dim)
@@ -738,13 +745,13 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
         # 1. Embeddings (ONLY if first stage)
         if self.is_first_stage:
-            self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
-            self.early_exit_head = EarlyExitHead(hidden_dim, vocab_size)
+            self.embed_tokens = _fast_embedding(vocab_size, hidden_dim, device=self.device)
+            self.early_exit_head = EarlyExitHead(hidden_dim, vocab_size, device=self.device)
         else:
             self.embed_tokens = None
             self.early_exit_head = None
 
-        # 2. Assigned Transformer Layers (always genuine RealTransformerBlock)
+        # 2. Assigned Transformer Layers (always genuine RealTransformerBlock directly placed on target device)
         num_layers = layer_end - layer_start
         self.layers = nn.ModuleList([
             RealTransformerBlock(
@@ -755,6 +762,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 head_dim=self.head_dim,
                 architecture=self.architecture,
                 layer_idx=layer_start + i,
+                device=self.device,
             )
             for i in range(num_layers)
         ])
@@ -762,7 +770,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         # 3. Norm and LM Head (ONLY if last stage)
         if self.is_last_stage:
             self.norm = RMSNorm(hidden_dim)
-            self.lm_head = _fast_linear(hidden_dim, vocab_size)
+            self.lm_head = _fast_linear(hidden_dim, vocab_size, device=self.device)
         else:
             self.norm = None
             self.lm_head = None
@@ -788,13 +796,19 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             )
         with torch.no_grad():
             target_shape = self.embed_tokens.weight.shape
-            src = weights.to(device=self.device, dtype=torch.float32)
+            src = weights.to(device=self.device)
             if src.shape != target_shape:
-                raise ValueError(
-                    f"Embedding weight shape mismatch: expected {tuple(target_shape)}, got {tuple(src.shape)}. "
-                    f"Partial copying is rejected."
-                )
-            self.embed_tokens.weight.copy_(src)
+                if src.dim() == 2 and src.T.shape == target_shape:
+                    src = src.T
+                else:
+                    raise ValueError(
+                        f"Embedding weight shape mismatch: expected {tuple(target_shape)}, got {tuple(src.shape)}. "
+                        f"Partial copying is rejected."
+                    )
+            if getattr(self.embed_tokens.weight, "is_meta", False):
+                self.embed_tokens = nn.Embedding.from_pretrained(src.to(dtype=torch.float16), freeze=False)
+            else:
+                self.embed_tokens.weight.copy_(src.to(dtype=self.embed_tokens.weight.dtype))
             logger.info(f"Loaded verified embedding weights {tuple(src.shape)} into first stage.")
 
     def load_head_weights(self, lm_head_weight: Any, norm_weight: Optional[Any] = None):
@@ -809,26 +823,29 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                     raise ValueError(
                         f"Expected torch.Tensor for RMSNorm weights, got {type(norm_weight).__name__}."
                     )
-                n_src = norm_weight.to(device=self.device, dtype=torch.float32)
+                n_src = norm_weight.to(device=self.device)
                 if n_src.shape != self.norm.weight.shape:
                     raise ValueError(
                         f"RMSNorm weight shape mismatch: expected {tuple(self.norm.weight.shape)}, got {tuple(n_src.shape)}. "
                         f"Partial copying is rejected."
                     )
-                self.norm.weight.copy_(n_src)
+                self.norm.weight.copy_(n_src.to(dtype=self.norm.weight.dtype))
             if lm_head_weight is not None and self.lm_head is not None:
                 if not isinstance(lm_head_weight, torch.Tensor):
                     raise ValueError(
                         f"Expected torch.Tensor for LM Head weights, got {type(lm_head_weight).__name__}."
                     )
-                h_src = lm_head_weight.to(device=self.device, dtype=torch.float32)
+                h_src = lm_head_weight.to(device=self.device)
                 target_shape = self.lm_head.weight.shape
                 if h_src.shape != target_shape:
-                    raise ValueError(
-                        f"LM Head weight shape mismatch: expected {tuple(target_shape)}, got {tuple(h_src.shape)}. "
-                        f"Partial copying is rejected."
-                    )
-                self.lm_head.weight.copy_(h_src)
+                    if h_src.dim() == 2 and h_src.T.shape == target_shape:
+                        h_src = h_src.T
+                    else:
+                        raise ValueError(
+                            f"LM Head weight shape mismatch: expected {tuple(target_shape)}, got {tuple(h_src.shape)}. "
+                            f"Partial copying is rejected."
+                        )
+                self.lm_head.weight.copy_(h_src.to(dtype=self.lm_head.weight.dtype))
                 logger.info(f"Loaded verified LM Head weights into last stage.")
 
     def hot_swap_layer(self, layer_index: int, weights: Optional[Any] = None, new_block: Optional[Any] = None):
@@ -961,48 +978,19 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
 
 def find_local_safetensors_files(model_name: str) -> List[str]:
-    """Finds safetensors, GGUF, or PyTorch checkpoint files on disk for the given model name."""
+    """Finds genuine safetensors or PyTorch checkpoint files on disk for the given model name."""
     import glob
     import os
-    import json
     candidates = []
 
     # 1. Direct path
     if os.path.isdir(model_name):
         candidates.append(model_name)
     elif os.path.isfile(model_name):
-        return [model_name]
+        if not model_name.endswith(".gguf"):
+            return [model_name]
 
-    # 2. Ollama model manifests and blobs (~/.ollama/models)
-    ollama_dir = os.path.expanduser("~/.ollama/models")
-    manifests_dir = os.path.join(ollama_dir, "manifests")
-    if os.path.isdir(manifests_dir):
-        clean_model = model_name.lower().replace("-", "")
-        parts = clean_model.split(":")
-        name_part = parts[0]
-        tag_part = parts[1] if len(parts) > 1 else None
-
-        for root, dirs, files in os.walk(manifests_dir):
-            rel = os.path.relpath(root, manifests_dir).lower().replace("-", "")
-            if name_part in rel:
-                for f in files:
-                    f_clean = f.lower().replace("-", "")
-                    if tag_part is None or tag_part in f_clean or f_clean == "latest":
-                        manifest_path = os.path.join(root, f)
-                        try:
-                            with open(manifest_path, "r", encoding="utf-8") as mf:
-                                mdata = json.load(mf)
-                            for layer in mdata.get("layers", []):
-                                if layer.get("mediaType") == "application/vnd.ollama.image.model":
-                                    digest = layer.get("digest", "")
-                                    blob_name = digest.replace(":", "-")
-                                    blob_path = os.path.join(ollama_dir, "blobs", blob_name)
-                                    if os.path.isfile(blob_path) and blob_path not in candidates:
-                                        candidates.append(blob_path)
-                        except Exception:
-                            pass
-
-    # 3. Hugging Face hub cache (~/.cache/huggingface/hub/models--*)
+    # 2. Hugging Face hub cache (~/.cache/huggingface/hub/models--*)
     hub_dir = os.path.expanduser("~/.cache/huggingface/hub")
     if os.path.isdir(hub_dir):
         clean_name = model_name.replace("/", "--").replace(":", "--").lower()
@@ -1017,11 +1005,12 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
                         if os.path.isdir(snap_path):
                             candidates.append(snap_path)
 
-    # Search candidates for .safetensors, .bin, or .gguf files
+    # Search candidates for .safetensors or .bin files (genuine unquantized PyTorch weights)
     results = []
     for cand in candidates:
         if os.path.isfile(cand):
-            results.append(cand)
+            if not cand.endswith(".gguf"):
+                results.append(cand)
             continue
         sfiles = sorted(glob.glob(os.path.join(cand, "*.safetensors")))
         if sfiles:
@@ -1031,9 +1020,6 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
         if pt_files:
             results.extend(pt_files)
             continue
-        gguf_files = sorted(glob.glob(os.path.join(cand, "*.gguf")))
-        if gguf_files:
-            results.extend(gguf_files)
 
     return results
 
@@ -1161,6 +1147,16 @@ def load_hf_stage_model(
                     if is_gguf:
                         try:
                             reader = gguf.GGUFReader(sf)
+                            # Strictly check whether file has quantized weights (which require llama.cpp / Ollama runtime).
+                            # Pure-Python CPU dequantization across dozens of layers allocates 18+ GB host RAM, exhausting commit limit.
+                            has_quant = any(t.tensor_type not in (0, 1) for t in reader.tensors)
+                            if has_quant:
+                                logger.info(
+                                    f"GGUF file '{sf}' contains quantized tensors. "
+                                    f"Skipping pure-Python CPU dequantization to prevent host RAM exhaustion."
+                                )
+                                continue
+
                             embed_weight = cached_embed
                             norm_weight = cached_norm
                             lm_head_weight = cached_head

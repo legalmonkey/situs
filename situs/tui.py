@@ -3151,6 +3151,24 @@ def run_opencode_tui(
                 return ""
     finally:
         stop_bg_sync.set()
+        try:
+            # Unconditionally restore terminal mouse reporting and cursor visibility
+            sys.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _restore_terminal_modes():
+    try:
+        sys.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+import atexit
+atexit.register(_restore_terminal_modes)
 
 
 

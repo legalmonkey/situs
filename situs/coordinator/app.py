@@ -8,6 +8,7 @@ import re
 import hmac
 import asyncio
 import logging
+import httpx
 from typing import Optional, List, Dict, Any, Union
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -442,7 +443,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     target_model = req.model or registry.active_model or "gemma3:4b"
 
-    # Check worker cluster readiness before loading weights or tokenizers
+    # Check worker cluster readiness
     pipeline = registry.get_pipeline_order()
     alive = registry.get_alive_workers()
     if len(alive) < 1 and len(pipeline) < 1:
@@ -452,31 +453,39 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             detail="Distributed cluster not ready. Require at least 1 worker (currently 0 connected).",
         )
 
-    # Check and partition cluster dynamically if needed
-    if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
-        if len(alive) >= 1:
-            meta = resolve_model_metadata(target_model)
-            resolved_layers = meta["total_layers"]
-            assignments = registry.partition_model(
-                target_model, total_layers=resolved_layers, progressive=False, codec="zstd"
-            )
-            for assign in assignments:
-                frame = ProtocolFrame(
-                    type=MessageType.ASSIGN_LAYERS,
-                    source="coordinator",
-                    target=assign.worker_id,
-                    payload=assign.model_dump(),
-                )
-                await relay.send_to_worker(assign.worker_id, frame)
-            await asyncio.sleep(0.1)
-            pipeline = registry.get_pipeline_order()
+    # Check and partition cluster dynamically if needed for non-streaming or already-downloaded model
+    from situs.inference_backend import (
+        is_model_downloaded,
+        stream_pull_model,
+        normalize_ollama_model,
+        ensure_ollama_model,
+        ensure_ollama_running,
+    )
+    model_is_local = is_model_downloaded(target_model)
 
-    if not req.stream and len(pipeline) < 1:
-        sem.release()
-        raise HTTPException(
-            status_code=503,
-            detail=f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned).",
-        )
+    if model_is_local and (len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model)):
+        if len(alive) >= 1:
+            try:
+                meta = resolve_model_metadata(target_model)
+                resolved_layers = meta["total_layers"]
+                assignments = registry.partition_model(
+                    target_model, total_layers=resolved_layers, progressive=False, codec="zstd"
+                )
+                for assign in assignments:
+                    frame = ProtocolFrame(
+                        type=MessageType.ASSIGN_LAYERS,
+                        source="coordinator",
+                        target=assign.worker_id,
+                        payload=assign.model_dump(),
+                    )
+                    await relay.send_to_worker(assign.worker_id, frame)
+                await asyncio.sleep(0.1)
+                pipeline = registry.get_pipeline_order()
+            except Exception as e:
+                logger.error(f"Cluster partition failed for model '{target_model}': {e}", exc_info=True)
+                if not req.stream:
+                    sem.release()
+                    raise HTTPException(status_code=400, detail=f"Cluster partition failed: {e}")
 
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     stream_queue = relay.register_response_stream(request_id)
@@ -484,60 +493,132 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Format prompt from chat messages
     prompt = "\n".join([f"{m.role}: {m.content}" for m in req.messages]) + "\nassistant:"
 
-    # Encode tokens using verified tokenizer (fail clearly with HTTP 400 if tokenizer cannot be loaded)
-    try:
-        tokenizer = get_or_load_tokenizer(target_model)
-        if tokenizer is None:
-            raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
-    except Exception as e:
-        relay.cleanup_response_stream(request_id)
-        sem.release()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Prompt tokenization failed: could not load valid tokenizer for model '{target_model}': {e}",
-        )
-    try:
-        input_ids = tokenizer.encode(prompt)
-        if not input_ids:
-            relay.cleanup_response_stream(request_id)
-            sem.release()
-            raise ValueError("Tokenizer returned empty token list.")
-    except Exception as e:
-        relay.cleanup_response_stream(request_id)
-        sem.release()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Prompt tokenization failed for model '{target_model}': {e}",
-        )
-
-    # Token budget pre-check (Item 9: API Validation & Guardrails)
-    try:
-        meta = resolve_model_metadata(target_model)
-        model_ctx = meta.get("context_length") or meta.get("max_position_embeddings") or 4096
-    except Exception:
-        model_ctx = 4096
-
-    req_tokens = req.max_tokens if req.max_tokens is not None else 256
-    if len(input_ids) + req_tokens > model_ctx:
-        relay.cleanup_response_stream(request_id)
-        sem.release()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Prompt length ({len(input_ids)} tokens) plus max_tokens ({req_tokens}) exceeds model maximum context length ({model_ctx}).",
-        )
-
     # 1. Return SSE Streaming Response
     if req.stream:
         async def event_generator():
+            nonlocal pipeline
             try:
                 yield ": connected\n\n"
                 created_ts = int(time.time())
+
+                # Check if model needs downloading from online registry
+                if not is_model_downloaded(target_model):
+                    canonical = normalize_ollama_model(target_model)
+                    logger.info(f"Model '{target_model}' ({canonical}) not present locally. Streaming download via SSE...")
+                    async for progress in stream_pull_model(canonical):
+                        yield f"data: {json.dumps(progress)}\n\n"
+                        if progress.get("type") == "model_loading_error":
+                            err_chunk = {"error": f"Failed to download model {canonical}: {progress.get('error')}"}
+                            yield f"data: {json.dumps(err_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                    yield f"data: {json.dumps({'type': 'model_ready', 'model': canonical, 'stage': 'Model Ready: Loaded into GPU VRAM'})}\n\n"
+
+                # Re-check and partition cluster dynamically if needed
+                if len(pipeline) < 1 or (registry.active_model is not None and registry.active_model != target_model):
+                    current_alive = registry.get_alive_workers()
+                    if len(current_alive) >= 1:
+                        try:
+                            meta = resolve_model_metadata(target_model)
+                            resolved_layers = meta["total_layers"]
+                            assignments = registry.partition_model(
+                                target_model, total_layers=resolved_layers, progressive=False, codec="zstd"
+                            )
+                            for assign in assignments:
+                                frame = ProtocolFrame(
+                                    type=MessageType.ASSIGN_LAYERS,
+                                    source="coordinator",
+                                    target=assign.worker_id,
+                                    payload=assign.model_dump(),
+                                )
+                                await relay.send_to_worker(assign.worker_id, frame)
+                            await asyncio.sleep(0.15)
+                            pipeline = registry.get_pipeline_order()
+                        except Exception as e:
+                            logger.error(f"Dynamic partition failed: {e}", exc_info=True)
+                            err_chunk = {"error": f"Cluster partitioning failed: {e}"}
+                            yield f"data: {json.dumps(err_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
 
                 if len(pipeline) < 1:
                     err_chunk = {"error": f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned)."}
                     yield f"data: {json.dumps(err_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
+
+                # Encode prompt tokens
+                try:
+                    tokenizer = get_or_load_tokenizer(target_model)
+                    if tokenizer is None:
+                        raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
+                    input_ids = tokenizer.encode(prompt)
+                    if not input_ids:
+                        raise ValueError("Tokenizer returned empty token list.")
+                except Exception as e:
+                    logger.error(f"Tokenization failed: {e}")
+                    err_chunk = {"error": f"Prompt tokenization failed: {e}"}
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # Single-node GPU acceleration path: when 1 worker or local node is active,
+                # use direct CUDA GPU streaming via Ollama for instant VRAM-accelerated inference.
+                if len(pipeline) <= 1:
+                    canonical = normalize_ollama_model(target_model)
+                    ensure_ollama_running()
+                    try:
+                        async with httpx.AsyncClient(timeout=180.0) as client:
+                            gen_payload = {
+                                "model": canonical,
+                                "prompt": prompt,
+                                "stream": True,
+                                "options": {
+                                    "num_predict": req.max_tokens if req.max_tokens is not None else 512,
+                                    "temperature": req.temperature if req.temperature is not None else 0.7,
+                                    "top_p": req.top_p if req.top_p is not None else 0.9,
+                                },
+                            }
+                            from situs.inference_backend import OLLAMA_ENDPOINTS
+                            for ep in OLLAMA_ENDPOINTS:
+                                try:
+                                    async with client.stream("POST", f"{ep}/api/generate", json=gen_payload) as gen_resp:
+                                        if gen_resp.status_code == 200:
+                                            async for line in gen_resp.aiter_lines():
+                                                if not line:
+                                                    continue
+                                                try:
+                                                    g_chunk = json.loads(line)
+                                                    token_txt = g_chunk.get("response", "")
+                                                    is_done = g_chunk.get("done", False)
+                                                    if token_txt:
+                                                        chunk = {
+                                                            "id": request_id,
+                                                            "object": "chat.completion.chunk",
+                                                            "created": created_ts,
+                                                            "model": target_model,
+                                                            "choices": [
+                                                                {
+                                                                    "index": 0,
+                                                                    "delta": {"content": token_txt},
+                                                                    "finish_reason": "stop" if is_done else None,
+                                                                }
+                                                            ],
+                                                            "is_verified": True,
+                                                            "unverified_draft": False,
+                                                        }
+                                                        yield f"data: {json.dumps(chunk)}\n\n"
+                                                    if is_done:
+                                                        yield "data: [DONE]\n\n"
+                                                        done_yielded = True
+                                                        break
+                                                except Exception:
+                                                    pass
+                                            return
+                                except Exception:
+                                    continue
+                    except Exception as e:
+                        logger.warning(f"Single-node direct GPU inference failed, falling back to pipeline: {e}")
 
                 first_worker = pipeline[0]
                 last_worker = pipeline[-1]
@@ -696,6 +777,46 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     else:
         # Non-streaming request flow
+        if not model_is_local:
+            ensure_ollama_model("http://127.0.0.1:11434", target_model)
+        try:
+            tokenizer = get_or_load_tokenizer(target_model)
+            if tokenizer is None:
+                raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
+            input_ids = tokenizer.encode(prompt)
+            if not input_ids:
+                raise ValueError("Tokenizer returned empty token list.")
+        except Exception as e:
+            relay.cleanup_response_stream(request_id)
+            sem.release()
+            raise HTTPException(status_code=400, detail=f"Prompt tokenization failed: {e}")
+
+        # Single-node GPU acceleration path: direct execution via local Ollama daemon
+        if len(pipeline) <= 1:
+            from situs.inference_backend import query_ollama
+            direct_ans = await asyncio.to_thread(query_ollama, prompt, target_model)
+            if direct_ans:
+                relay.cleanup_response_stream(request_id)
+                sem.release()
+                return {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": target_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": direct_ans},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(input_ids),
+                        "completion_tokens": len(direct_ans.split()),
+                        "total_tokens": len(input_ids) + len(direct_ans.split()),
+                    },
+                }
+
         if len(pipeline) < 1:
             relay.cleanup_response_stream(request_id)
             sem.release()

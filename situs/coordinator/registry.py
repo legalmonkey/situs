@@ -347,15 +347,19 @@ def optimal_heterogeneous_partition(
     num_kv_heads = meta.get("num_kv_heads") or num_heads
     head_dim = meta.get("head_dim") or max(1, h_dim // max(1, num_heads))
 
-    # Actual verified context length for KV-cache footprint (reject assumed fixed length)
+    # Context length for KV-cache footprint budgeting (clamped to working context 2048 unless explicitly set)
     context_length = (
         (runtime_config.get("context_length") or runtime_config.get("max_seq_len"))
         if runtime_config else None
     ) or (
-        meta.get("context_length")
-        or meta.get("max_position_embeddings")
-        or meta.get("seq_length")
-        or meta.get("max_seq_len")
+        min(
+            2048,
+            meta.get("context_length")
+            or meta.get("max_position_embeddings")
+            or meta.get("seq_length")
+            or meta.get("max_seq_len")
+            or 2048
+        )
     )
     if context_length is None or context_length <= 0:
         raise ValueError(
@@ -364,6 +368,13 @@ def optimal_heterogeneous_partition(
         )
 
     # Precision: dtype bytes per param (fp32=4, fp16/bf16=2, int8/fp8=1, int4=0.5)
+    explicit_precision = bool(
+        runtime_config and (
+            runtime_config.get("bytes_per_param")
+            or runtime_config.get("precision")
+            or runtime_config.get("compression_dtype")
+        )
+    )
     precision_val = (
         (runtime_config.get("bytes_per_param") or runtime_config.get("precision") or runtime_config.get("compression_dtype") or runtime_config.get("torch_dtype") or runtime_config.get("dtype"))
         if runtime_config else None
@@ -411,20 +422,36 @@ def optimal_heterogeneous_partition(
         (h_dim * inter_dim * 3) +
         (h_dim * 2)
     )
-    layer_weight_bytes = int(params_per_layer * bytes_per_param)
-    # Dynamic KV cache footprint per layer using actual context length, batch size, and precision
-    kv_cache_bytes = int(2 * num_kv_heads * head_dim * context_length * batch_size * bytes_per_param)
-    bytes_per_layer = max(10 * 1024**2, layer_weight_bytes + kv_cache_bytes)
 
-    # Stage-specific memory overhead:
-    # First stage holds embedding table
-    first_overhead = int(vocab_size * h_dim * bytes_per_param)
-    # Last stage holds final RMSNorm + lm_head projection
-    last_overhead = int((h_dim + h_dim * vocab_size) * bytes_per_param)
+    def _calc_memory_footprint(bpp: float) -> Tuple[int, int, int, int]:
+        l_wt = int(params_per_layer * bpp)
+        kv = int(2 * num_kv_heads * head_dim * context_length * batch_size * bpp)
+        b_layer = max(10 * 1024**2, l_wt + kv)
+        f_ov = int(vocab_size * h_dim * bpp)
+        l_ov = int((h_dim + h_dim * vocab_size) * bpp)
+        tot = (total_layers * b_layer) + f_ov + l_ov
+        return tot, b_layer, f_ov, l_ov
 
-    # Total model memory footprint
-    total_model_memory = (total_layers * bytes_per_layer) + first_overhead + last_overhead
     total_usable_cluster_vram = sum(max(50 * 1024**2, int(w.free_vram_bytes * 0.9)) for w in workers)
+    total_model_memory, bytes_per_layer, first_overhead, last_overhead = _calc_memory_footprint(bytes_per_param)
+
+    # Auto-fallback to quantized precision (INT8=1.0B, INT4=0.5B) if uncompressed float exceeds cluster VRAM
+    if total_usable_cluster_vram < total_model_memory and not explicit_precision:
+        for fallback_bpp in (1.0, 0.5):
+            if fallback_bpp < bytes_per_param:
+                fb_tot, fb_bl, fb_fo, fb_lo = _calc_memory_footprint(fallback_bpp)
+                if fb_tot <= total_usable_cluster_vram:
+                    logger.info(
+                        f"Auto-selected {int(fallback_bpp * 8)}-bit quantization ({fb_tot / (1024**3):.2f} GB) "
+                        f"to accommodate cluster VRAM ({total_usable_cluster_vram / (1024**3):.2f} GB usable)."
+                    )
+                    bytes_per_param = fallback_bpp
+                    total_model_memory = fb_tot
+                    bytes_per_layer = fb_bl
+                    first_overhead = fb_fo
+                    last_overhead = fb_lo
+                    break
+
     if total_usable_cluster_vram < total_model_memory:
         raise ValueError(
             f"Insufficient cluster memory: total cluster usable memory ({total_usable_cluster_vram / (1024**3):.2f} GB) "
