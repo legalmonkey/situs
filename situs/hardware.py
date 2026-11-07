@@ -172,29 +172,38 @@ def query_nvidia_smi(force_refresh: bool = False) -> Optional[Tuple[str, int, in
 def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
     """
     Returns live (total_bytes, used_bytes, free_bytes) from dedicated GPU VRAM.
-    Uses PyTorch CUDA allocator if active; otherwise queries nvidia-smi with caching.
+    Accurately reports process-allocated VRAM for used_bytes (0 when idle, matching Task Manager),
+    and true available GPU memory for free_bytes.
     """
     if HAS_TORCH:
         try:
             if torch.cuda.is_available():
                 free_b, total_b = torch.cuda.mem_get_info(dev_idx)
-                allocated_b = torch.cuda.memory_allocated(dev_idx)
-                driver_used_b = max(0, total_b - free_b)
-                used_b = max(allocated_b, driver_used_b)
-                return (total_b, used_b, free_b)
+                alloc_b = torch.cuda.memory_allocated(dev_idx)
+                res_b = torch.cuda.memory_reserved(dev_idx)
+                effective_free_b = free_b + max(0, res_b - alloc_b)
+                # Used bytes must reflect actual process VRAM allocated by Situs, matching OS Task Manager
+                used_b = alloc_b
+                return (total_b, used_b, effective_free_b)
         except Exception:
             pass
 
     smi = query_nvidia_smi()
     if smi is not None:
-        return (smi[1], smi[3], smi[2])
+        # For non-torch fallback, return SMI total & free; process used is 0 when idle
+        return (smi[1], 0, smi[2])
 
     cim = query_windows_cim_gpus()
     if cim is not None:
-        return (cim[1], cim[3], cim[2])
+        return (cim[1], 0, cim[2])
 
     tot_ram, free_ram, _ = get_system_ram_and_cpu()
-    used_ram = max(0, tot_ram - free_ram)
+    used_ram = 0
+    try:
+        import psutil
+        used_ram = psutil.Process().memory_info().rss
+    except Exception:
+        used_ram = max(0, tot_ram - free_ram)
     return (tot_ram, used_ram, free_ram)
 
 
@@ -248,8 +257,8 @@ def query_windows_cim_gpus() -> Optional[Tuple[str, int, int, int]]:
                         est_gb = round(adapter_ram / (1024**3), 1)
 
                 total_b = int(est_gb * 1024**3)
-                used_b = int(total_b * 0.15)
-                free_b = total_b - used_b
+                used_b = 0
+                free_b = total_b
                 return (gpu_name, total_b, free_b, used_b)
     except Exception:
         pass
@@ -314,7 +323,10 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
             gpu_name = torch.cuda.get_device_name(dev_idx)
             free_b, total_b = torch.cuda.mem_get_info(dev_idx)
             alloc_b = torch.cuda.memory_allocated(dev_idx)
-            used_b = max(alloc_b, total_b - free_b)
+            res_b = torch.cuda.memory_reserved(dev_idx)
+            eff_free_b = free_b + max(0, res_b - alloc_b)
+            # Used VRAM must reflect process allocations (0 when idle, matching Task Manager)
+            used_b = alloc_b
 
             info = HardwareInfo(
                 gpu_available=True,
@@ -322,7 +334,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
                 device_type="cuda",
                 device_name=gpu_name,
                 total_memory_bytes=total_b,
-                free_memory_bytes=free_b,
+                free_memory_bytes=eff_free_b,
                 used_memory_bytes=used_b,
                 memory_type="VRAM",
                 status_message=f"CUDA GPU detected: {gpu_name} ({total_b / 1e9:.1f} GB VRAM). Proceeding with GPU acceleration.",

@@ -241,7 +241,7 @@ DISTRIBUTED_MODELS_6GB_10GB = [
         "name": "Google Gemma 3 4B",
         "vram_gb": 3.4,
         "params": "4.0B",
-        "layers": 28,
+        "layers": 34,
         "context": "8k",
         "recommended_split": "1-2x GPUs (1.7 GB / GPU)",
         "desc": "Google Gemma 3 dense lightweight instruction-tuned model.",
@@ -2268,11 +2268,37 @@ def run_opencode_tui(
         elif role == "metric":
             metric_html = f'<style color="#ff70a6">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(metric_html)))
+        elif role == "stage":
+            parts = text.split(" · ")
+            if len(parts) == 2:
+                left = parts[0]
+                right = parts[1]
+                m_title = right.split(" (")[0]
+                layers_part = (" (" + right.split(" (")[-1]) if " (" in right else ""
+                stage_html = (
+                    f'<style color="#64748b">{html.escape(left)} · </style>'
+                    f'<style color="#ffffff"><b>{html.escape(m_title)}</b></style>'
+                    f'<style color="#64748b">{html.escape(layers_part)}</style>\n\n'
+                )
+            else:
+                stage_html = f'<style color="#64748b">{html.escape(text)}</style>\n\n'
+            try:
+                frags.extend(to_formatted_text(HTML(stage_html)))
+            except Exception:
+                frags.append(("#64748b", f"{text}\n\n"))
+        elif role == "info":
+            clean_t = re.sub(r"\[/?(bold|dim|yellow|white|pink|red|green|cyan)[^\]]*\]", "", text)
+            info_html = f'<style color="#f59e0b">{html.escape(clean_t)}</style>\n\n'
+            try:
+                frags.extend(to_formatted_text(HTML(info_html)))
+            except Exception:
+                frags.append(("#f59e0b", f"{clean_t}\n\n"))
         elif role == "system":
             if "\x1b[" in text:
                 frags.extend(to_formatted_text(ANSI(text + "\n\n")))
             else:
-                sys_html = f'<style color="#ff70a6">{html.escape(text)}</style>\n\n'
+                clean_t = re.sub(r"\[/?(bold|dim|yellow|white|pink|red|green|cyan)[^\]]*\]", "", text)
+                sys_html = f'<style color="#ff70a6">{html.escape(clean_t)}</style>\n\n'
                 frags.extend(to_formatted_text(HTML(sys_html)))
         return frags
 
@@ -2977,7 +3003,7 @@ def run_opencode_tui(
             disp_layers = m_info["layers"] if m_info else 32
             stages_txt = f"Pipeline Stage 1 & {w_cnt}" if w_cnt > 1 else ("Pipeline Stage 1" if w_cnt == 1 else "Standalone Local Stage")
             hdr_line = f"← {stages_txt} · {disp_m} ({disp_layers} Layers)"
-            history_entries.append(("system", f"[dim]← {stages_txt} · [bold white]{disp_m}[/bold white] ({disp_layers} Layers)[/dim]", ""))
+            history_entries.append(("stage", hdr_line, disp_m))
 
             payload = {
                 "model": session_state.get("model", model),

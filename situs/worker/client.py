@@ -157,6 +157,20 @@ class WorkerDaemon:
 
     def query_gpu_info(self):
         try:
+            if HAS_TORCH and torch.cuda.is_available() and self.config.device != "cpu":
+                dev_idx = 0
+                if ":" in str(self.config.device):
+                    try:
+                        dev_idx = int(str(self.config.device).split(":")[1])
+                    except Exception:
+                        dev_idx = 0
+                free_b, tot_b = torch.cuda.mem_get_info(dev_idx)
+                alloc_b = torch.cuda.memory_allocated(dev_idx)
+                res_b = torch.cuda.memory_reserved(dev_idx)
+                eff_free_b = free_b + max(0, res_b - alloc_b)
+                dev_name = torch.cuda.get_device_name(dev_idx)
+                return dev_name, tot_b, eff_free_b, "cuda", alloc_b
+
             from situs.hardware import detect_hardware, get_live_gpu_vram
             if self._cached_hw is None:
                 hw = detect_hardware(requested_device=self.config.device)
@@ -172,7 +186,7 @@ class WorkerDaemon:
             logger.warning(f"Hardware query failed, falling back to real CPU/RAM: {e}")
             from situs.hardware import get_system_ram_and_cpu
             tot_ram, free_ram, cpu_name = get_system_ram_and_cpu()
-            return f"{cpu_name} (CPU)", tot_ram, free_ram, "cpu", max(0, tot_ram - free_ram)
+            return f"{cpu_name} (CPU)", tot_ram, free_ram, "cpu", 0
 
     async def heartbeat_loop(self):
         while self.is_running and self.ws:

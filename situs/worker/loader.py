@@ -202,7 +202,9 @@ def _fast_linear(in_features: int, out_features: int, device: str = "cpu", dtype
     """Safe linear module initialization avoiding PyTorch C++ memory corruption."""
     if not HAS_TORCH:
         return None
-    dt = dtype if dtype is not None else torch.float32
+    dt = dtype if dtype is not None else (
+        torch.float16 if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else torch.float32
+    )
     linear = nn.Linear.__new__(nn.Linear)
     super(nn.Linear, linear).__init__()
     linear.in_features = in_features
@@ -221,7 +223,9 @@ def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu"
     """Safe embedding module initialization avoiding multi-GB host CPU memory allocation."""
     if not HAS_TORCH:
         return None
-    dt = dtype if dtype is not None else torch.float32
+    dt = dtype if dtype is not None else (
+        torch.float16 if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else torch.float32
+    )
     emb = nn.Embedding.__new__(nn.Embedding)
     super(nn.Embedding, emb).__init__()
     emb.num_embeddings = num_embeddings
@@ -255,6 +259,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         eps: float = 1e-6,
         layer_idx: int = 0,
         device: str = "cpu",
+        dtype: Optional[Any] = None,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -281,6 +286,9 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.intermediate_size = intermediate_size
         self.layer_idx = layer_idx
         self.device = device
+        self.dtype = dtype if dtype is not None else (
+            torch.float16 if (device != "cpu" and HAS_TORCH and torch.cuda.is_available() and "cuda" in str(device)) else (torch.float32 if HAS_TORCH else None)
+        )
 
         if not HAS_TORCH:
             return
@@ -288,16 +296,16 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.input_layernorm = RMSNorm(hidden_dim, eps=eps)
 
         # Self-Attention projections (instant zero initialization directly on target device)
-        self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim, device=self.device)
-        self.k_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device)
-        self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device)
-        self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device)
+        self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim, device=self.device, dtype=self.dtype)
+        self.k_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device, dtype=self.dtype)
+        self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device, dtype=self.dtype)
+        self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device, dtype=self.dtype)
 
         # Feed-Forward Network (SwiGLU for LLaMA/Mistral/Qwen, GeGLU for Gemma)
         self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps)
-        self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device)
-        self.up_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device)
-        self.down_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device)
+        self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype)
+        self.up_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype)
+        self.down_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device, dtype=self.dtype)
         if "gemma" in str(architecture).lower():
             self.act_fn = nn.GELU(approximate="tanh")
         else:
@@ -709,6 +717,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         architecture: str,
         device: str = "cpu",
         progressive: bool = False,
+        dtype: Optional[Any] = None,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -746,6 +755,9 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             logger.warning(f"CUDA device '{device}' requested but PyTorch CUDA runtime is not available. Safely falling back to CPU.")
             safe_device = "cpu"
         self.device = safe_device
+        self.dtype = dtype if dtype is not None else (
+            torch.float16 if (self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and "cuda" in str(self.device)) else (torch.float32 if HAS_TORCH else None)
+        )
         self.progressive = progressive
 
         # JIT Progressive layer readiness tracking
@@ -764,8 +776,8 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
         # 1. Embeddings (ONLY if first stage)
         if self.is_first_stage:
-            self.embed_tokens = _fast_embedding(vocab_size, hidden_dim, device=self.device)
-            self.early_exit_head = EarlyExitHead(hidden_dim, vocab_size, device=self.device)
+            self.embed_tokens = _fast_embedding(vocab_size, hidden_dim, device=self.device, dtype=self.dtype)
+            self.early_exit_head = None
         else:
             self.embed_tokens = None
             self.early_exit_head = None
@@ -782,6 +794,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 architecture=self.architecture,
                 layer_idx=layer_start + i,
                 device=self.device,
+                dtype=self.dtype,
             )
             for i in range(num_layers)
         ])
@@ -789,7 +802,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         # 3. Norm and LM Head (ONLY if last stage)
         if self.is_last_stage:
             self.norm = RMSNorm(hidden_dim)
-            self.lm_head = _fast_linear(hidden_dim, vocab_size, device=self.device)
+            self.lm_head = _fast_linear(hidden_dim, vocab_size, device=self.device, dtype=self.dtype)
         else:
             self.norm = None
             self.lm_head = None
@@ -1074,6 +1087,16 @@ def load_hf_stage_model(
     intermediate_size = meta["intermediate_size"]
     head_dim = meta.get("head_dim") or max(1, hidden_dim // max(1, num_heads))
 
+    meta_dtype_str = meta.get("torch_dtype") or meta.get("dtype")
+    stage_dtype = None
+    if HAS_TORCH and meta_dtype_str and isinstance(meta_dtype_str, str):
+        if "bfloat16" in meta_dtype_str.lower() and hasattr(torch, "bfloat16"):
+            stage_dtype = torch.bfloat16
+        elif "float16" in meta_dtype_str.lower():
+            stage_dtype = torch.float16
+        elif "float32" in meta_dtype_str.lower():
+            stage_dtype = torch.float32
+
     stage = DistributedStageModel(
         layer_start=layer_start,
         layer_end=layer_end,
@@ -1089,6 +1112,7 @@ def load_hf_stage_model(
         progressive=progressive,
         head_dim=head_dim,
         architecture=arch,
+        dtype=stage_dtype,
     )
 
     if not progressive and HAS_TORCH:

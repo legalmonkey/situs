@@ -490,8 +490,16 @@ def optimal_heterogeneous_partition(
         speed = base_speed * lat_penalty
         speeds.append(speed)
 
-        # 3. Memory telemetry: available free VRAM with 10% safety margin for runtime buffers
-        avail_vram = max(0, int(w.free_vram_bytes * 0.90))
+        # 3. Memory telemetry: available capacity for Situs layers
+        # Usable capacity accounts for free VRAM plus currently used process VRAM (which holds existing layers to be replaced)
+        # and dedicated GPU physical limits (minus ~500 MB Windows OS desktop reserve).
+        if getattr(w, "device_type", "cuda") == "cuda" and w.total_vram_bytes > 0:
+            eff_avail = max(0, w.free_vram_bytes) + max(0, getattr(w, "used_vram_bytes", 0))
+            dedicated_margin = max(0, w.total_vram_bytes - int(500 * 1024**2))
+            avail_vram = max(int(eff_avail * 0.90), int(dedicated_margin * 0.85))
+        else:
+            avail_vram = max(0, int(w.free_vram_bytes * 0.90))
+
         stage_overhead = (first_overhead if idx == 0 else 0) + (last_overhead if idx == (K - 1) else 0)
         usable_for_layers = avail_vram - stage_overhead
         if usable_for_layers < bytes_per_layer:
