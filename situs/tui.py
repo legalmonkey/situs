@@ -49,21 +49,22 @@ enable_windows_vt_support()
 
 
 def set_pitch_black_terminal():
-    """Sets terminal default background to pure pitch black (#000000) using OSC 11 and clears canvas."""
+    """Sets terminal default background to pure pitch black (#000000) using OSC 11, sets blinking block cursor, and clears canvas."""
     if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
         try:
             # OSC 11 sets terminal background to #000000, OSC 10 sets foreground to #e2e8f0
-            sys.stdout.write("\x1b]11;#000000\x1b\\\x1b]10;#e2e8f0\x1b\\\x1b[48;2;0;0;0m")
+            # \x1b[1 q sets cursor to blinking block, \x1b[?25h ensures cursor visibility
+            sys.stdout.write("\x1b]11;#000000\x1b\\\x1b]10;#e2e8f0\x1b\\\x1b[48;2;0;0;0m\x1b[1 q\x1b[?25h")
             sys.stdout.flush()
         except Exception:
             pass
 
 
 def restore_terminal_colors():
-    """Restores terminal default foreground and background colors using OSC 111/110."""
+    """Restores terminal default foreground and background colors using OSC 111/110 and resets cursor shape."""
     if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
         try:
-            sys.stdout.write("\x1b]111\x1b\\\x1b]110\x1b\\\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m")
+            sys.stdout.write("\x1b]111\x1b\\\x1b]110\x1b\\\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[0 q\x1b[?25h\x1b[0m")
             sys.stdout.flush()
         except Exception:
             pass
@@ -87,10 +88,11 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML, ANSI, to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.styles import Style
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.application import Application
 from prompt_toolkit.widgets import TextArea
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer, DynamicContainer
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign, FloatContainer, Float, ConditionalContainer, DynamicContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.layout import Layout
@@ -148,31 +150,31 @@ TAGLINE_TEXT = "D I S T R I B U T E D   G P U   S W A R M   R U N T I M E"
 
 # High-Precision Modern Palette: Pitch Black (#000000) & Electric Pink (#ff2a85)
 TUI_STYLE = Style.from_dict({
-    "": "bg:#000000 #e2e8f0",               # Pure pitch-black terminal canvas
+    "": "bg:#000000 #e2e8f0",                    # Pure pitch-black terminal canvas
     "window": "bg:#000000",
     "frame": "bg:#000000",
-    "card": "bg:#000000",
-    "card.border": "bg:#000000 #27272a",   # Muted modern zinc border
-    "card.border.active": "bg:#000000 #ff2a85", # Vibrant hot-pink active focus border
-    "prompt.bar": "bg:#000000 #ff2a85 bold",# Vertical accent focus bar
-    "prompt.text": "bg:#000000 #ffffff",   # Crisp modern white input text
-    "text-area": "bg:#000000 #ffffff",     # Crisp modern white typed text in input card
-    "text-area.cursor-line": "bg:#000000 #ffffff",
-    "placeholder": "bg:#000000 #64748b italic", # Muted placeholder text
-    "status.badge": "bg:#000000 #ff2a85 bold", # Pink status tag
-    "status.text": "bg:#000000 #ff70a6",   # Soft rose status text
-    "status.ready": "bg:#000000 #22c55e bold", # Vibrant green status indicator
-    "status.waiting": "bg:#000000 #f59e0b bold", # Warm amber waiting indicator
-    "shortcuts": "bg:#000000 #64748b",     # Subtle muted shortcuts text
-    "shortcuts.key": "bg:#000000 #ff70a6 bold", # Soft pink shortcut keys
-    "bottom-toolbar": "bg:#000000 #64748b",# Pitch-black bottom bar
-    "bottom-toolbar.branch": "bg:#000000 #ff2a85 bold",
-    "bottom-toolbar.version": "bg:#000000 #ff70a6",
-    "completion-menu": "bg:#09090b #ffffff",
-    "completion-menu.completion": "bg:#09090b #ff70a6",
-    "completion-menu.completion.current": "bg:#27272a #ff2a85 bold",
-    "completion-menu.meta": "bg:#09090b #64748b italic",
-    "completion-menu.meta.current": "bg:#27272a #fda4af italic",
+    "card": "bg:#161619",                        # Elevated dark surface
+    "card.border": "bg:#000000 #27272a",        # Muted modern zinc border
+    "card.border.active": "bg:#000000 #ff2a85",  # Vibrant hot-pink active focus border
+    "prompt.bar": "bg:#161619 #ff2a85 bold",     # Vertical accent focus bar
+    "prompt.text": "bg:#161619 #ffffff",        # Crisp modern white input text
+    "text-area": "bg:#161619 #ffffff",          # Crisp modern white typed text in input card
+    "text-area.cursor-line": "bg:#161619 #ffffff",
+    "placeholder": "bg:#161619 #64748b italic",  # Muted placeholder text
+    "status.badge": "bg:#161619 #ff2a85 bold",   # Pink status tag
+    "status.text": "bg:#161619 #ff70a6",        # Soft rose status text
+    "status.ready": "bg:#161619 #22c55e bold",   # Vibrant green status indicator
+    "status.waiting": "bg:#161619 #f59e0b bold", # Warm amber waiting indicator
+    "shortcuts": "bg:#000000 #71717a",          # Subtle muted shortcuts text
+    "shortcuts.key": "bg:#000000 #ffffff bold",  # White shortcut keys
+    "bottom-toolbar": "bg:#000000 #64748b",     # Pitch-black bottom bar
+    "bottom-toolbar.branch": "bg:#000000 #64748b",
+    "bottom-toolbar.version": "bg:#000000 #64748b",
+    "completion-menu": "bg:#161619 #ffffff",
+    "completion-menu.completion": "bg:#161619 #ff70a6",
+    "completion-menu.completion.current": "bg:#ff2a85 #000000 bold",
+    "completion-menu.meta": "bg:#161619 #71717a italic",
+    "completion-menu.meta.current": "bg:#ff2a85 #000000 italic",
     "sidebar": "bg:#000000",
     "history": "bg:#000000",
 })
@@ -1079,36 +1081,22 @@ def prompt_in_centered_box(
     else:
         badge_html = f'<style color="#ff2a85"><b>Cluster</b></style> <style color="#ffffff"><b>{model_name}</b></style> · <style color="#6b7280">Offline (Start with /coordinator)</style>'
 
-    status_line_html = "  " + badge_html
+    status_line_html = badge_html
 
     card_inner = HSplit([
-        Window(height=1, char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#161619"),
         input_box,
-        Window(height=1, char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(HTML(status_line_html)), height=1, char=" ", style="bg:#000000"),
-        Window(height=1, char=" ", style="bg:#000000"),
-    ], style="bg:#000000")
+        Window(content=FormattedTextControl(HTML(status_line_html)), height=1, char=" ", style="bg:#161619"),
+        Window(height=1, char=" ", style="bg:#161619"),
+    ], style="bg:#161619")
 
-    # Clean Unicode Rounded Card Borders (╭ ─ ╮ / ╰ ─ ╯)
-    card_top = VSplit([
-        Window(width=1, height=1, char="╭", style="class:card.border"),
-        Window(char="─", style="class:card.border"),
-        Window(width=1, height=1, char="╮", style="class:card.border"),
-    ], height=1, style="bg:#000000")
-
-    card_middle = VSplit([
-        Window(width=1, char="│", style="class:card.border"),
+    # Clean elevated card (solid #161619 with left hot-pink accent bar ▌)
+    card_box = VSplit([
+        Window(width=1, char="▌", style="bg:#161619 #ff2a85 bold"),
+        Window(width=1, char=" ", style="bg:#161619"),
         card_inner,
-        Window(width=1, char="│", style="class:card.border"),
-    ], style="bg:#000000")
-
-    card_bottom = VSplit([
-        Window(width=1, height=1, char="╰", style="class:card.border"),
-        Window(char="─", style="class:card.border"),
-        Window(width=1, height=1, char="╯", style="class:card.border"),
-    ], height=1, style="bg:#000000")
-
-    card_box = HSplit([card_top, card_middle, card_bottom], width=card_width, style="bg:#000000")
+        Window(width=2, char=" ", style="bg:#161619"),
+    ], width=card_width, style="bg:#161619")
 
     float_container = FloatContainer(
         content=card_box,
@@ -1119,27 +1107,38 @@ def prompt_in_centered_box(
     )
 
     shortcuts_html = (
-        "  <style color='#ff70a6'><b>tab</b></style> <style color='#6b7280'>nodes</style>   "
-        "<style color='#ff70a6'><b>f2</b></style> <style color='#6b7280'>models</style>   "
-        "<style color='#ff70a6'><b>/</b></style> <style color='#6b7280'>commands</style>   "
-        "<style color='#6b7280'><b>ctrl+c</b> exit</style>"
+        "<style color='#ffffff'><b>tab</b></style> <style color='#71717a'>nodes</style>   "
+        "<style color='#ffffff'><b>f2</b></style> <style color='#71717a'>models</style>   "
+        "<style color='#ffffff'><b>ctrl+p</b></style> <style color='#71717a'>commands</style>"
     )
 
     shortcuts_view = VSplit([
         Window(width=D(), char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(HTML(shortcuts_html)), width=card_width, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(HTML(shortcuts_html)), width=card_width, align=WindowAlign.LEFT, char=" ", style="bg:#000000"),
         Window(width=D(), char=" ", style="bg:#000000"),
     ], height=1, style="bg:#000000")
 
+    tip_html = (
+        "<style color='#f59e0b'><b>● Tip</b></style> "
+        "<style color='#94a3b8'>Press</style> <style color='#ffffff'><b>ctrl+c</b></style> <style color='#94a3b8'>when typing to clear the input field</style>"
+    )
+
+    tip_view = VSplit([
+        Window(width=D(), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(HTML(tip_html)), width=card_width, align=WindowAlign.CENTER, char=" ", style="bg:#000000"),
+        Window(width=D(), char=" ", style="bg:#000000"),
+    ], height=1, style="bg:#000000")
+
+    branch = get_git_branch()
     footer_view = VSplit([
-        Window(content=FormattedTextControl(HTML(" <style color='#6b7280'>~/situs/cluster:HEAD</style>")), char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(HTML(f"<style color='#22c55e'>●</style> <style color='#6b7280'>swarm active ({workers_cnt} nodes)</style> " if workers_cnt > 0 else "<style color='#6b7280'>local</style> ")), align="RIGHT", char=" ", style="bg:#000000")
+        Window(content=FormattedTextControl(HTML(f"  <style color='#64748b'>{html.escape(branch)}</style>")), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(HTML(f"<style color='#22c55e'>●</style> <style color='#64748b'>v0.1.0 ({workers_cnt} nodes)</style>  " if workers_cnt > 0 else "<style color='#64748b'>v0.1.0</style>  ")), align=WindowAlign.RIGHT, char=" ", style="bg:#000000")
     ], height=1, style="bg:#000000")
 
     elements = []
     if show_splash:
         # Optical vertical centering
-        top_pad = max(1, (lines - 17) // 2 - 1)
+        top_pad = max(1, (lines - 16) // 2 - 1)
         elements.append(Window(height=top_pad, char=" ", style="bg:#000000"))
 
         # Centered logo
@@ -1150,20 +1149,16 @@ def prompt_in_centered_box(
             logo_html_parts.append((" " * pad_l) + f'<style color="#ff2a85"><b>{l}</b></style>')
         centered_logo_html = "\n".join(logo_html_parts)
         elements.append(Window(content=FormattedTextControl(HTML(centered_logo_html)), height=len(logo_lines), char=" ", style="bg:#000000"))
-        elements.append(Window(height=1, char=" ", style="bg:#000000"))
-
-        # Centered tagline
-        pad_tag = max(0, (cols - len(TAGLINE_TEXT)) // 2)
-        centered_tag_html = (" " * pad_tag) + f'<style color="#ff70a6"><b>{TAGLINE_TEXT}</b></style>'
-        elements.append(Window(content=FormattedTextControl(HTML(centered_tag_html)), height=1, char=" ", style="bg:#000000"))
         elements.append(Window(height=2, char=" ", style="bg:#000000"))
     else:
         elements.append(Window(height=1, char=" ", style="bg:#000000"))
 
-    # Add centered card and shortcuts
+    # Add centered card, shortcuts, and tip
     elements.append(VSplit([Window(width=D(), char=" ", style="bg:#000000"), float_container, Window(width=D(), char=" ", style="bg:#000000")], style="bg:#000000"))
     elements.append(Window(height=1, char=" ", style="bg:#000000"))
     elements.append(shortcuts_view)
+    elements.append(Window(height=1, char=" ", style="bg:#000000"))
+    elements.append(tip_view)
     elements.append(Window(height=D(), char=" ", style="bg:#000000"))  # Spring pushing footer down
     elements.append(footer_view)
 
@@ -2114,40 +2109,49 @@ def run_opencode_tui(
     # History entries: list of (role, text_content, meta_str)
     history_entries: List[Tuple[str, str, str]] = []
 
+    cursor_blink = [True]
+
     def get_dynamic_placeholder() -> Any:
         if session_state.get("active_screen", "startup") == "startup":
-            return [
-                ("#cbd5e1", "Ask anything... "),
-                ("#64748b italic", '"What is the tech stack of this cluster?"'),
-            ]
+            # Upright opaque rectangle that blinks to show where the typing cursor is
+            if cursor_blink[0]:
+                return [("bold #ffffff", "█")]
+            else:
+                return [("bg:#161619", " ")]
         return [
             ("class:placeholder", "Ask anything or type / for commands..."),
         ]
 
-    # Completer & Input TextArea (Clean modern prompt, crisp readable text)
+    # Completer & Input TextArea (Clean modern prompt, crisp readable text, fixed normal height)
     completer = OpenCodeSlashCompleter()
     input_box = TextArea(
         multiline=True,
-        prompt=[("class:prompt.bar", "▌ ")],
+        prompt="",
         completer=completer,
         complete_while_typing=True,
         history=session_history,
         style="class:text-area",
         input_processors=[PlaceholderProcessor(get_dynamic_placeholder)],
+        dont_extend_height=True,
+        height=D(min=1, max=3, preferred=1),
     )
 
     app_instance: List[Optional[Application]] = [None]
     show_model_picker = [False]
     picker_focus_idx = [0]
+    model_search_query = [""]
 
-    # Auto-dismiss model dropdown whenever user starts typing in input buffer
-    def _on_input_text_changed(buf):
-        if show_model_picker[0] and buf.text.strip():
-            show_model_picker[0] = False
-            if app_instance[0]:
-                app_instance[0].invalidate()
-
-    input_box.buffer.on_text_changed += _on_input_text_changed
+    def get_filtered_models() -> List[Tuple[int, Dict[str, Any]]]:
+        """Returns list of (1-based-index, model-dict) matching search query."""
+        q = model_search_query[0].lower().strip()
+        if not q:
+            return list(enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1))
+        results = []
+        for idx, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
+            corpus = f"{m['id']} {m['name']} {m['desc']} {m.get('params', '')} {m['recommended_split']}".lower()
+            if q in corpus:
+                results.append((idx, m))
+        return results
 
     def select_model_by_index(idx: int):
         if 1 <= idx <= len(DISTRIBUTED_MODELS_6GB_10GB):
@@ -2223,6 +2227,7 @@ def run_opencode_tui(
                 cached_history_frags.clear()
                 cached_history_len[0] = 0
             show_model_picker[0] = False
+            model_search_query[0] = ""
             if app_instance[0]:
                 app_instance[0].invalidate()
 
@@ -2235,6 +2240,8 @@ def run_opencode_tui(
                 app_instance[0].invalidate()
             return
         show_model_picker[0] = not show_model_picker[0]
+        model_search_query[0] = ""
+        picker_focus_idx[0] = 0
         if show_model_picker[0]:
             curr_m = session_state.get("model", model).lower()
             for idx, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB):
@@ -2314,10 +2321,10 @@ def run_opencode_tui(
             frags.append(("", "\n"))
         elif role == "user":
             user_html = (
-                f'<style color="#ff2a85"><b>❯</b></style> <style color="#ffffff"><b>{html.escape(text)}</b></style>\n'
+                f'<style color="#ff2a85"><b>▌</b></style> <style color="#ffffff"><b>{html.escape(text)}</b></style>\n'
             )
             if meta:
-                user_html += f'<style color="#64748b">  {html.escape(meta)}</style>\n'
+                user_html += f'<style color="#ff2a85"><b>▌</b></style> <style color="#64748b"> {html.escape(meta)}</style>\n'
             user_html += '\n'
             frags.extend(to_formatted_text(HTML(user_html)))
         elif role == "assistant":
@@ -2325,21 +2332,17 @@ def run_opencode_tui(
             frags.extend(to_formatted_text(HTML(asst_html)))
         elif role == "loading":
             lines = text.strip().split("\n")
-            content_html = ""
-            for l in lines:
-                content_html += f'<style color="#27272a"><b>│</b></style> <style color="#ff70a6">{html.escape(l)}</style>\n'
             tag = f" ({html.escape(meta)})" if meta else ""
-            load_html = (
-                f'<style color="#ff2a85"><b>╭─ [Online Model Streaming]</b></style><style color="#ff70a6"><b>{tag}</b></style>\n'
-                f'{content_html}'
-                f'<style color="#27272a"><b>╰──────────────────────────────────────────────────────────</b></style>\n\n'
-            )
+            load_html = f'<style color="#ff2a85"><b>▌ Online Model Streaming</b></style><style color="#ff70a6"><b>{tag}</b></style>\n'
+            for l in lines:
+                load_html += f'<style color="#ff70a6">  {html.escape(l)}</style>\n'
+            load_html += '\n'
             try:
                 frags.extend(to_formatted_text(HTML(load_html)))
             except Exception:
                 frags.append(("", f"[{meta}] {text}\n\n"))
         elif role == "metric":
-            metric_html = f'<style color="#64748b">  ✦ </style><style color="#ff70a6">{html.escape(text)}</style>\n\n'
+            metric_html = f'<style color="#64748b">✦ </style><style color="#ff70a6">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(metric_html)))
         elif role == "stage":
             parts = text.split(" · ")
@@ -2349,16 +2352,16 @@ def run_opencode_tui(
                 m_title = right.split(" (")[0]
                 layers_part = (" (" + right.split(" (")[-1]) if " (" in right else ""
                 stage_html = (
-                    f'<style color="#64748b">  {html.escape(left)} · </style>'
+                    f'<style color="#64748b">{html.escape(left)} · </style>'
                     f'<style color="#ffffff"><b>{html.escape(m_title)}</b></style>'
                     f'<style color="#64748b">{html.escape(layers_part)}</style>\n\n'
                 )
             else:
-                stage_html = f'<style color="#64748b">  {html.escape(text)}</style>\n\n'
+                stage_html = f'<style color="#64748b">{html.escape(text)}</style>\n\n'
             try:
                 frags.extend(to_formatted_text(HTML(stage_html)))
             except Exception:
-                frags.append(("#64748b", f"  {text}\n\n"))
+                frags.append(("#64748b", f"{text}\n\n"))
         elif role == "info":
             clean_t = re.sub(r"\[/?(bold|dim|yellow|white|pink|red|green|cyan)[^\]]*\]", "", text)
             info_html = f'<style color="#f59e0b">{html.escape(clean_t)}</style>\n\n'
@@ -2493,7 +2496,7 @@ def run_opencode_tui(
         cols = _get_active_columns()
         trans_lbl = "WebRTC P2P" if session_state.get("p2p", True) else "Relay WS"
 
-        badge_text = "  Cluster"
+        badge_text = "Cluster"
         badge_style = "bold #ff2a85"
 
         if workers_cnt > 0:
@@ -2527,19 +2530,13 @@ def run_opencode_tui(
             (stat_style, stat_text),
         ]
 
-    # Startup Screen Card: Centered Splash Card
+    # Startup Screen Card: Clean elevated surface with proper vertical padding (height=4)
     startup_card_inner = HSplit([
-        Window(height=1, char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#161619"),
         input_box,
-        Window(height=1, char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(get_card_status_fragments), height=1, char=" ", style="bg:#000000"),
-        Window(height=1, char=" ", style="bg:#000000"),
-    ], style="bg:#000000")
-
-    # Active Screen Card: Docked Minimal Input Box (Eliminates redundant status bar, saves screen space)
-    active_card_inner = HSplit([
-        input_box,
-    ], style="bg:#000000")
+        Window(content=FormattedTextControl(get_card_status_fragments), height=1, char=" ", style="bg:#161619"),
+        Window(height=1, char=" ", style="bg:#161619"),
+    ], style="bg:#161619")
 
     def get_active_card_ticker():
         is_gen = session_state.get("is_generating", False)
@@ -2559,6 +2556,19 @@ def run_opencode_tui(
             f'<style color="#64748b">· press <b>esc</b> to stop</style>'
         ))
 
+    active_ticker_window = ConditionalContainer(
+        content=Window(content=FormattedTextControl(get_active_card_ticker), height=1, char=" ", style="bg:#161619"),
+        filter=Condition(lambda: session_state.get("is_generating", False))
+    )
+
+    # Active Screen Card: Clean elevated input surface with proper vertical padding (3 lines resting, 4 when streaming)
+    active_card_inner = HSplit([
+        Window(height=1, char=" ", style="bg:#161619"),
+        input_box,
+        active_ticker_window,
+        Window(height=1, char=" ", style="bg:#161619"),
+    ], style="bg:#161619")
+
     def get_shortcuts_formatted():
         is_gen = session_state.get("is_generating", False)
         if not auto_scroll_locked[0] and is_gen:
@@ -2567,14 +2577,16 @@ def run_opencode_tui(
                 '<style color="#94a3b8">· press <b>End</b> to follow</style>'
             ))
         is_coord = session_state.get("is_coordinator", True)
-        f2_part = '<style color="#ff70a6"><b>f2</b></style> <style color="#6b7280">models</style>   ' if is_coord else ''
+        f2_part = '<style color="#ffffff"><b>f2</b></style> <style color="#71717a">models</style>  ' if is_coord else ''
+        cols = _get_active_columns()
+        scroll_part = '<style color="#71717a">pgup/dn</style> <style color="#475569">scroll</style>  ' if cols >= 88 else ''
         return to_formatted_text(HTML(
-            f'  <style color="#475569">········</style> <style color="#64748b">esc</style> <style color="#475569">interrupt</style>   '
-            f'<style color="#ff70a6"><b>tab</b></style> <style color="#6b7280">nodes</style>   '
+            f'  <style color="#71717a">esc</style> <style color="#475569">stop</style>  '
+            f'<style color="#ffffff"><b>tab</b></style> <style color="#71717a">nodes</style>  '
             f'{f2_part}'
-            f'<style color="#ff70a6"><b>/</b></style> <style color="#6b7280">commands</style>   '
-            f'<style color="#64748b"><b>pgup/dn</b></style> <style color="#475569">scroll</style>   '
-            f'<style color="#64748b"><b>ctrl+c</b></style> <style color="#475569">exit</style>'
+            f'<style color="#ffffff"><b>/</b></style> <style color="#71717a">commands</style>  '
+            f'{scroll_part}'
+            f'<style color="#71717a">ctrl+c</style> <style color="#475569">exit</style>'
         ))
 
     shortcuts_line = Window(
@@ -2671,7 +2683,7 @@ def run_opencode_tui(
         trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
         frags.append(("#94a3b8", "Interconnect: "))
         frags.append(("#e2e8f0", f"{trans_name}\n"))
-        frags.append(("#2a1220", "────────────────────────────────────\n\n"))
+        frags.append(("#27272a", "────────────────────────────────────\n\n"))
 
         # SECTION 2: ACTIVE MODEL
         is_coord = session_state.get("is_coordinator", True)
@@ -2724,16 +2736,16 @@ def run_opencode_tui(
         spec_text = "Speculative" if session_state.get("speculative", True) else "Disabled"
         frags.append(("#94a3b8", "Acceleration: "))
         frags.append(("bold #22c55e", f"{spec_text}\n"))
-        frags.append(("#2a1220", "────────────────────────────────────\n\n"))
+        frags.append(("#27272a", "────────────────────────────────────\n\n"))
 
         # SECTION 3: WORKER NODES & STAGES
         workers = session_state.get("cluster_workers", [])
         w_sub = f"{len(workers)} Stages" if workers else ""
-        frags.append(("bold #ffffff", "Active Nodes & Stages"))
+        frags.append(("bold #ffffff", "NODES & PIPELINE"))
         if w_sub:
             frags.append(("#6b7280", f"  {w_sub}"))
         frags.append(("", "\n"))
-        frags.append(("#2a1220", "────────────────────────────────────\n"))
+        frags.append(("#27272a", "────────────────────────────────────\n"))
         if not workers:
             frags.append(("#94a3b8", " No workers connected\n"))
             frags.append(("#6b7280", " Run /join to pool GPUs\n\n"))
@@ -2843,76 +2855,85 @@ def run_opencode_tui(
             ("bold #ff70a6", TAGLINE_TEXT),
         ]
 
-    def get_startup_shortcuts_formatted():
-        is_coord = session_state.get("is_coordinator", True)
-        f2_part = '<style color="#ff70a6"><b>f2</b></style> <style color="#6b7280">models</style>   ' if is_coord else ''
-        return to_formatted_text(HTML(
-            f'<style color="#ff70a6"><b>tab</b></style> <style color="#6b7280">nodes</style>   '
-            f'{f2_part}'
-            f'<style color="#ff70a6"><b>/</b></style> <style color="#6b7280">commands</style>'
-        ))
-
     def _get_responsive_card_dim() -> D:
         cols = _get_active_columns()
         if cols >= 88:
-            target = max(86, min(112, int(cols * 0.70)))
+            target = max(78, min(96, int(cols * 0.70)))
         else:
             target = max(40, cols - 4)
         return D(min=min(target, 76), max=target, preferred=target)
 
+    def get_startup_shortcuts_formatted():
+        is_coord = session_state.get("is_coordinator", True)
+        f2_part = '<style color="#ffffff"><b>f2</b></style> <style color="#71717a">models</style>   ' if is_coord else ''
+        return to_formatted_text(HTML(
+            f'<style color="#ffffff"><b>tab</b></style> <style color="#71717a">nodes</style>   '
+            f'{f2_part}'
+            f'<style color="#ffffff"><b>ctrl+p</b></style> <style color="#71717a">commands</style>'
+        ))
+
+    def get_startup_tip_formatted():
+        return to_formatted_text(HTML(
+            '<style color="#f59e0b"><b>● Tip</b></style> '
+            '<style color="#94a3b8">Press</style> <style color="#ffffff"><b>ctrl+c</b></style> <style color="#94a3b8">when typing to clear the input field</style>'
+        ))
+
     def get_bottom_bar_left():
-        return to_formatted_text(HTML(" <style color='#64748b'>~/situs/cluster:HEAD</style>"))
+        branch = get_git_branch()
+        return to_formatted_text(HTML(f"  <style color='#64748b'>{html.escape(branch)}</style>"))
 
     def get_bottom_bar_right():
         w_cnt = session_state.get("workers_count", 0)
         if w_cnt > 0:
-            return to_formatted_text(HTML(f"<style color='#22c55e'>●</style> <style color='#94a3b8'>swarm active ({w_cnt} nodes)</style> "))
-        return to_formatted_text(HTML("<style color='#64748b'>local</style> "))
+            return to_formatted_text(HTML(f"<style color='#22c55e'>●</style> <style color='#64748b'>v0.1.0 ({w_cnt} nodes)</style>  "))
+        return to_formatted_text(HTML("<style color='#64748b'>v0.1.0</style>  "))
 
-    startup_card_box = HSplit([
-        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1, style="bg:#000000"),
-        VSplit([Window(width=1, char="│", style="class:card.border"), startup_card_inner, Window(width=1, char="│", style="class:card.border")], style="bg:#000000"),
-        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1, style="bg:#000000"),
-    ], width=_get_responsive_card_dim, height=7, style="bg:#000000")
+    # Clean elevated card (solid #161619 with left hot-pink accent bar ▌)
+    startup_card_box = VSplit([
+        Window(width=1, char="▌", style="bg:#161619 #ff2a85 bold"),
+        Window(width=1, char=" ", style="bg:#161619"),
+        startup_card_inner,
+        Window(width=2, char=" ", style="bg:#161619"),
+    ], width=_get_responsive_card_dim, height=4, style="bg:#161619")
 
     startup_card_row = VSplit([
         Window(width=D(), char=" ", style="bg:#000000"),
         startup_card_box,
         Window(width=D(), char=" ", style="bg:#000000"),
-    ], height=7, style="bg:#000000")
+    ], height=4, style="bg:#000000")
 
     startup_shortcuts_line = VSplit([
         Window(width=D(), char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(get_startup_shortcuts_formatted), width=_get_responsive_card_dim, align="RIGHT", char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_startup_shortcuts_formatted), width=_get_responsive_card_dim, align=WindowAlign.LEFT, char=" ", style="bg:#000000"),
+        Window(width=D(), char=" ", style="bg:#000000"),
+    ], height=1, style="bg:#000000")
+
+    startup_tip_line = VSplit([
+        Window(width=D(), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_startup_tip_formatted), width=_get_responsive_card_dim, align=WindowAlign.CENTER, char=" ", style="bg:#000000"),
         Window(width=D(), char=" ", style="bg:#000000"),
     ], height=1, style="bg:#000000")
 
     startup_bottom_bar = VSplit([
         Window(content=FormattedTextControl(get_bottom_bar_left), height=1, char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(get_bottom_bar_right), height=1, align="RIGHT", char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_bottom_bar_right), height=1, align=WindowAlign.RIGHT, char=" ", style="bg:#000000"),
     ], height=1, style="bg:#000000")
 
     startup_view = HSplit([
         Window(height=D(min=0, weight=1), char=" ", style="bg:#000000"),
         Window(content=FormattedTextControl(get_centered_logo), height=len(RED_SITUS_LOGO.strip().splitlines()), char=" ", style="bg:#000000"),
-        Window(height=1, char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(get_centered_tagline), height=1, char=" ", style="bg:#000000"),
-        Window(height=1, char=" ", style="bg:#000000"),
+        Window(height=2, char=" ", style="bg:#000000"),
         startup_card_row,
         Window(height=1, char=" ", style="bg:#000000"),
         startup_shortcuts_line,
-        Window(height=D(min=0, weight=1.2), char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#000000"),
+        startup_tip_line,
+        Window(height=D(min=0, weight=1.4), char=" ", style="bg:#000000"),
         startup_bottom_bar,
     ], style="bg:#000000")
 
-    # ── Screen 2 (Active Screen): Modern Integrated Telemetry Header + Docked Chat ──
-    def get_top_session_bar_left():
-        last_q = session_state.get("last_query", "")
-        if not last_q:
-            last_q = "Cluster Session"
-        if len(last_q) > 36:
-            last_q = last_q[:34] + ".."
-
+    # ── Screen 2 (Active Screen): Modern Integrated Telemetry Footer + Docked Chat ──
+    def get_bottom_session_bar_left():
         curr_m = session_state.get("model", model)
         m_short = curr_m.split(":")[0] if ":" in curr_m else curr_m
         w_cnt = session_state.get("workers_count", 0)
@@ -2926,12 +2947,10 @@ def run_opencode_tui(
             cluster_chip = f"<style color='#64748b'>○ Offline</style>"
 
         return to_formatted_text(HTML(
-            f" <style color='#ff2a85'><b>✦ SITUS</b></style> <style color='#27272a'>│</style> "
-            f"<style color='#ff70a6'><b>#</b></style> <style color='#ffffff'><b>{html.escape(last_q)}</b></style> <style color='#27272a'>│</style> "
-            f"<style color='#ff70a6'><b>[{html.escape(m_short)}]</b></style> <style color='#475569'>·</style> {cluster_chip}"
+            f"  <style color='#ff70a6'><b>[{html.escape(m_short)}]</b></style> <style color='#475569'>·</style> {cluster_chip}"
         ))
 
-    def get_top_session_bar_right():
+    def get_bottom_session_bar_right():
         s_tok = session_state.get("stream_tokens", 0)
         s_tps = session_state.get("stream_tps", 0.0)
         tot_tok = session_state.get("tokens", 0)
@@ -2952,50 +2971,27 @@ def run_opencode_tui(
         parts = [tok_part]
         if tps_part:
             parts.extend([dot, tps_part])
-        parts.extend([dot, f"<style color='#94a3b8'>{vram_str}</style>", dot, f"<style color='#22c55e'>{trans}</style> "])
+        parts.extend([dot, f"<style color='#94a3b8'>{vram_str}</style>", dot, f"<style color='#22c55e'>{trans}</style>  "])
         return to_formatted_text(HTML(" ".join(parts)))
 
-    top_session_bar = VSplit([
-        Window(content=FormattedTextControl(get_top_session_bar_left), height=1, char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(get_top_session_bar_right), height=1, align="RIGHT", char=" ", style="bg:#000000"),
+    bottom_session_bar = VSplit([
+        Window(content=FormattedTextControl(get_bottom_session_bar_left), height=1, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_bottom_session_bar_right), height=1, align=WindowAlign.RIGHT, char=" ", style="bg:#000000"),
     ], height=1, style="bg:#000000")
 
-    top_session_sep = Window(height=1, char="─", style="class:card.border")
-
-    # Docked Minimal 3-Line Input Card for active chat (saves 4 lines of vertical space, no redundant status)
-    active_card_top = VSplit([
-        Window(width=1, height=1, char="╭", style="class:card.border"),
-        Window(char="─", style="class:card.border"),
-        Window(width=1, height=1, char="╮", style="class:card.border"),
-    ], height=1, style="bg:#000000")
-
-    active_card_middle = VSplit([
-        Window(width=1, char="│", style="class:card.border"),
+    # Docked Elevated Input Card for active chat (solid #161619, left accent bar ▌, 3 lines resting, 4 when streaming)
+    active_card_box = VSplit([
+        Window(width=1, char="▌", style="bg:#161619 #ff2a85 bold"),
+        Window(width=1, char=" ", style="bg:#161619"),
         active_card_inner,
-        Window(width=1, char="│", style="class:card.border"),
-    ], style="bg:#000000")
-
-    active_ticker_window = ConditionalContainer(
-        content=Window(content=FormattedTextControl(get_active_card_ticker), height=1, char=" ", style="bg:#000000"),
-        filter=Condition(lambda: session_state.get("is_generating", False))
-    )
-
-    active_card_bottom = VSplit([
-        Window(width=1, height=1, char="╰", style="class:card.border"),
-        Window(char="─", style="class:card.border"),
-        Window(width=1, height=1, char="╯", style="class:card.border"),
-    ], height=1, style="bg:#000000")
-
-    active_card_box = HSplit([
-        active_card_top,
-        active_card_middle,
-        active_ticker_window,
-        active_card_bottom,
-    ], style="bg:#000000")
+        Window(width=2, char=" ", style="bg:#161619"),
+    ], height=D(min=3, max=4, preferred=3), style="bg:#161619")
 
     active_left_pane = HSplit([
         history_win,
+        Window(height=1, char=" ", style="bg:#000000"),
         active_card_box,
+        Window(height=1, char=" ", style="bg:#000000"),
         shortcuts_line,
     ], style="bg:#000000")
 
@@ -3006,9 +3002,9 @@ def run_opencode_tui(
     ], style="bg:#000000")
 
     active_view = HSplit([
-        top_session_bar,
-        top_session_sep,
         active_main_split,
+        Window(height=1, char=" ", style="bg:#000000"),
+        bottom_session_bar,
     ], style="bg:#000000")
 
     def get_current_main_view():
@@ -3018,7 +3014,7 @@ def run_opencode_tui(
 
     main_container = DynamicContainer(get_current_main_view)
 
-    # Interactive Model Selection Dropdown Popup
+    # Interactive Model Selection Dropdown Popup (matching OpenCode modal design)
     def get_model_menu_fragments():
         curr_m = session_state.get("model", model).lower()
         frags = []
@@ -3039,72 +3035,100 @@ def run_opencode_tui(
                 return None
             return NotImplemented
 
-        # Header (82 cols total)
-        header_title = "╭── Select Distributed Model (6GB - 16GB Multi-GPU Pipeline) "
-        header_dashes = ("─" * (82 - len(header_title) - 1)) + "╮\n"
-        frags.append(("bold #ff2a85", header_title, close_handler))
-        frags.append(("bold #ff2a85", header_dashes, close_handler))
+        # Row 1: Header (Select model + esc)
+        frags.append(("bg:#161619 bold #ffffff", "  Select model", close_handler))
+        frags.append(("bg:#161619", " " * 55, close_handler))
+        frags.append(("bg:#161619 #71717a", "esc  \n", close_handler))
 
-        # Model rows (each exactly 82 cols)
-        for i, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
-            is_active = (m["id"].lower() == curr_m or m["name"].lower() == curr_m)
-            is_focused = (i - 1 == picker_focus_idx[0])
+        # Row 2: Dynamic Search line with hot-pink cursor
+        q_str = model_search_query[0]
+        if not q_str:
+            frags.append(("bg:#161619", "  ", close_handler))
+            frags.append(("bg:#161619 #71717a", "Search ", close_handler))
+            frags.append(("bg:#161619 bold #ff2a85", "▌", close_handler))
+            frags.append(("bg:#161619", (" " * 64) + "\n", close_handler))
+        else:
+            q_disp = q_str[:48]
+            rem_pad = max(0, 74 - (10 + len(q_disp) + 1))
+            frags.append(("bg:#161619", "  ", close_handler))
+            frags.append(("bg:#161619 #71717a", "Search: ", close_handler))
+            frags.append(("bg:#161619 bold #ffffff", q_disp, close_handler))
+            frags.append(("bg:#161619 bold #ff2a85", "▌", close_handler))
+            frags.append(("bg:#161619", (" " * rem_pad) + "\n", close_handler))
 
-            cur_str = "▶ " if is_focused else "  "
-            cur_style = "bold #ff2a85" if is_focused else "#ffffff"
+        # Row 3: Blank spacing row
+        frags.append(("bg:#161619", (" " * 74) + "\n", close_handler))
 
-            num_str = f"[{i:>2}] "
-            num_style = "bold #ff70a6" if is_focused else "#6b7280"
+        # Row 4: Group Header
+        filtered_models = get_filtered_models()
+        if not q_str.strip():
+            hdr_text = "  Distributed Cluster Models (6GB - 16GB)"
+        else:
+            hdr_text = f"  Search Results ({len(filtered_models)} matches)"
+        hdr_pad = max(0, 74 - len(hdr_text))
+        frags.append(("bg:#161619 bold #c084fc", hdr_text + (" " * hdr_pad) + "\n", close_handler))
 
-            marker_str = "● " if is_active else "  "
-            marker_style = "bold #22c55e" if is_active else "#334155"
+        # Model rows
+        if not filtered_models:
+            no_match = f"  No models found matching '{q_str}'..."
+            no_pad = max(0, 74 - len(no_match))
+            frags.append(("bg:#161619 #71717a italic", no_match + (" " * no_pad) + "\n", close_handler))
+        else:
+            picker_focus_idx[0] = max(0, min(picker_focus_idx[0], len(filtered_models) - 1))
+            for item_idx, (real_idx, m) in enumerate(filtered_models):
+                is_active = (m["id"].lower() == curr_m or m["name"].lower() == curr_m)
+                is_focused = (item_idx == picker_focus_idx[0])
 
-            m_name = m["name"]
-            name_str = f"{m_name[:31]:<31} "
-            name_style = "bold #ffffff" if (is_focused or is_active) else "#cbd5e1"
+                m_name = m["name"]
+                m_vram = m["vram_gb"]
+                split = m["recommended_split"]
+                if "2-3x" in split:
+                    split = "2-3x GPUs (5G/3x, 7G/2x)"
+                elif "2x 6GB" in split:
+                    split = split.replace(" / GPU", "/GPU")
 
-            m_vram = m["vram_gb"]
-            vram_str = f"{m_vram:>4.1f} GB · "
-            vram_style = "bold #ff70a6" if is_focused else "#94a3b8"
+                name_col = f"{m_name[:38]:<38}"
+                spec_col = f"{m_vram:>4.1f} GB · {split[:18]:<18}"
+                h = make_handler(real_idx)
 
-            split = m["recommended_split"]
-            if "2-3x" in split:
-                split = "2-3x GPUs (5G/3x, 7G/2x)"
-            elif "2x 6GB" in split:
-                split = split.replace(" / GPU", "/GPU")
-            split_str = f"{split[:27]:<27}"
-            split_style = "bold #ffffff" if is_focused else "#64748b"
+                if is_focused:
+                    # Solid hot-pink highlight banner across full row
+                    frags.append(("bg:#ff2a85 #000000 bold", f"  ● {name_col}  {spec_col}    \n", h))
+                else:
+                    marker = "● " if is_active else "  "
+                    marker_style = "bg:#161619 bold #22c55e" if is_active else "bg:#161619 #334155"
+                    name_style = "bg:#161619 bold #ffffff" if is_active else "bg:#161619 #e2e8f0"
+                    frags.append(("bg:#161619", "  ", h))
+                    frags.append((marker_style, marker, h))
+                    frags.append((name_style, f"{name_col}  ", h))
+                    frags.append(("bg:#161619 #71717a", f"{spec_col}    \n", h))
 
-            h = make_handler(i)
+        # Blank spacing row
+        frags.append(("bg:#161619", (" " * 74) + "\n", close_handler))
 
-            frags.append(("bold #ff2a85", "│ ", h))
-            frags.append((cur_style, cur_str, h))
-            frags.append((num_style, num_str, h))
-            frags.append((marker_style, marker_str, h))
-            frags.append((name_style, name_str, h))
-            frags.append((vram_style, vram_str, h))
-            frags.append((split_style, split_str, h))
-            frags.append(("bold #ff2a85", " │\n", h))
-
-        # Hint & footer
-        hint_str = "│  ↑/↓: Navigate  ·  Enter / Click: Select  ·  1-9: Quick  ·  Esc: Close         │\n"
-        frags.append(("#ff70a6", hint_str, close_handler))
-
-        footer_str = "╰" + ("─" * 80) + "╯"
-        frags.append(("bold #ff2a85", footer_str, close_handler))
+        # Footer
+        frags.append(("bg:#161619 #71717a", "  Select ", close_handler))
+        frags.append(("bg:#161619 bold #ffffff", "enter", close_handler))
+        frags.append(("bg:#161619 #71717a", "   Navigate ", close_handler))
+        frags.append(("bg:#161619 bold #ffffff", "↑/↓ · tab", close_handler))
+        frags.append(("bg:#161619 #71717a", "   Close ", close_handler))
+        frags.append(("bg:#161619 bold #ffffff", "esc", close_handler))
+        frags.append(("bg:#161619", " " * 27, close_handler))
 
         return frags
 
     model_menu_win = Window(
         content=FormattedTextControl(get_model_menu_fragments),
-        width=82,
-        height=len(DISTRIBUTED_MODELS_6GB_10GB) + 3,
+        width=74,
+        height=lambda: min(18, max(7, len(get_filtered_models()) + 6)),
         wrap_lines=False,
+        char=" ",
+        style="bg:#161619",
     )
     is_model_picker_open = Condition(lambda: show_model_picker[0])
     model_menu_float = Float(
         content=ConditionalContainer(content=model_menu_win, filter=is_model_picker_open),
-        bottom=8,
+        bottom=3,
     )
 
     root = FloatContainer(
@@ -3297,6 +3321,18 @@ def run_opencode_tui(
 
     @kb.add("enter")
     def on_enter(event):
+        if show_model_picker[0]:
+            filtered = get_filtered_models()
+            if filtered:
+                idx = max(0, min(picker_focus_idx[0], len(filtered) - 1))
+                real_idx, _ = filtered[idx]
+                select_model_by_index(real_idx)
+            else:
+                show_model_picker[0] = False
+                model_search_query[0] = ""
+                event.app.invalidate()
+            return
+
         buf = input_box.buffer
         if buf.complete_state and buf.complete_state.current_completion:
             comp = buf.complete_state.current_completion
@@ -3308,7 +3344,7 @@ def run_opencode_tui(
             buf.cancel_completion()
         user_input = input_box.text.strip()
 
-        # If user entered a command or prompt, ALWAYS execute it (never let model picker swallow Enter)
+        # If user entered a command or prompt, execute it
         if user_input:
             show_model_picker[0] = False
             session_state["active_screen"] = "active"
@@ -3380,11 +3416,6 @@ def run_opencode_tui(
             t.start()
             return
 
-        # Empty input: if model picker was explicitly opened, Enter selects the focused model
-        elif show_model_picker[0]:
-            select_model_by_index(picker_focus_idx[0] + 1)
-            return
-
     # Multiline support: Shift+Enter / Ctrl+J or Alt+Enter inserts newline
     @kb.add("c-j")
     def on_ctrl_j(event):
@@ -3403,6 +3434,7 @@ def run_opencode_tui(
             return
         if show_model_picker[0]:
             show_model_picker[0] = False
+            model_search_query[0] = ""
             event.app.invalidate()
             return
         if session_state.get("is_generating", False):
@@ -3425,6 +3457,7 @@ def run_opencode_tui(
             return
         if show_model_picker[0]:
             show_model_picker[0] = False
+            model_search_query[0] = ""
             event.app.invalidate()
             return
         if session_state.get("is_generating", False):
@@ -3456,20 +3489,57 @@ def run_opencode_tui(
     def on_ctrl_o(event):
         toggle_model_menu()
 
-    for num in range(1, 9):
-        @kb.add(str(num), filter=Condition(lambda: show_model_picker[0] and not input_box.text.strip()))
-        def _pick_num(event, n=num):
-            select_model_by_index(n)
+    @kb.add("c-p")
+    def on_ctrl_p(event):
+        """Ctrl+P opens slash commands completions menu."""
+        buf = input_box.buffer
+        if not buf.text.startswith("/"):
+            buf.text = "/"
+            buf.cursor_position = 1
+        buf.start_completion(select_first=True)
+        event.app.invalidate()
+
+    # Interactive dynamic search inside model picker
+    is_picker_active = Condition(lambda: show_model_picker[0])
+
+    @kb.add(Keys.Any, filter=is_picker_active)
+    def _on_picker_char(event):
+        char = event.data
+        if char and (char.isprintable() or char == " "):
+            model_search_query[0] += char
+            picker_focus_idx[0] = 0
+            event.app.invalidate()
+
+    @kb.add("space", filter=is_picker_active)
+    def _on_picker_space(event):
+        model_search_query[0] += " "
+        picker_focus_idx[0] = 0
+        event.app.invalidate()
+
+    @kb.add("backspace", filter=is_picker_active)
+    def _on_picker_backspace(event):
+        if model_search_query[0]:
+            model_search_query[0] = model_search_query[0][:-1]
+            picker_focus_idx[0] = 0
+            event.app.invalidate()
+
+    @kb.add("c-u", filter=is_picker_active)
+    def _on_picker_clear(event):
+        model_search_query[0] = ""
+        picker_focus_idx[0] = 0
+        event.app.invalidate()
 
     @kb.add("tab")
     def on_tab(event):
+        if show_model_picker[0]:
+            filtered = get_filtered_models()
+            if filtered:
+                picker_focus_idx[0] = (picker_focus_idx[0] + 1) % len(filtered)
+            event.app.invalidate()
+            return
         buf = input_box.buffer
         if buf.complete_state and buf.complete_state.completions:
             buf.complete_next()
-            event.app.invalidate()
-            return
-        if show_model_picker[0] and not input_box.text.strip():
-            picker_focus_idx[0] = (picker_focus_idx[0] + 1) % len(DISTRIBUTED_MODELS_6GB_10GB)
             event.app.invalidate()
             return
         if not buf.text:
@@ -3483,18 +3553,21 @@ def run_opencode_tui(
 
     @kb.add("s-tab")
     def on_s_tab(event):
+        if show_model_picker[0]:
+            filtered = get_filtered_models()
+            if filtered:
+                picker_focus_idx[0] = (picker_focus_idx[0] - 1) % len(filtered)
+            event.app.invalidate()
+            return
         buf = input_box.buffer
         if buf.complete_state and buf.complete_state.completions:
             buf.complete_previous()
             event.app.invalidate()
             return
-        if show_model_picker[0] and not input_box.text.strip():
-            picker_focus_idx[0] = (picker_focus_idx[0] - 1) % len(DISTRIBUTED_MODELS_6GB_10GB)
-            event.app.invalidate()
 
     @kb.add("pageup")
     def on_pageup(event):
-        if show_model_picker[0] and not input_box.text.strip():
+        if show_model_picker[0]:
             picker_focus_idx[0] = 0
             event.app.invalidate()
             return
@@ -3502,8 +3575,10 @@ def run_opencode_tui(
 
     @kb.add("pagedown")
     def on_pagedown(event):
-        if show_model_picker[0] and not input_box.text.strip():
-            picker_focus_idx[0] = len(DISTRIBUTED_MODELS_6GB_10GB) - 1
+        if show_model_picker[0]:
+            filtered = get_filtered_models()
+            if filtered:
+                picker_focus_idx[0] = len(filtered) - 1
             event.app.invalidate()
             return
         scroll_history_down(10)
@@ -3546,13 +3621,15 @@ def run_opencode_tui(
 
     @kb.add("up")
     def on_up(event):
+        if show_model_picker[0]:
+            filtered = get_filtered_models()
+            if filtered:
+                picker_focus_idx[0] = (picker_focus_idx[0] - 1) % len(filtered)
+            event.app.invalidate()
+            return
         buf = input_box.buffer
         if buf.complete_state and buf.complete_state.completions:
             buf.complete_previous()
-            event.app.invalidate()
-            return
-        if show_model_picker[0] and not input_box.text.strip():
-            picker_focus_idx[0] = (picker_focus_idx[0] - 1) % len(DISTRIBUTED_MODELS_6GB_10GB)
             event.app.invalidate()
             return
         if "\n" in buf.text and buf.cursor_position > buf.text.find("\n"):
@@ -3569,13 +3646,15 @@ def run_opencode_tui(
 
     @kb.add("down")
     def on_down(event):
+        if show_model_picker[0]:
+            filtered = get_filtered_models()
+            if filtered:
+                picker_focus_idx[0] = (picker_focus_idx[0] + 1) % len(filtered)
+            event.app.invalidate()
+            return
         buf = input_box.buffer
         if buf.complete_state and buf.complete_state.completions:
             buf.complete_next()
-            event.app.invalidate()
-            return
-        if show_model_picker[0] and not input_box.text.strip():
-            picker_focus_idx[0] = (picker_focus_idx[0] + 1) % len(DISTRIBUTED_MODELS_6GB_10GB)
             event.app.invalidate()
             return
         buf = input_box.buffer
@@ -3658,6 +3737,19 @@ def run_opencode_tui(
 
     sync_thread = threading.Thread(target=_bg_cluster_sync_loop, daemon=True)
     sync_thread.start()
+
+    def _bg_cursor_blink_loop():
+        while not stop_bg_sync.is_set():
+            time.sleep(0.53)
+            cursor_blink[0] = not cursor_blink[0]
+            if app_instance[0] and session_state.get("active_screen", "startup") == "startup" and not input_box.text:
+                try:
+                    app_instance[0].invalidate()
+                except Exception:
+                    pass
+
+    blink_thread = threading.Thread(target=_bg_cursor_blink_loop, daemon=True)
+    blink_thread.start()
 
     try:
         set_pitch_black_terminal()
