@@ -128,12 +128,6 @@ class ScrollableHistoryControl(FormattedTextControl):
         return NotImplemented
 
 
-try:
-    import torch
-    HAS_TORCH = True
-except (ImportError, OSError, Exception):
-    HAS_TORCH = False
-
 console = Console(legacy_windows=False)
 
 # Centered modern block logo for Situs
@@ -706,10 +700,95 @@ def start_in_process_coordinator(host: str = "0.0.0.0", port: int = 8000) -> Tup
 
 
 def detect_hardware_gpu(requested_device: Optional[str] = "auto") -> Tuple[str, int, int, str]:
-    """Detects physical GPU/CPU hardware and returns (name, total_b, free_b, dev_type)."""
-    from situs.hardware import detect_hardware
+    """Fast, memory-efficient physical GPU/CPU hardware detection for TUI status and telemetry."""
+    from situs.hardware import query_nvidia_smi, query_windows_cim_gpus, detect_hardware
+    req = (requested_device or "auto").strip().lower()
+    if req not in ("cpu", "host"):
+        smi = query_nvidia_smi()
+        if smi is not None:
+            name, total_b, free_b, used_b = smi
+            return (name, total_b, free_b, "cuda")
+        cim = query_windows_cim_gpus()
+        if cim is not None:
+            name, total_b, free_b, used_b = cim
+            return (name, total_b, free_b, "cuda")
     hw = detect_hardware(requested_device=requested_device)
     return hw.as_tuple()
+
+
+def _sync_live_vram_state(session_state: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> bool:
+    """Sync live local dGPU hardware telemetry and cluster metadata into session_state. Returns True if changed."""
+    from situs.hardware import get_live_gpu_vram
+    changed = False
+
+    try:
+        loc_tot_b, loc_used_b, loc_free_b = get_live_gpu_vram()
+        loc_tot = round(loc_tot_b / (1024**3), 2)
+        loc_used = round(loc_used_b / (1024**3), 2)
+        loc_free = round(loc_free_b / (1024**3), 2)
+        loc_pct = round((loc_used_b / max(1, loc_tot_b)) * 100, 1)
+
+        if abs(loc_tot - session_state.get("local_total_vram_gb", 0.0)) > 0.01:
+            session_state["local_total_vram_gb"] = loc_tot
+            changed = True
+        if abs(loc_used - session_state.get("local_used_vram_gb", 0.0)) > 0.01:
+            session_state["local_used_vram_gb"] = loc_used
+            changed = True
+        if abs(loc_free - session_state.get("local_free_vram_gb", 0.0)) > 0.01:
+            session_state["local_free_vram_gb"] = loc_free
+            changed = True
+        if abs(loc_pct - session_state.get("local_vram_pct", 0.0)) > 0.2:
+            session_state["local_vram_pct"] = loc_pct
+            changed = True
+
+        mem_tag = "VRAM" if session_state.get("local_dev_type", "cuda") == "cuda" else "RAM"
+        session_state["vram_desc"] = f"{loc_used:.1f}/{loc_tot:.1f} GB {mem_tag} ({loc_free:.1f} GB free)"
+    except Exception:
+        pass
+
+    if meta is not None:
+        w_cnt = meta.get("active_workers_count", 0)
+        if w_cnt != session_state.get("workers_count"):
+            session_state["workers_count"] = w_cnt
+            changed = True
+
+        c_stat = meta.get("status", "offline")
+        if c_stat != session_state.get("coord_status"):
+            session_state["coord_status"] = c_stat
+            changed = True
+
+        tot_vram = meta.get("total_vram_gb", 0.0)
+        if abs(tot_vram - session_state.get("total_vram_gb", 0.0)) > 0.01:
+            session_state["total_vram_gb"] = tot_vram
+            changed = True
+
+        free_vram = meta.get("free_vram_gb", 0.0)
+        if abs(free_vram - session_state.get("free_vram_gb", 0.0)) > 0.01:
+            session_state["free_vram_gb"] = free_vram
+            changed = True
+
+        used_vram = meta.get("used_vram_gb", 0.0)
+        if abs(used_vram - session_state.get("used_vram_gb", 0.0)) > 0.01:
+            session_state["used_vram_gb"] = used_vram
+            changed = True
+
+        pct = meta.get("vram_usage_pct", 0.0)
+        if abs(pct - session_state.get("vram_usage_pct", 0.0)) > 0.2:
+            session_state["vram_usage_pct"] = pct
+            changed = True
+
+        coord_model = meta.get("model") or meta.get("active_model")
+        if not session_state.get("is_coordinator", True) and coord_model:
+            if coord_model.lower() != session_state.get("model", "").lower():
+                session_state["model"] = coord_model
+                changed = True
+
+        curr_workers = meta.get("workers", [])
+        if curr_workers != session_state.get("cluster_workers"):
+            session_state["cluster_workers"] = curr_workers
+            changed = True
+
+    return changed
 
 
 def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected GPU Worker Nodes") -> Table:
@@ -790,7 +869,7 @@ def render_vram_telemetry_table(meta: Dict[str, Any]) -> Table:
             "local-host",
             hw.device_name,
             bar_str,
-            f"{used_b / 1e9:.2f} / {tot_b / 1e9:.2f} GB",
+            f"{used_b / (1024**3):.2f} / {tot_b / (1024**3):.2f} GB",
             "GPU VRAM Only (Zero RAM)",
             "[bold green]STANDBY[/bold green]",
         )
@@ -1058,7 +1137,7 @@ def prompt_in_centered_box(
     """
     cols = shutil.get_terminal_size().columns
     lines = shutil.get_terminal_size().lines
-    card_width = min(74, max(44, cols - 4))
+    card_width = min(74, max(20, cols - 4))
 
     completer = OpenCodeSlashCompleter()
     input_box = TextArea(
@@ -1088,7 +1167,7 @@ def prompt_in_centered_box(
         input_box,
         Window(content=FormattedTextControl(HTML(status_line_html)), height=1, char=" ", style="bg:#161619"),
         Window(height=1, char=" ", style="bg:#161619"),
-    ], style="bg:#161619")
+    ], style="bg:#161619", window_too_small=Window(height=0))
 
     # Clean elevated card (solid #161619 with left hot-pink accent bar ▌)
     card_box = VSplit([
@@ -1096,7 +1175,7 @@ def prompt_in_centered_box(
         Window(width=1, char=" ", style="bg:#161619"),
         card_inner,
         Window(width=2, char=" ", style="bg:#161619"),
-    ], width=card_width, style="bg:#161619")
+    ], width=card_width, height=4, style="bg:#161619", window_too_small=Window(height=0))
 
     float_container = FloatContainer(
         content=card_box,
@@ -1136,7 +1215,7 @@ def prompt_in_centered_box(
     ], height=1, style="bg:#000000")
 
     elements = []
-    if show_splash:
+    if show_splash and lines >= 17:
         # Optical vertical centering
         top_pad = max(1, (lines - 16) // 2 - 1)
         elements.append(Window(height=top_pad, char=" ", style="bg:#000000"))
@@ -1154,7 +1233,7 @@ def prompt_in_centered_box(
         elements.append(Window(height=1, char=" ", style="bg:#000000"))
 
     # Add centered card, shortcuts, and tip
-    elements.append(VSplit([Window(width=D(), char=" ", style="bg:#000000"), float_container, Window(width=D(), char=" ", style="bg:#000000")], style="bg:#000000"))
+    elements.append(VSplit([Window(width=D(), char=" ", style="bg:#000000"), float_container, Window(width=D(), char=" ", style="bg:#000000")], style="bg:#000000", window_too_small=Window(height=0)))
     elements.append(Window(height=1, char=" ", style="bg:#000000"))
     elements.append(shortcuts_view)
     elements.append(Window(height=1, char=" ", style="bg:#000000"))
@@ -1162,7 +1241,7 @@ def prompt_in_centered_box(
     elements.append(Window(height=D(), char=" ", style="bg:#000000"))  # Spring pushing footer down
     elements.append(footer_view)
 
-    root = HSplit(elements, style="bg:#000000")
+    root = HSplit(elements, style="bg:#000000", window_too_small=Window(height=0))
 
     kb = KeyBindings()
 
@@ -1475,8 +1554,9 @@ def execute_slash_command(
 
         # Update local session hardware telemetry
         session_state["gpu_name"] = hw.device_name
+        session_state["local_dev_type"] = hw.device_type
         mem_tag = "VRAM" if hw.gpu_available else "RAM"
-        session_state["vram_desc"] = f"{hw.total_memory_gb:.1f} GB {mem_tag} ({hw.free_memory_gb:.1f} GB free)"
+        session_state["vram_desc"] = f"{hw.used_memory_gb:.1f}/{hw.total_memory_gb:.1f} GB {mem_tag} ({hw.free_memory_gb:.1f} GB free)"
 
         # Update session coordinator_url so this TUI also communicates directly with the cluster!
         http_coord = target_addr.strip()
@@ -1494,10 +1574,7 @@ def execute_slash_command(
             session_state["is_coordinator"] = False
 
         m = fetch_cluster_metadata(http_coord, ttl=0.0)
-        session_state["workers_count"] = m.get("active_workers_count", session_state.get("workers_count", 1))
-        session_state["coord_status"] = m.get("status", "online")
-        session_state["total_vram_gb"] = m.get("total_vram_gb", 0.0)
-        session_state["free_vram_gb"] = m.get("free_vram_gb", 0.0)
+        _sync_live_vram_state(session_state, m)
         if m.get("model"):
             session_state["model"] = m.get("model")
 
@@ -2082,6 +2159,15 @@ def run_opencode_tui(
         "speed": 0.0,
         "workers_count": 0,
         "coord_status": "offline",
+        "total_vram_gb": 0.0,
+        "free_vram_gb": 0.0,
+        "used_vram_gb": 0.0,
+        "vram_usage_pct": 0.0,
+        "local_dev_type": dev_type,
+        "local_total_vram_gb": round(total_gb, 2),
+        "local_used_vram_gb": 0.0,
+        "local_free_vram_gb": round(free_gb, 2),
+        "local_vram_pct": 0.0,
         "vram_desc": f"{total_gb:.1f} GB ({free_gb:.1f} GB free)" if dev_type == "cuda" else f"{total_gb:.1f} GB RAM ({free_gb:.1f} GB free)",
         "gpu_name": gpu_name,
         "is_generating": False,
@@ -2089,15 +2175,9 @@ def run_opencode_tui(
         "cluster_workers": [],
     }
 
-    # Initial cluster probe
+    # Initial cluster probe & live hardware telemetry
     meta = fetch_cluster_metadata(coordinator_url, ttl=0.0)
-    session_state["workers_count"] = meta.get("active_workers_count", 0)
-    session_state["coord_status"] = meta.get("status", "offline")
-    session_state["total_vram_gb"] = meta.get("total_vram_gb", 0.0)
-    session_state["free_vram_gb"] = meta.get("free_vram_gb", 0.0)
-    session_state["used_vram_gb"] = meta.get("used_vram_gb", 0.0)
-    session_state["vram_usage_pct"] = meta.get("vram_usage_pct", 0.0)
-    session_state["cluster_workers"] = meta.get("workers", [])
+    _sync_live_vram_state(session_state, meta)
     if not is_init_coord and meta.get("model"):
         session_state["model"] = meta.get("model")
 
@@ -2536,38 +2616,15 @@ def run_opencode_tui(
         input_box,
         Window(content=FormattedTextControl(get_card_status_fragments), height=1, char=" ", style="bg:#161619"),
         Window(height=1, char=" ", style="bg:#161619"),
-    ], style="bg:#161619")
+    ], style="bg:#161619", window_too_small=Window(height=0))
 
-    def get_active_card_ticker():
-        is_gen = session_state.get("is_generating", False)
-        if not is_gen:
-            return []
-        if session_state.get("is_pulling"):
-            pct = session_state.get("pull_percent", 0.0)
-            stage = session_state.get("pull_stage", "Streaming Layers...")
-            bar = make_progress_bar(pct, width=14)
-            sp = session_state.get("pull_speed", "")
-            sp_txt = f" · {sp}" if sp else ""
-            return to_formatted_text(HTML(f'<style color="#f59e0b">  ● <b>Pulling Weights:</b> {bar} {pct:.1f}%{sp_txt} ({html.escape(stage)})</style>'))
-        s_tok = session_state.get("stream_tokens", 0)
-        s_tps = session_state.get("stream_tps", 0.0)
-        return to_formatted_text(HTML(
-            f'<style color="#ff70a6">  ● <b>Streaming:</b> {s_tok} tokens · {s_tps:.1f} tok/s</style> '
-            f'<style color="#64748b">· press <b>esc</b> to stop</style>'
-        ))
-
-    active_ticker_window = ConditionalContainer(
-        content=Window(content=FormattedTextControl(get_active_card_ticker), height=1, char=" ", style="bg:#161619"),
-        filter=Condition(lambda: session_state.get("is_generating", False))
-    )
-
-    # Active Screen Card: Clean elevated input surface with proper vertical padding (3 lines resting, 4 when streaming)
+    # Active Screen Card: Clean elevated input surface with fixed normal height (3 lines always)
+    # Streaming/pulling telemetry lives cleanly in the integrated bottom session bar
     active_card_inner = HSplit([
         Window(height=1, char=" ", style="bg:#161619"),
         input_box,
-        active_ticker_window,
         Window(height=1, char=" ", style="bg:#161619"),
-    ], style="bg:#161619")
+    ], style="bg:#161619", window_too_small=Window(height=0))
 
     def get_shortcuts_formatted():
         is_gen = session_state.get("is_generating", False)
@@ -2655,31 +2712,47 @@ def run_opencode_tui(
         used_cluster_vram = session_state.get("used_vram_gb", 0.0)
         pct_cluster = session_state.get("vram_usage_pct", 0.0)
 
+        loc_tot = session_state.get("local_total_vram_gb", 0.0)
+        loc_used = session_state.get("local_used_vram_gb", 0.0)
+        loc_free = session_state.get("local_free_vram_gb", 0.0)
+        loc_pct = session_state.get("local_vram_pct", 0.0)
+
+        def _append_vram_gauge(label: str, used_g: float, tot_g: float, free_g: float, pct_v: float, suffix: str = "") -> None:
+            frags.append(("#94a3b8", f"{label}: "))
+            frags.append(("bold #ffffff", f"{used_g:.1f}/{tot_g:.1f} GB "))
+            frags.append(("bold #ff70a6", f"({pct_v:.0f}%)\n"))
+            bar = make_progress_bar(pct_v, width=16)
+            frags.append(("bold #ff2a85", f"{bar}\n"))
+            frags.append(("#94a3b8", "Available Free: "))
+            frags.append(("bold #22c55e", f"{free_g:.1f} GB{suffix}\n"))
+
         # SECTION 1: CLUSTER POOL
         frags.append(("bold #ffffff", "CLUSTER POOL\n"))
         if w_cnt > 0:
             frags.append(("bold #22c55e", f"● {w_cnt} GPUs Active\n"))
             if total_cluster_vram > 0:
-                frags.append(("#94a3b8", "Pooled VRAM: "))
-                frags.append(("bold #ffffff", f"{used_cluster_vram:.1f}/{total_cluster_vram:.1f} GB "))
-                frags.append(("bold #ff70a6", f"({pct_cluster:.0f}%)\n"))
-                bar = make_progress_bar(pct_cluster, width=16)
-                frags.append(("bold #ff2a85", f"{bar}\n"))
-                frags.append(("#94a3b8", "Available Free: "))
-                frags.append(("bold #22c55e", f"{free_cluster_vram:.1f} GB (GPU Pure)\n"))
+                _append_vram_gauge("Pooled VRAM", used_cluster_vram, total_cluster_vram, free_cluster_vram, pct_cluster, " (GPU Pure)")
+            elif loc_tot > 0:
+                _append_vram_gauge("dGPU VRAM", loc_used, loc_tot, loc_free, loc_pct)
             else:
                 vram_str = session_state.get("vram_desc", f"{total_cluster_vram:.1f} GB")
                 frags.append(("#94a3b8", f"VRAM: {vram_str}\n"))
         elif c_stat in ("healthy", "online", "no_workers"):
             frags.append(("bold #f59e0b", "● Coordinator Ready\n"))
             frags.append(("#94a3b8", "Waiting for /join\n"))
-            vram_str = session_state.get("vram_desc", "0.0 GB")
-            frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
+            if loc_tot > 0:
+                _append_vram_gauge("dGPU VRAM", loc_used, loc_tot, loc_free, loc_pct)
+            else:
+                vram_str = session_state.get("vram_desc", "0.0 GB")
+                frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         else:
             frags.append(("#64748b", "○ Cluster Offline\n"))
             frags.append(("#94a3b8", "Start with /coordinator\n"))
-            vram_str = session_state.get("vram_desc", "0.0 GB")
-            frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
+            if loc_tot > 0:
+                _append_vram_gauge("dGPU VRAM", loc_used, loc_tot, loc_free, loc_pct)
+            else:
+                vram_str = session_state.get("vram_desc", "0.0 GB")
+                frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
         trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
         frags.append(("#94a3b8", "Interconnect: "))
         frags.append(("#e2e8f0", f"{trans_name}\n"))
@@ -2831,8 +2904,17 @@ def run_opencode_tui(
                 pass
         return shutil.get_terminal_size().columns
 
+    def _get_active_rows():
+        if app_instance[0] and hasattr(app_instance[0], "output") and app_instance[0].output:
+            try:
+                return app_instance[0].output.get_size().rows
+            except Exception:
+                pass
+        return shutil.get_terminal_size().lines
+
     # Condition: show sidebar on standard and wide screens (>= 80 columns)
     is_wide = Condition(lambda: _get_active_columns() >= 80)
+    is_tall_enough = Condition(lambda: _get_active_rows() >= 17)
     divider = ConditionalContainer(content=Window(width=1, char="│", style="class:card.border"), filter=is_wide)
     sidebar_cond = ConditionalContainer(content=sidebar_pane, filter=is_wide)
 
@@ -2859,9 +2941,9 @@ def run_opencode_tui(
         cols = _get_active_columns()
         if cols >= 88:
             target = max(78, min(96, int(cols * 0.70)))
-        else:
-            target = max(40, cols - 4)
-        return D(min=min(target, 76), max=target, preferred=target)
+            return D(min=min(target, max(12, cols - 4)), max=target, preferred=target)
+        target = max(16, cols - 4)
+        return D(min=min(target, max(12, cols - 4)), max=target, preferred=target)
 
     def get_startup_shortcuts_formatted():
         is_coord = session_state.get("is_coordinator", True)
@@ -2894,35 +2976,44 @@ def run_opencode_tui(
         Window(width=1, char=" ", style="bg:#161619"),
         startup_card_inner,
         Window(width=2, char=" ", style="bg:#161619"),
-    ], width=_get_responsive_card_dim, height=4, style="bg:#161619")
+    ], width=_get_responsive_card_dim, height=4, style="bg:#161619", window_too_small=Window(height=0))
 
     startup_card_row = VSplit([
         Window(width=D(), char=" ", style="bg:#000000"),
         startup_card_box,
         Window(width=D(), char=" ", style="bg:#000000"),
-    ], height=4, style="bg:#000000")
+    ], height=4, style="bg:#000000", window_too_small=Window(height=0))
 
     startup_shortcuts_line = VSplit([
         Window(width=D(), char=" ", style="bg:#000000"),
         Window(content=FormattedTextControl(get_startup_shortcuts_formatted), width=_get_responsive_card_dim, align=WindowAlign.LEFT, char=" ", style="bg:#000000"),
         Window(width=D(), char=" ", style="bg:#000000"),
-    ], height=1, style="bg:#000000")
+    ], height=1, style="bg:#000000", window_too_small=Window(height=0))
 
     startup_tip_line = VSplit([
         Window(width=D(), char=" ", style="bg:#000000"),
         Window(content=FormattedTextControl(get_startup_tip_formatted), width=_get_responsive_card_dim, align=WindowAlign.CENTER, char=" ", style="bg:#000000"),
         Window(width=D(), char=" ", style="bg:#000000"),
-    ], height=1, style="bg:#000000")
+    ], height=1, style="bg:#000000", window_too_small=Window(height=0))
 
     startup_bottom_bar = VSplit([
         Window(content=FormattedTextControl(get_bottom_bar_left), height=1, char=" ", style="bg:#000000"),
         Window(content=FormattedTextControl(get_bottom_bar_right), height=1, align=WindowAlign.RIGHT, char=" ", style="bg:#000000"),
-    ], height=1, style="bg:#000000")
+    ], height=1, style="bg:#000000", window_too_small=Window(height=0))
+
+    startup_logo_win = ConditionalContainer(
+        content=Window(content=FormattedTextControl(get_centered_logo), height=len(RED_SITUS_LOGO.strip().splitlines()), char=" ", style="bg:#000000"),
+        filter=is_tall_enough,
+    )
+    startup_logo_pad = ConditionalContainer(
+        content=Window(height=2, char=" ", style="bg:#000000"),
+        filter=is_tall_enough,
+    )
 
     startup_view = HSplit([
         Window(height=D(min=0, weight=1), char=" ", style="bg:#000000"),
-        Window(content=FormattedTextControl(get_centered_logo), height=len(RED_SITUS_LOGO.strip().splitlines()), char=" ", style="bg:#000000"),
-        Window(height=2, char=" ", style="bg:#000000"),
+        startup_logo_win,
+        startup_logo_pad,
         startup_card_row,
         Window(height=1, char=" ", style="bg:#000000"),
         startup_shortcuts_line,
@@ -2930,7 +3021,7 @@ def run_opencode_tui(
         startup_tip_line,
         Window(height=D(min=0, weight=1.4), char=" ", style="bg:#000000"),
         startup_bottom_bar,
-    ], style="bg:#000000")
+    ], style="bg:#000000", window_too_small=Window(height=0))
 
     # ── Screen 2 (Active Screen): Modern Integrated Telemetry Footer + Docked Chat ──
     def get_bottom_session_bar_left():
@@ -2939,7 +3030,15 @@ def run_opencode_tui(
         w_cnt = session_state.get("workers_count", 0)
         coord_st = session_state.get("coord_status", "offline")
 
-        if w_cnt > 0:
+        if session_state.get("is_pulling"):
+            pct = session_state.get("pull_percent", 0.0)
+            bar = make_progress_bar(pct, width=10)
+            stage = session_state.get("pull_stage", "Streaming Layers...")
+            return to_formatted_text(HTML(
+                f"  <style color='#ff70a6'><b>[{html.escape(m_short)}]</b></style> <style color='#475569'>·</style> "
+                f"<style color='#f59e0b'>● Pulling: {bar} {pct:.0f}% ({html.escape(stage)})</style>"
+            ))
+        elif w_cnt > 0:
             cluster_chip = f"<style color='#22c55e'>● {w_cnt} Nodes Active</style>"
         elif coord_st in ("healthy", "online", "no_workers"):
             cluster_chip = f"<style color='#eab308'>● Ready (/join)</style>"
@@ -2961,10 +3060,23 @@ def run_opencode_tui(
         used_v = session_state.get("used_vram_gb", 0.0)
         tot_v = session_state.get("total_vram_gb", 0.0)
         pct_v = session_state.get("vram_usage_pct", 0.0)
+        if tot_v <= 0:
+            used_v = session_state.get("local_used_vram_gb", 0.0)
+            tot_v = session_state.get("local_total_vram_gb", 0.0)
+            pct_v = session_state.get("local_vram_pct", 0.0)
         vram_str = f"{used_v:.1f}/{tot_v:.1f} GB ({pct_v:.0f}%)" if tot_v > 0 else "0.0 GB"
         trans = "WebRTC P2P" if session_state.get("p2p", True) else "Relay WS"
 
-        tok_part = f"<style color='#ffffff'><b>{disp_tok} tok</b></style>" if disp_tok > 0 else "<style color='#64748b'>ready</style>"
+        if session_state.get("is_generating", False):
+            if interrupt_armed[0]:
+                tok_part = "<style color='#ff2a85'><b>● Esc again to cancel</b></style>"
+            elif disp_tok > 0:
+                tok_part = f"<style color='#ff70a6'><b>●</b></style> <style color='#ffffff'><b>{disp_tok} tok</b></style>"
+            else:
+                tok_part = "<style color='#ff70a6'><b>● inferencing...</b></style>"
+        else:
+            tok_part = f"<style color='#ffffff'><b>{disp_tok} tok</b></style>" if disp_tok > 0 else "<style color='#64748b'>ready</style>"
+
         tps_part = f"<style color='#ff70a6'><b>{disp_tps:.1f} t/s</b></style>" if disp_tps > 0 else ""
         dot = "<style color='#475569'>·</style>"
 
@@ -2977,15 +3089,15 @@ def run_opencode_tui(
     bottom_session_bar = VSplit([
         Window(content=FormattedTextControl(get_bottom_session_bar_left), height=1, char=" ", style="bg:#000000"),
         Window(content=FormattedTextControl(get_bottom_session_bar_right), height=1, align=WindowAlign.RIGHT, char=" ", style="bg:#000000"),
-    ], height=1, style="bg:#000000")
+    ], height=1, style="bg:#000000", window_too_small=Window(height=0))
 
-    # Docked Elevated Input Card for active chat (solid #161619, left accent bar ▌, 3 lines resting, 4 when streaming)
+    # Docked Elevated Input Card for active chat (solid #161619, left accent bar ▌, fixed 3-line height)
     active_card_box = VSplit([
         Window(width=1, char="▌", style="bg:#161619 #ff2a85 bold"),
         Window(width=1, char=" ", style="bg:#161619"),
         active_card_inner,
         Window(width=2, char=" ", style="bg:#161619"),
-    ], height=D(min=3, max=4, preferred=3), style="bg:#161619")
+    ], height=3, style="bg:#161619", window_too_small=Window(height=0))
 
     active_left_pane = HSplit([
         history_win,
@@ -2993,19 +3105,19 @@ def run_opencode_tui(
         active_card_box,
         Window(height=1, char=" ", style="bg:#000000"),
         shortcuts_line,
-    ], style="bg:#000000")
+    ], style="bg:#000000", window_too_small=Window(height=0))
 
     active_main_split = VSplit([
         active_left_pane,
         divider,
         sidebar_cond,
-    ], style="bg:#000000")
+    ], style="bg:#000000", window_too_small=Window(height=0))
 
     active_view = HSplit([
         active_main_split,
         Window(height=1, char=" ", style="bg:#000000"),
         bottom_session_bar,
-    ], style="bg:#000000")
+    ], style="bg:#000000", window_too_small=Window(height=0))
 
     def get_current_main_view():
         if session_state.get("active_screen", "startup") == "startup":
@@ -3271,15 +3383,19 @@ def run_opencode_tui(
                 session_state["speed"] = tps
 
                 if not cancel_event.is_set() and tok_cnt > 0:
-                    meta_latest = fetch_cluster_metadata(normalized)
+                    meta_latest = fetch_cluster_metadata(normalized, ttl=0.0)
+                    _sync_live_vram_state(session_state, meta_latest)
                     p_stages = meta_latest.get("pipeline_stages") or []
                     w_cnt = meta_latest.get("active_workers_count", session_state.get("workers_count", 1))
-                    session_state["total_vram_gb"] = meta_latest.get("total_vram_gb", 0.0)
-                    session_state["free_vram_gb"] = meta_latest.get("free_vram_gb", 0.0)
-                    session_state["used_vram_gb"] = meta_latest.get("used_vram_gb", 0.0)
-                    session_state["cluster_workers"] = meta_latest.get("workers", [])
-                    used_v = meta_latest.get("used_vram_gb", 0.0)
-                    tot_v = meta_latest.get("total_vram_gb", 0.0)
+                    used_v = session_state.get("used_vram_gb", 0.0)
+                    tot_v = session_state.get("total_vram_gb", 0.0)
+                    if w_cnt == 1 and tot_v > 0 and ("127.0.0.1" in normalized or "localhost" in normalized):
+                        workers_m = meta_latest.get("workers") or []
+                        if workers_m and workers_m[0].get("device") != "cpu":
+                            loc_u = session_state.get("local_used_vram_gb", 0.0)
+                            if loc_u > used_v:
+                                used_v = loc_u
+                                session_state["used_vram_gb"] = loc_u
                     v_str = f" (VRAM: {used_v:.1f}/{tot_v:.1f} GB)" if tot_v > 0 else ""
                     if len(p_stages) <= 1:
                         t_mode = "Single-Node CUDA Direct"
@@ -3388,10 +3504,7 @@ def run_opencode_tui(
                 # Update meta
                 active_c = session_state.get("coordinator_url", coordinator_url)
                 m = fetch_cluster_metadata(active_c, ttl=0.0)
-                session_state["workers_count"] = m.get("active_workers_count", 0)
-                session_state["coord_status"] = m.get("status", "offline")
-                session_state["total_vram_gb"] = m.get("total_vram_gb", 0.0)
-                session_state["free_vram_gb"] = m.get("free_vram_gb", 0.0)
+                _sync_live_vram_state(session_state, m)
 
                 if not keep_running:
                     event.app.exit(result="/exit")
@@ -3686,50 +3799,14 @@ def run_opencode_tui(
 
     def _bg_cluster_sync_loop():
         while not stop_bg_sync.is_set():
-            time.sleep(1.0)
+            is_gen = session_state.get("is_generating", False)
+            time.sleep(0.5 if is_gen else 1.0)
             if stop_bg_sync.is_set():
                 break
             try:
                 active_c = session_state.get("coordinator_url", coordinator_url)
-                meta = fetch_cluster_metadata(active_c, ttl=0.8)
-                changed = False
-                w_cnt = meta.get("active_workers_count", 0)
-                if w_cnt != session_state.get("workers_count"):
-                    session_state["workers_count"] = w_cnt
-                    changed = True
-
-                c_stat = meta.get("status", "offline")
-                if c_stat != session_state.get("coord_status"):
-                    session_state["coord_status"] = c_stat
-                    changed = True
-
-                tot_vram = meta.get("total_vram_gb", 0.0)
-                if abs(tot_vram - session_state.get("total_vram_gb", 0.0)) > 0.05:
-                    session_state["total_vram_gb"] = tot_vram
-                    session_state["free_vram_gb"] = meta.get("free_vram_gb", 0.0)
-                    changed = True
-
-                used_vram = meta.get("used_vram_gb", 0.0)
-                if abs(used_vram - session_state.get("used_vram_gb", 0.0)) > 0.05:
-                    session_state["used_vram_gb"] = used_vram
-                    changed = True
-
-                pct = meta.get("vram_usage_pct", 0.0)
-                if abs(pct - session_state.get("vram_usage_pct", 0.0)) > 0.5:
-                    session_state["vram_usage_pct"] = pct
-                    changed = True
-
-                coord_model = meta.get("model") or meta.get("active_model")
-                if not session_state.get("is_coordinator", True) and coord_model:
-                    if coord_model.lower() != session_state.get("model", "").lower():
-                        session_state["model"] = coord_model
-                        changed = True
-
-                curr_workers = meta.get("workers", [])
-                if curr_workers != session_state.get("cluster_workers"):
-                    session_state["cluster_workers"] = curr_workers
-                    changed = True
-
+                meta = fetch_cluster_metadata(active_c, ttl=0.4 if is_gen else 0.8)
+                changed = _sync_live_vram_state(session_state, meta)
                 if changed and app_instance[0]:
                     app_instance[0].invalidate()
             except Exception:

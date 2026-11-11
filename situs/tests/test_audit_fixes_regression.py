@@ -170,12 +170,18 @@ def test_load_head_weights_rejects_shape_mismatch():
 
 def test_architecture_compatibility_check():
     """Verify is_architecture_supported accepts compatible types and rejects incompatible ones."""
-    # Supported verified architectures (LLaMA, Mistral, Gemma families)
-    for arch in ("llama", "LlamaForCausalLM", "llama2", "llama3", "mistral", "MistralForCausalLM", "gemma", "gemma2", "gemma3", "Gemma3ForCausalLM"):
+    # Supported verified architectures (LLaMA, Mistral/NeMo, Qwen2, Gemma, StarCoder2 families)
+    for arch in (
+        "llama", "LlamaForCausalLM", "llama2", "llama3",
+        "mistral", "MistralForCausalLM", "mistralnemo",
+        "qwen", "qwen2", "qwen2.5", "Qwen2ForCausalLM",
+        "gemma", "gemma2", "gemma3", "Gemma3ForCausalLM",
+        "starcoder2", "Starcoder2ForCausalLM",
+    ):
         assert is_architecture_supported(arch), f"Expected {arch} to be supported"
 
-    # Unsupported architectures (unverified/non-parity: qwen, transformer, gpt2, mpt, moe, etc.)
-    for arch in ("qwen", "qwen2", "transformer", "gpt2", "mpt", "qwen2_moe", "mixtral", "falcon", "chatglm", "bloom", "opt", "bert", "t5", "vision_transformer", "albert_transformer"):
+    # Unsupported architectures (unverified/MoE/non-decoder: qwen2_moe, transformer, gpt2, mpt, moe, etc.)
+    for arch in ("qwen2_moe", "transformer", "gpt2", "mpt", "mixtral", "falcon", "chatglm", "bloom", "opt", "bert", "t5", "vision_transformer", "albert_transformer"):
         assert not is_architecture_supported(arch), f"Expected {arch} to be rejected"
 
     # None and empty

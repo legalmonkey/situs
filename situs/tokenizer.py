@@ -63,33 +63,66 @@ def get_or_load_tokenizer(
     if model_name and model_name not in ("default", "gpt2"):
         prefix = model_name.split(":")[0].lower()
         if "qwen" in prefix:
-            candidates.extend([
-                os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"),
+            qwen_cands = []
+            if "coder" in clean_name:
+                qwen_cands.append("Qwen/Qwen2.5-Coder-7B-Instruct")
+            if "14b" in clean_name:
+                qwen_cands.append("Qwen/Qwen2.5-14B-Instruct")
+            qwen_cands.extend([
                 "Qwen/Qwen2.5-7B-Instruct",
                 "Qwen/Qwen2.5-3B-Instruct",
+                os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"),
                 "Qwen/Qwen3-4B-Instruct-2507",
             ])
+            candidates.extend(qwen_cands)
         elif "gemma" in prefix:
-            candidates.extend([
-                "google/gemma-2-2b-it",
+            gemma_cands = []
+            if "gemma3" in clean_name or "gemma-3" in clean_name:
+                gemma_cands.append("google/gemma-3-4b-it")
+            gemma_cands.extend([
                 "google/gemma-2-9b-it",
+                "google/gemma-2-2b-it",
                 "google/gemma-7b",
                 "google/gemma-2b",
                 "fxmarty/tiny-random-GemmaForCausalLM",
             ])
+            candidates.extend(gemma_cands)
         elif "llama" in prefix:
-            candidates.extend([
+            llama_cands = []
+            if "3.2" in clean_name or "3b" in clean_name:
+                llama_cands.extend([
+                    "meta-llama/Llama-3.2-3B-Instruct",
+                    "meta-llama/Llama-3.2-1B-Instruct",
+                ])
+            llama_cands.extend([
                 "meta-llama/Llama-3.1-8B-Instruct",
                 "meta-llama/Llama-3.2-3B-Instruct",
                 "meta-llama/Llama-3.2-1B-Instruct",
             ])
+            candidates.extend(llama_cands)
         elif "deepseek" in prefix:
-            candidates.extend([
+            ds_cands = []
+            if "14b" in clean_name:
+                ds_cands.append("deepseek-ai/DeepSeek-R1-Distill-Qwen-14B")
+            ds_cands.extend([
                 "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+                "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
             ])
+            candidates.extend(ds_cands)
         elif "mistral" in prefix:
-            candidates.extend([
+            mistral_cands = []
+            if "nemo" in clean_name:
+                mistral_cands.append("mistralai/Mistral-Nemo-Instruct-2407")
+            mistral_cands.extend([
                 "mistralai/Mistral-7B-Instruct-v0.3",
+                "mistralai/Mistral-Nemo-Instruct-2407",
+            ])
+            candidates.extend(mistral_cands)
+        elif "starcoder2" in prefix:
+            candidates.extend([
+                "bigcode/starcoder2-7b",
+                "bigcode/starcoder2-3b",
+                "bigcode/starcoder2-15b",
             ])
         else:
             candidates.append(model_name)

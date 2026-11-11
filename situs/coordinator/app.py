@@ -379,9 +379,9 @@ async def cluster_status():
     return {
         "status": "healthy" if alive else "no_workers",
         "active_workers_count": len(alive),
-        "total_vram_gb": round(total_vram_b / 1e9, 2),
-        "free_vram_gb": round(free_vram_b / 1e9, 2),
-        "used_vram_gb": round(used_vram_b / 1e9, 2),
+        "total_vram_gb": round(total_vram_b / (1024**3), 2),
+        "free_vram_gb": round(free_vram_b / (1024**3), 2),
+        "used_vram_gb": round(used_vram_b / (1024**3), 2),
         "vram_usage_pct": round((used_vram_b / max(1, total_vram_b)) * 100, 1),
         "pure_vram_enforced": True,
         "model": curr_model,
@@ -395,10 +395,10 @@ async def cluster_status():
                 "worker_id": w.worker_id,
                 "gpu": w.gpu_name,
                 "device": w.device_type,
-                "total_gb": round(w.total_vram_bytes / 1e9, 2),
-                "used_gb": round(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / 1e9, 2),
-                "free_gb": round(w.free_vram_bytes / 1e9, 2),
-                "vram_available_mb": round(w.free_vram_bytes / 1e6, 1),
+                "total_gb": round(w.total_vram_bytes / (1024**3), 2),
+                "used_gb": round(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / (1024**3), 2),
+                "free_gb": round(w.free_vram_bytes / (1024**3), 2),
+                "vram_available_mb": round(w.free_vram_bytes / (1024**2), 1),
                 "usage_pct": round((getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / max(1, w.total_vram_bytes)) * 100, 1),
                 "vram_exclusive": True,
                 "layer_range": f"{w.assigned_layer_start}..{w.assigned_layer_end}" if w.assigned_layer_start is not None else "unassigned",
@@ -481,7 +481,7 @@ async def remove_worker_endpoint(request: Request, worker_id: str):
     ws = relay.active_connections.get(worker_id)
     if ws:
         try:
-            await ws.close(code=1000, reason="Worker removed by coordinator operator")
+            await asyncio.wait_for(ws.close(code=1000, reason="Worker removed by coordinator operator"), timeout=1.0)
         except Exception:
             pass
 
@@ -494,7 +494,7 @@ async def remove_worker_endpoint(request: Request, worker_id: str):
     rebalanced = False
     if remaining:
         try:
-            await rebalance_and_assign_layers(registry.active_model)
+            await asyncio.wait_for(rebalance_and_assign_layers(registry.active_model), timeout=2.5)
             rebalanced = True
         except Exception as e:
             logger.warning(f"Rebalancing after removing worker '{worker_id}' failed: {e}")

@@ -1,6 +1,7 @@
 """Worker registry, health tracking, and dynamic programming layer partition scheduler."""
 
 import time
+import re
 import math
 import logging
 import functools
@@ -48,6 +49,14 @@ class WorkerNode(BaseModel):
 
 def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     """Dynamically parses and validates a model config dict without arbitrary fallback defaults."""
+    outer = data
+    if isinstance(data.get("text_config"), dict):
+        merged = dict(data)
+        merged.update(data["text_config"])
+        if "architectures" in outer and "architectures" not in data["text_config"]:
+            merged["architectures"] = outer["architectures"]
+        data = merged
+
     total_layers = data.get("num_hidden_layers") or data.get("n_layer") or data.get("num_layers") or data.get("total_layers")
     hidden_dim = data.get("hidden_size") or data.get("n_embd") or data.get("hidden_dim")
     vocab_size = data.get("vocab_size")
@@ -63,6 +72,21 @@ def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
             return int(val) if val is not None else None
         except (ValueError, TypeError):
             return None
+
+    def _to_float(val):
+        try:
+            return float(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    def _to_bool(val):
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes")
+        return bool(val)
 
     total_layers = _to_int(total_layers)
     hidden_dim = _to_int(hidden_dim)
@@ -99,6 +123,33 @@ def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     )
     torch_dtype = data.get("torch_dtype") or data.get("precision") or data.get("dtype")
 
+    rope_theta = _to_float(data.get("rope_theta"))
+    rope_local_base_freq = _to_float(data.get("rope_local_base_freq"))
+    rope_params = data.get("rope_parameters")
+    if isinstance(rope_params, dict):
+        if rope_theta is None:
+            full_rp = rope_params.get("full_attention") if isinstance(rope_params.get("full_attention"), dict) else rope_params
+            rope_theta = _to_float(full_rp.get("rope_theta"))
+        if rope_local_base_freq is None and isinstance(rope_params.get("sliding_attention"), dict):
+            rope_local_base_freq = _to_float(rope_params["sliding_attention"].get("rope_theta"))
+
+    rms_norm_eps = _to_float(
+        data.get("rms_norm_eps")
+        or data.get("norm_epsilon")
+        or data.get("layer_norm_eps")
+        or data.get("layer_norm_epsilon")
+    )
+    query_pre_attn_scalar = _to_float(data.get("query_pre_attn_scalar"))
+    attn_logit_softcapping = _to_float(data.get("attn_logit_softcapping"))
+    final_logit_softcapping = _to_float(data.get("final_logit_softcapping"))
+    sliding_window = _to_int(data.get("sliding_window"))
+    sliding_window_pattern = _to_int(data.get("sliding_window_pattern") or data.get("_sliding_window_pattern"))
+    use_bias = _to_bool(data.get("use_bias"))
+    attention_bias = _to_bool(data.get("attention_bias"))
+    mlp_bias = _to_bool(data.get("mlp_bias"))
+    hidden_act = data.get("hidden_act") or data.get("hidden_activation")
+    tie_word_embeddings = _to_bool(data.get("tie_word_embeddings"))
+
     return {
         "total_layers": total_layers,
         "hidden_dim": hidden_dim,
@@ -111,7 +162,59 @@ def _parse_verified_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         "context_length": context_length,
         "max_position_embeddings": context_length,
         "torch_dtype": torch_dtype,
+        "rms_norm_eps": rms_norm_eps,
+        "rope_theta": rope_theta,
+        "rope_local_base_freq": rope_local_base_freq,
+        "query_pre_attn_scalar": query_pre_attn_scalar,
+        "attn_logit_softcapping": attn_logit_softcapping,
+        "final_logit_softcapping": final_logit_softcapping,
+        "sliding_window": sliding_window,
+        "sliding_window_pattern": sliding_window_pattern,
+        "use_bias": use_bias,
+        "attention_bias": attention_bias,
+        "mlp_bias": mlp_bias,
+        "hidden_act": str(hidden_act) if hidden_act is not None else None,
+        "tie_word_embeddings": tie_word_embeddings,
     }
+
+
+def _score_local_config_match(model_name: str, cfg_stem: str) -> int:
+    """Score specificity of a local verified JSON stem against a model identifier."""
+    raw = model_name.strip().lower().split("/")[-1]
+    base_part = raw.split(":", 1)[0]
+    clean = base_part.replace("-", "").replace("_", "")
+    full_clean = raw.replace(":", "").replace("-", "").replace("_", "")
+    query_sizes = set(
+        re.findall(r"(?<![a-z0-9])\d+(?:\.\d+)?b(?![a-z0-9])", re.sub(r"[-_:]+", " ", raw))
+    )
+
+    stem_lower = cfg_stem.lower()
+    stem_clean = stem_lower.replace("-", "").replace("_", "")
+    stem_tokens = [t for t in re.split(r"[-_]+", stem_lower) if t]
+    stem_sizes = set(
+        re.findall(r"(?<![a-z0-9])\d+(?:\.\d+)?b(?![a-z0-9])", " ".join(stem_tokens))
+    )
+    stem_family = "".join(t for t in stem_tokens if t not in stem_sizes)
+
+    if query_sizes and stem_sizes and not (query_sizes & stem_sizes):
+        return 0
+
+    if stem_clean == full_clean:
+        return 1000
+    if stem_clean == clean:
+        return 950
+    if full_clean.startswith(stem_clean):
+        return 900 + len(stem_clean)
+    if stem_family and (stem_family == clean or clean.startswith(stem_family) or stem_family in clean):
+        score = 500 + len(stem_family) * 2
+        if stem_family == clean:
+            score += 200
+        if query_sizes & stem_sizes:
+            score += 300
+        return score
+    if stem_clean in clean or clean in stem_clean:
+        return 200 + len(stem_clean)
+    return 0
 
 
 @functools.lru_cache(maxsize=64)
@@ -169,15 +272,12 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
     # 2. Local verified configs directory (situs/configs/)
     configs_dir = pathlib.Path(__file__).resolve().parent.parent / "configs"
     if configs_dir.is_dir():
-        clean = model_name.lower().split(":")[0].replace("-", "").replace("_", "")
-        # Find matching config files
         best_match = None
-        for cfg_file in configs_dir.glob("*.json"):
-            stem_clean = cfg_file.stem.lower().replace("-", "").replace("_", "")
-            if stem_clean == clean:
-                best_match = cfg_file
-                break
-            if stem_clean in clean or clean in stem_clean:
+        best_score = 0
+        for cfg_file in sorted(configs_dir.glob("*.json")):
+            score = _score_local_config_match(model_name, cfg_file.stem)
+            if score > best_score:
+                best_score = score
                 best_match = cfg_file
 
         if best_match is not None:
@@ -613,7 +713,7 @@ class WorkerRegistry:
             node.first_worker_id = existing.first_worker_id
 
         self.workers[reg.worker_id] = node
-        logger.info(f"Registered worker {reg.worker_id} ({reg.gpu_name}, {reg.free_vram_bytes / 1e9:.2f} GB free)")
+        logger.info(f"Registered worker {reg.worker_id} ({reg.gpu_name}, {reg.free_vram_bytes / (1024**3):.2f} GB free)")
         return node
 
     def update_heartbeat(

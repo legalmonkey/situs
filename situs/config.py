@@ -185,7 +185,7 @@ class WorkerConfig:
     assigned_layer_start: Optional[int] = None
     assigned_layer_end: Optional[int] = None
     compression_dtype: str = "int8"  # 'none', 'fp8', 'int8'
-    heartbeat_interval_s: float = 3.0
+    heartbeat_interval_s: float = 1.0
     enable_speculative: bool = True
     p2p_direct_enabled: bool = True
     auth_token: Optional[str] = field(

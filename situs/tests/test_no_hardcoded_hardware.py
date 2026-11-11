@@ -59,3 +59,52 @@ def test_get_live_gpu_vram_no_fake_fallback():
         assert tot == 16 * 1024**3
         assert free == 10 * 1024**3
         assert tot != 6 * 1024**3
+
+
+def test_get_live_gpu_vram_reports_dgpu_used_bytes():
+    """Ensure get_live_gpu_vram accurately reports live dGPU used bytes from hardware telemetry."""
+    fake_smi = ("NVIDIA GeForce RTX 3050 6GB Laptop GPU", 6 * 1024**3, 2 * 1024**3, 4 * 1024**3)
+    with patch("situs.hardware.query_nvidia_smi", return_value=fake_smi), \
+         patch("situs.hardware._torch_checked", False):
+        tot, used, free = get_live_gpu_vram()
+        assert tot == 6 * 1024**3
+        assert used == 4 * 1024**3
+        assert free == 2 * 1024**3
+
+
+def test_sync_live_vram_state_updates_dynamically_when_total_constant():
+    """Ensure TUI live VRAM sync updates free/used/pct dynamically even when total_vram_gb stays constant."""
+    from situs.tui import _sync_live_vram_state
+
+    session_state = {
+        "workers_count": 1,
+        "coord_status": "healthy",
+        "total_vram_gb": 6.0,
+        "free_vram_gb": 5.8,
+        "used_vram_gb": 0.2,
+        "vram_usage_pct": 3.3,
+        "local_total_vram_gb": 6.0,
+        "local_used_vram_gb": 0.2,
+        "local_free_vram_gb": 5.8,
+        "local_vram_pct": 3.3,
+        "cluster_workers": [],
+    }
+
+    with patch("situs.hardware.get_live_gpu_vram", return_value=(6 * 1024**3, int(3.6 * 1024**3), int(2.2 * 1024**3))):
+        meta_active = {
+            "active_workers_count": 1,
+            "status": "healthy",
+            "total_vram_gb": 6.0,
+            "free_vram_gb": 2.2,
+            "used_vram_gb": 3.6,
+            "vram_usage_pct": 60.0,
+            "workers": [{"worker_id": "w1", "total_gb": 6.0, "used_gb": 3.6, "free_gb": 2.2}],
+        }
+        changed = _sync_live_vram_state(session_state, meta_active)
+        assert changed is True
+        assert session_state["free_vram_gb"] == 2.2
+        assert session_state["used_vram_gb"] == 3.6
+        assert session_state["vram_usage_pct"] == 60.0
+        assert session_state["local_used_vram_gb"] == 3.6
+        assert session_state["local_free_vram_gb"] == 2.2
+

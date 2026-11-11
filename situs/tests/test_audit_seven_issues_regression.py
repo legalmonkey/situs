@@ -213,7 +213,7 @@ def test_issue2_numerical_parity_with_reference_layer_prefill_and_cached():
     assert parity_cached is True, "Cached autoregressive step must achieve numerical parity with reference"
 
     # 2. Strict rejection of architectures without established numerical parity
-    for unverified_arch in ("qwen", "qwen2", "transformer", "mixtral", "moe", "gpt2", "mpt", "falcon", "chatglm"):
+    for unverified_arch in ("qwen2_moe", "transformer", "mixtral", "moe", "gpt2", "mpt", "falcon", "chatglm"):
         assert not is_architecture_supported(unverified_arch), f"Expected unverified {unverified_arch} to be rejected"
         with pytest.raises(ValueError, match="Unsupported model architecture"):
             RealTransformerBlock(

@@ -466,7 +466,28 @@ def test_cors_allows_trycloudflare():
     assert middleware.is_allowed_origin("https://untrusted-malicious-site.com") is False
 
 
+def test_tui_no_window_too_small_during_active_chat():
+    from situs.tui import run_opencode_tui
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    from prompt_toolkit.data_structures import Size
+    import io
 
+    # Test on compact terminal size (18 rows x 80 cols) and transition into active chat view
+    buf = io.StringIO()
+    with create_pipe_input() as pipe:
+        pipe.send_text("/status\rhello\r/exit\r")
+        fake_out = Vt100_Output(buf, lambda: Size(18, 80))
+        res = run_opencode_tui(
+            coordinator_url="http://127.0.0.1:18999",
+            model="gemma3:4b",
+            app_input=pipe,
+            app_output=fake_out,
+            full_screen=False,
+        )
+        assert res == "/exit"
 
-
+    rendered_output = buf.getvalue()
+    assert "Window too small" not in rendered_output
+    assert "too small..." not in rendered_output
 

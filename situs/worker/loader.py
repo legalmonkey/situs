@@ -37,7 +37,15 @@ SUPPORTED_ARCHITECTURES: Set[str] = {
     "gemma2",
     "gemma3",
     "gemma3forcausallm",
+    "gemma3forconditionalgeneration",
     "mistral",
+    "mistralnemo",
+    "qwen",
+    "qwen2",
+    "qwen2.5",
+    "qwen2forcausallm",
+    "starcoder2",
+    "starcoder2forcausallm",
 }
 
 CANONICAL_TENSOR_MAP: Dict[str, str] = {
@@ -45,21 +53,48 @@ CANONICAL_TENSOR_MAP: Dict[str, str] = {
     "self_attn.k_proj.weight": "attn_k.weight",
     "self_attn.v_proj.weight": "attn_v.weight",
     "self_attn.o_proj.weight": "attn_output.weight",
+    "self_attn.q_proj.bias": "attn_q.bias",
+    "self_attn.k_proj.bias": "attn_k.bias",
+    "self_attn.v_proj.bias": "attn_v.bias",
+    "self_attn.o_proj.bias": "attn_output.bias",
+    "self_attn.q_norm.weight": "attn_q_norm.weight",
+    "self_attn.k_norm.weight": "attn_k_norm.weight",
     "mlp.gate_proj.weight": "ffn_gate.weight",
     "mlp.up_proj.weight": "ffn_up.weight",
     "mlp.down_proj.weight": "ffn_down.weight",
+    "mlp.c_fc.weight": "ffn_up.weight",
+    "mlp.c_fc.bias": "ffn_up.bias",
+    "mlp.c_proj.weight": "ffn_down.weight",
+    "mlp.c_proj.bias": "ffn_down.bias",
     "input_layernorm.weight": "attn_norm.weight",
+    "input_layernorm.bias": "attn_norm.bias",
     "post_attention_layernorm.weight": "ffn_norm.weight",
+    "post_attention_layernorm.bias": "ffn_norm.bias",
+    "pre_feedforward_layernorm.weight": "pre_ffn_norm.weight",
+    "post_feedforward_layernorm.weight": "post_ffn_norm.weight",
     # GGUF standardized keys
     "attn_q.weight": "attn_q.weight",
     "attn_k.weight": "attn_k.weight",
     "attn_v.weight": "attn_v.weight",
     "attn_output.weight": "attn_output.weight",
+    "attn_q.bias": "attn_q.bias",
+    "attn_k.bias": "attn_k.bias",
+    "attn_v.bias": "attn_v.bias",
+    "attn_output.bias": "attn_output.bias",
+    "attn_q_norm.weight": "attn_q_norm.weight",
+    "attn_k_norm.weight": "attn_k_norm.weight",
     "ffn_gate.weight": "ffn_gate.weight",
     "ffn_up.weight": "ffn_up.weight",
+    "ffn_up.bias": "ffn_up.bias",
     "ffn_down.weight": "ffn_down.weight",
+    "ffn_down.bias": "ffn_down.bias",
     "attn_norm.weight": "attn_norm.weight",
+    "attn_norm.bias": "attn_norm.bias",
+    "attn_post_norm.weight": "post_attn_norm.weight",
     "ffn_norm.weight": "ffn_norm.weight",
+    "ffn_norm.bias": "ffn_norm.bias",
+    "ffn_pre_norm.weight": "pre_ffn_norm.weight",
+    "ffn_post_norm.weight": "post_ffn_norm.weight",
 }
 
 SUPPORTED_QUANTIZATION_SCHEMES: Set[str] = {
@@ -79,9 +114,9 @@ class UnsupportedQuantizationError(ValueError):
 def normalize_canonical_tensor_name(raw_name: str) -> str:
     """Normalizes arbitrary HuggingFace or GGUF tensor names into unified canonical keys."""
     clean = raw_name.strip()
-    # Strip leading layer prefixes e.g. "model.layers.0." or "blk.0."
+    # Strip leading layer prefixes e.g. "model.layers.0.", "language_model.model.layers.0.", or "blk.0."
     import re
-    clean = re.sub(r"^(?:model\.layers\.\d+\.|blk\.\d+\.)", "", clean)
+    clean = re.sub(r"^(?:(?:language_model\.)?model\.layers\.\d+\.|layers\.\d+\.|blk\.\d+\.)", "", clean)
     return CANONICAL_TENSOR_MAP.get(clean, clean)
 
 
@@ -101,16 +136,15 @@ def validate_quantization_metadata(quant_meta: Dict[str, Any]) -> None:
 
 def is_architecture_supported(arch: Optional[str]) -> bool:
     """
-    Validates that the architecture is compatible with RealTransformerBlock
-    (RMSNorm, RoPE, and SwiGLU/GeGLU-style MLP with verified numerical parity).
-    Explicitly rejects incompatible non-decoder architectures such as MoE, MPT, GPT-2, etc.
+    Validates that the architecture is supported by RealTransformerBlock
+    (LLaMA, Mistral/NeMo, Qwen2, Gemma 1/2/3, StarCoder2 with verified numerical parity).
     """
     if not arch or not isinstance(arch, str):
         return False
     norm = arch.strip().lower()
     incompatible = (
         "moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon",
-        "chatglm", "bloom", "opt", "bert", "t5", "qwen", "transformer"
+        "chatglm", "bloom", "opt", "bert", "t5", "transformer"
     )
     for bad in incompatible:
         if bad in norm:
@@ -123,8 +157,180 @@ def is_architecture_supported(arch: Optional[str]) -> bool:
     return False
 
 
+def _get_arch_spec(architecture: Optional[str]) -> Dict[str, Any]:
+    """Return normalized architecture-specific defaults for norms, biases, RoPE, MLP, and sliding windows."""
+    norm = str(architecture or "").strip().lower()
+    if "gemma3" in norm:
+        return {
+            "family": "gemma3",
+            "norm_type": "rmsnorm",
+            "norm_unit_offset": True,
+            "has_4_norms": True,
+            "has_qk_norm": True,
+            "mlp_type": "geglu",
+            "hidden_act": "gelu_pytorch_tanh",
+            "qkv_bias": False,
+            "o_bias": False,
+            "mlp_bias": False,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 10000.0,
+            "norm_eps": 1e-6,
+            "query_pre_attn_scalar": 256.0,
+            "attn_logit_softcapping": None,
+            "final_logit_softcapping": None,
+            "sliding_window": 1024,
+            "sliding_window_pattern": 6,
+            "sliding_rule": "pattern",
+            "embed_scale_sqrt": True,
+        }
+    if "gemma2" in norm:
+        return {
+            "family": "gemma2",
+            "norm_type": "rmsnorm",
+            "norm_unit_offset": True,
+            "has_4_norms": True,
+            "has_qk_norm": False,
+            "mlp_type": "geglu",
+            "hidden_act": "gelu_pytorch_tanh",
+            "qkv_bias": False,
+            "o_bias": False,
+            "mlp_bias": False,
+            "rope_theta": 10000.0,
+            "rope_local_base_freq": None,
+            "norm_eps": 1e-6,
+            "query_pre_attn_scalar": 256.0,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "sliding_window": 4096,
+            "sliding_window_pattern": 2,
+            "sliding_rule": "even",
+            "embed_scale_sqrt": True,
+        }
+    if "gemma" in norm:
+        return {
+            "family": "gemma",
+            "norm_type": "rmsnorm",
+            "norm_unit_offset": True,
+            "has_4_norms": False,
+            "has_qk_norm": False,
+            "mlp_type": "geglu",
+            "hidden_act": "gelu_pytorch_tanh",
+            "qkv_bias": False,
+            "o_bias": False,
+            "mlp_bias": False,
+            "rope_theta": 10000.0,
+            "rope_local_base_freq": None,
+            "norm_eps": 1e-6,
+            "query_pre_attn_scalar": None,
+            "attn_logit_softcapping": None,
+            "final_logit_softcapping": None,
+            "sliding_window": None,
+            "sliding_window_pattern": None,
+            "sliding_rule": "none",
+            "embed_scale_sqrt": True,
+        }
+    if "starcoder2" in norm:
+        return {
+            "family": "starcoder2",
+            "norm_type": "layernorm",
+            "norm_unit_offset": False,
+            "has_4_norms": False,
+            "has_qk_norm": False,
+            "mlp_type": "gelu_2layer",
+            "hidden_act": "gelu_pytorch_tanh",
+            "qkv_bias": True,
+            "o_bias": True,
+            "mlp_bias": True,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": None,
+            "norm_eps": 1e-5,
+            "query_pre_attn_scalar": None,
+            "attn_logit_softcapping": None,
+            "final_logit_softcapping": None,
+            "sliding_window": 4096,
+            "sliding_window_pattern": None,
+            "sliding_rule": "all",
+            "embed_scale_sqrt": False,
+        }
+    if "qwen" in norm:
+        return {
+            "family": "qwen2",
+            "norm_type": "rmsnorm",
+            "norm_unit_offset": False,
+            "has_4_norms": False,
+            "has_qk_norm": False,
+            "mlp_type": "swiglu",
+            "hidden_act": "silu",
+            "qkv_bias": True,
+            "o_bias": False,
+            "mlp_bias": False,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": None,
+            "norm_eps": 1e-6,
+            "query_pre_attn_scalar": None,
+            "attn_logit_softcapping": None,
+            "final_logit_softcapping": None,
+            "sliding_window": None,
+            "sliding_window_pattern": None,
+            "sliding_rule": "none",
+            "embed_scale_sqrt": False,
+        }
+    return {
+        "family": "llama",
+        "norm_type": "rmsnorm",
+        "norm_unit_offset": False,
+        "has_4_norms": False,
+        "has_qk_norm": False,
+        "mlp_type": "swiglu",
+        "hidden_act": "silu",
+        "qkv_bias": False,
+        "o_bias": False,
+        "mlp_bias": False,
+        "rope_theta": 10000.0,
+        "rope_local_base_freq": None,
+        "norm_eps": 1e-6,
+        "query_pre_attn_scalar": None,
+        "attn_logit_softcapping": None,
+        "final_logit_softcapping": None,
+        "sliding_window": None,
+        "sliding_window_pattern": None,
+        "sliding_rule": "none",
+        "embed_scale_sqrt": False,
+    }
+
+
+def _resolve_layer_sliding_and_rope(
+    spec: Dict[str, Any],
+    layer_idx: int,
+    rope_theta: Optional[float] = None,
+    rope_local_base_freq: Optional[float] = None,
+    sliding_window: Optional[int] = None,
+    sliding_window_pattern: Optional[int] = None,
+) -> Tuple[float, Optional[int]]:
+    """Compute per-layer RoPE base frequency and active sliding window size."""
+    base_theta = float(rope_theta if rope_theta is not None else spec["rope_theta"])
+    local_theta = float(
+        rope_local_base_freq
+        if rope_local_base_freq is not None
+        else (spec["rope_local_base_freq"] if spec["rope_local_base_freq"] is not None else base_theta)
+    )
+    sw = sliding_window if sliding_window is not None else spec["sliding_window"]
+    rule = spec.get("sliding_rule", "none")
+    if rule == "even":
+        # Gemma2 alternates sliding attention on even layers and full attention on odd layers.
+        return base_theta, (sw if (layer_idx % 2 == 0) else None)
+    if rule == "pattern":
+        # Gemma3 uses local sliding attention except on every N-th (typically 6th) full layer.
+        pattern = sliding_window_pattern if sliding_window_pattern is not None else (spec["sliding_window_pattern"] or 6)
+        is_sliding = ((layer_idx + 1) % pattern) != 0
+        return (local_theta if is_sliding else base_theta), (sw if is_sliding else None)
+    if rule == "all":
+        return base_theta, sw
+    return base_theta, sw
+
+
 class RMSNorm(nn.Module if HAS_TORCH else object):
-    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral, with Gemma unit-offset support)."""
+    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral, Qwen2, with Gemma unit-offset support)."""
     def __init__(self, dim: int, eps: float = 1e-6, is_gemma: bool = False):
         super().__init__()
         self.eps = eps
@@ -137,9 +343,13 @@ class RMSNorm(nn.Module if HAS_TORCH else object):
             raise RuntimeError("PyTorch is required for model inference")
         if not isinstance(x, torch.Tensor):
             return x
-        variance = x.pow(2).mean(-1, keepdim=True)
-        w = (1.0 + self.weight) if self.is_gemma else self.weight
-        return x * torch.rsqrt(variance + self.eps) * w
+        orig_dtype = x.dtype
+        x_f = x.float()
+        variance = x_f.pow(2).mean(-1, keepdim=True)
+        x_norm = x_f * torch.rsqrt(variance + self.eps)
+        if self.is_gemma:
+            return (x_norm * (1.0 + self.weight.float())).to(orig_dtype)
+        return (x_norm * self.weight.float()).to(orig_dtype)
 
 
 class RotaryEmbedding(nn.Module if HAS_TORCH else object):
@@ -204,8 +414,17 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
-def _fast_linear(in_features: int, out_features: int, device: str = "cpu", dtype: Any = None) -> Any:
-    """Safe linear module initialization avoiding PyTorch C++ memory corruption."""
+_UNSET = object()
+
+
+def _fast_linear(
+    in_features: int,
+    out_features: int,
+    device: str = "cpu",
+    dtype: Any = None,
+    bias: bool = False,
+) -> Any:
+    """Safe linear module initialization."""
     if not HAS_TORCH:
         return None
     dt = dtype if dtype is not None else (
@@ -213,13 +432,40 @@ def _fast_linear(in_features: int, out_features: int, device: str = "cpu", dtype
     )
     dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
     try:
-        return nn.Linear(in_features, out_features, bias=False, device=dev, dtype=dt)
+        return nn.Linear(in_features, out_features, bias=bias, device=dev, dtype=dt)
     except Exception:
-        linear = nn.Linear(in_features, out_features, bias=False)
+        linear = nn.Linear(in_features, out_features, bias=bias)
         linear.to(dtype=dt)
         if dev != "cpu":
             linear.to(dev)
         return linear
+
+
+def _build_norm(
+    dim: int,
+    eps: float,
+    norm_type: str = "rmsnorm",
+    is_gemma: bool = False,
+    device: str = "cpu",
+    dtype: Any = None,
+) -> Any:
+    """Initialize RMSNorm or LayerNorm matching the model architecture."""
+    if not HAS_TORCH:
+        return None
+    if norm_type == "layernorm":
+        dt = dtype if dtype is not None else (
+            torch.float16 if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else torch.float32
+        )
+        dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
+        try:
+            return nn.LayerNorm(dim, eps=eps, elementwise_affine=True, device=dev, dtype=dt)
+        except Exception:
+            ln = nn.LayerNorm(dim, eps=eps, elementwise_affine=True)
+            ln.to(dtype=dt)
+            if dev != "cpu":
+                ln.to(dev)
+            return ln
+    return RMSNorm(dim, eps=eps, is_gemma=is_gemma)
 
 
 def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu", dtype: Any = None) -> Any:
@@ -245,12 +491,11 @@ def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu"
 
 class RealTransformerBlock(nn.Module if HAS_TORCH else object):
     """
-    Genuine Transformer Decoder Block with:
-    - RMSNorm pre-attention normalization
-    - Multi-Head / Grouped-Query Self-Attention (GQA) with KV-cache
-    - RMSNorm post-attention normalization
-    - SwiGLU Feed-Forward Network (gate_proj, up_proj, down_proj)
-    - Residual connections
+    Genuine Transformer Decoder Block supporting all Situs catalog architectures:
+    - LLaMA / Mistral / Mistral-NeMo (RMSNorm, RoPE, SwiGLU)
+    - Qwen2 / DeepSeek-R1-Distill-Qwen (RMSNorm, RoPE, QKV bias, SwiGLU)
+    - Gemma / Gemma2 / Gemma3 (unit-offset RMSNorm, 4-norm flow, Q/K norm, logit softcapping, GeGLU)
+    - StarCoder2 (LayerNorm with bias, QKV+O+MLP biases, RoPE, 2-layer GELU-tanh MLP)
     """
     def __init__(
         self,
@@ -260,16 +505,24 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         intermediate_size: int,
         head_dim: int,
         architecture: str,
-        eps: float = 1e-6,
+        eps: Optional[float] = None,
         layer_idx: int = 0,
         device: str = "cpu",
         dtype: Optional[Any] = None,
+        rope_theta: Optional[float] = None,
+        sliding_window: Any = _UNSET,
+        query_pre_attn_scalar: Optional[float] = None,
+        attn_logit_softcapping: Any = _UNSET,
+        qkv_bias: Optional[bool] = None,
+        o_bias: Optional[bool] = None,
+        mlp_bias: Optional[bool] = None,
+        hidden_act: Optional[str] = None,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
             raise ValueError(
                 f"Unsupported model architecture '{architecture}'. "
-                f"RealTransformerBlock requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
+                f"RealTransformerBlock requires a supported decoder architecture "
                 f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
             )
         for name, val in [
@@ -282,7 +535,9 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             if val is None or not isinstance(val, int) or val <= 0:
                 raise ValueError(f"RealTransformerBlock requires verified positive integer for '{name}', got {val}")
 
+        spec = _get_arch_spec(architecture)
         self.architecture = architecture
+        self.spec = spec
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -294,30 +549,122 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             torch.float16 if (device != "cpu" and HAS_TORCH and torch.cuda.is_available() and "cuda" in str(device)) else (torch.float32 if HAS_TORCH else None)
         )
 
+        self.norm_type = spec["norm_type"]
+        self.is_gemma = spec["norm_unit_offset"]
+        self.has_4_norms = spec["has_4_norms"]
+        self.has_qk_norm = spec["has_qk_norm"]
+        self.mlp_type = spec["mlp_type"]
+        self.qkv_bias = spec["qkv_bias"] if qkv_bias is None else bool(qkv_bias)
+        self.o_bias = spec["o_bias"] if o_bias is None else bool(o_bias)
+        self.mlp_bias = spec["mlp_bias"] if mlp_bias is None else bool(mlp_bias)
+        norm_eps = float(eps if eps is not None else spec["norm_eps"])
+
+        if sliding_window is _UNSET:
+            layer_rope_theta, layer_sw = _resolve_layer_sliding_and_rope(
+                spec, layer_idx, rope_theta=rope_theta
+            )
+        else:
+            layer_rope_theta = float(rope_theta if rope_theta is not None else spec["rope_theta"])
+            layer_sw = sliding_window
+        self.rope_theta = layer_rope_theta
+        self.sliding_window = layer_sw
+
+        scalar = query_pre_attn_scalar if query_pre_attn_scalar is not None else spec["query_pre_attn_scalar"]
+        self.query_pre_attn_scalar = scalar
+        self.attn_scale = (float(scalar) ** -0.5) if (scalar is not None and scalar > 0) else (float(head_dim) ** -0.5)
+        self.attn_logit_softcapping = (
+            spec["attn_logit_softcapping"] if attn_logit_softcapping is _UNSET else attn_logit_softcapping
+        )
+
         if not HAS_TORCH:
             return
 
-        is_gemma = "gemma" in str(architecture).lower()
-        self.input_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=is_gemma)
+        self.input_layernorm = _build_norm(
+            hidden_dim, eps=norm_eps, norm_type=self.norm_type, is_gemma=self.is_gemma, device=self.device, dtype=self.dtype
+        )
 
-        # Self-Attention projections (instant zero initialization directly on target device)
-        self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim, device=self.device, dtype=self.dtype)
-        self.k_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device, dtype=self.dtype)
-        self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device, dtype=self.dtype)
-        self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device, dtype=self.dtype)
+        # Self-Attention projections
+        self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim, device=self.device, dtype=self.dtype, bias=self.qkv_bias)
+        self.k_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device, dtype=self.dtype, bias=self.qkv_bias)
+        self.v_proj = _fast_linear(hidden_dim, self.num_kv_heads * self.head_dim, device=self.device, dtype=self.dtype, bias=self.qkv_bias)
+        self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device, dtype=self.dtype, bias=self.o_bias)
 
-        # Feed-Forward Network (SwiGLU for LLaMA/Mistral/Qwen, GeGLU for Gemma)
-        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=is_gemma)
-        self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype)
-        self.up_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype)
-        self.down_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device, dtype=self.dtype)
-        if "gemma" in str(architecture).lower():
-            self.act_fn = nn.GELU(approximate="tanh")
+        if self.has_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=norm_eps, is_gemma=self.is_gemma)
+            self.k_norm = RMSNorm(self.head_dim, eps=norm_eps, is_gemma=self.is_gemma)
+
+        self.post_attention_layernorm = _build_norm(
+            hidden_dim, eps=norm_eps, norm_type=self.norm_type, is_gemma=self.is_gemma, device=self.device, dtype=self.dtype
+        )
+        if self.has_4_norms:
+            self.pre_feedforward_layernorm = _build_norm(
+                hidden_dim, eps=norm_eps, norm_type=self.norm_type, is_gemma=self.is_gemma, device=self.device, dtype=self.dtype
+            )
+            self.post_feedforward_layernorm = _build_norm(
+                hidden_dim, eps=norm_eps, norm_type=self.norm_type, is_gemma=self.is_gemma, device=self.device, dtype=self.dtype
+            )
+
+        act_name = str(hidden_act or spec["hidden_act"]).lower()
+        if self.mlp_type == "gelu_2layer":
+            self.c_fc = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype, bias=self.mlp_bias)
+            self.c_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device, dtype=self.dtype, bias=self.mlp_bias)
+            self.act_fn = nn.GELU(approximate="none" if act_name == "gelu" else "tanh")
         else:
-            self.act_fn = nn.SiLU()
+            self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype, bias=self.mlp_bias)
+            self.up_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype, bias=self.mlp_bias)
+            self.down_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device, dtype=self.dtype, bias=self.mlp_bias)
+            if "gelu" in act_name or self.mlp_type == "geglu":
+                self.act_fn = nn.GELU(approximate="tanh")
+            else:
+                self.act_fn = nn.SiLU()
 
         # Rotary Embeddings
-        self.rotary = RotaryEmbedding(self.head_dim)
+        self.rotary = RotaryEmbedding(self.head_dim, base=layer_rope_theta)
+
+    def _compute_mlp(self, norm_mlp: torch.Tensor) -> torch.Tensor:
+        if self.mlp_type == "gelu_2layer":
+            return self.c_proj(self.act_fn(self.c_fc(norm_mlp)))
+        return self.down_proj(self.act_fn(self.gate_proj(norm_mlp)) * self.up_proj(norm_mlp))
+
+    def _compute_attention(
+        self,
+        q: torch.Tensor,
+        k_exp: torch.Tensor,
+        v_exp: torch.Tensor,
+        seq_len: int,
+        past_len: int,
+    ) -> torch.Tensor:
+        total_kv_len = k_exp.shape[-2]
+        use_sliding = self.sliding_window is not None and self.sliding_window > 0 and (
+            seq_len > 1 or total_kv_len > self.sliding_window
+        )
+
+        def _build_mask():
+            q_idx = torch.arange(past_len, past_len + seq_len, device=q.device).unsqueeze(1)
+            k_idx = torch.arange(total_kv_len, device=q.device).unsqueeze(0)
+            mask = k_idx <= q_idx
+            if use_sliding:
+                mask = mask & (k_idx > (q_idx - self.sliding_window))
+            return mask
+
+        if self.attn_logit_softcapping is not None and self.attn_logit_softcapping > 0:
+            cap = float(self.attn_logit_softcapping)
+            attn_weights = torch.matmul(q.float(), k_exp.float().transpose(-2, -1)) * self.attn_scale
+            attn_weights = torch.tanh(attn_weights / cap) * cap
+            if seq_len > 1 or use_sliding:
+                mask = _build_mask()
+                attn_weights = attn_weights.masked_fill(~mask, torch.finfo(attn_weights.dtype).min)
+            attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            return torch.matmul(attn_probs, v_exp)
+
+        sdpa_scale = self.attn_scale if self.query_pre_attn_scalar is not None else None
+        if use_sliding:
+            return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale)
+        if seq_len > 1:
+            if past_len > 0:
+                return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale)
+            return F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True, scale=sdpa_scale)
+        return F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False, scale=sdpa_scale)
 
     def forward(
         self,
@@ -343,6 +690,10 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         q = self.q_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.has_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Determine past KV cache length for RoPE offset
         past_len = 0
@@ -374,29 +725,69 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             k_exp = k
             v_exp = v
 
-        # Scaled dot-product attention
-        if seq_len > 1:
-            if past_len > 0:
-                q_idx = torch.arange(past_len, past_len + seq_len, device=q.device).unsqueeze(1)
-                k_idx = torch.arange(past_len + seq_len, device=q.device).unsqueeze(0)
-                attn_mask = k_idx <= q_idx
-                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=attn_mask)
-            else:
-                attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
-        else:
-            attn_out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
-
+        attn_out = self._compute_attention(q, k_exp, v_exp, seq_len=seq_len, past_len=past_len)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         attn_out = self.o_proj(attn_out)
-        x = residual + attn_out
 
-        # SwiGLU / GeGLU MLP
-        residual = x
-        norm_mlp = self.post_attention_layernorm(x)
-        mlp_out = self.down_proj(self.act_fn(self.gate_proj(norm_mlp)) * self.up_proj(norm_mlp))
-        x = residual + mlp_out
+        if self.has_4_norms:
+            attn_out = self.post_attention_layernorm(attn_out)
+            x = residual + attn_out
+            residual = x
+            norm_mlp = self.pre_feedforward_layernorm(x)
+            mlp_out = self._compute_mlp(norm_mlp)
+            mlp_out = self.post_feedforward_layernorm(mlp_out)
+            x = residual + mlp_out
+        else:
+            x = residual + attn_out
+            residual = x
+            norm_mlp = self.post_attention_layernorm(x)
+            mlp_out = self._compute_mlp(norm_mlp)
+            x = residual + mlp_out
 
         return x, new_kv
+
+    def _copy_validated_param(self, param_name: str, tensor: Any, my_dict: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(
+                f"Invalid tensor type for '{param_name}' in layer {self.layer_idx}: {type(tensor)}"
+            )
+        if param_name not in my_dict:
+            attr, field = param_name.split(".", 1)
+            mod = getattr(self, attr, None)
+            if isinstance(mod, nn.Linear) and field == "bias" and tensor.dim() == 1:
+                mod.bias = nn.Parameter(torch.empty_like(tensor, device=mod.weight.device, dtype=mod.weight.dtype))
+                my_dict = self.state_dict()
+            else:
+                return my_dict
+
+        target_shape = my_dict[param_name].shape
+        if tensor.shape != target_shape:
+            attr = param_name.split(".")[0]
+            mod = getattr(self, attr, None)
+            if isinstance(mod, nn.Linear) and tensor.dim() == 2:
+                out_f, in_f = tensor.shape
+                if in_f == mod.in_features or out_f == mod.out_features:
+                    new_linear = _fast_linear(
+                        in_f,
+                        out_f,
+                        device=str(mod.weight.device),
+                        dtype=mod.weight.dtype,
+                        bias=(mod.bias is not None),
+                    )
+                    setattr(self, attr, new_linear)
+                    my_dict = self.state_dict()
+                    target_shape = my_dict[param_name].shape
+            if tensor.shape != target_shape:
+                raise ValueError(
+                    f"Shape mismatch for parameter '{param_name}' in layer {self.layer_idx}: "
+                    f"got {tuple(tensor.shape)}, expected {tuple(target_shape)}"
+                )
+
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            raise ValueError(f"Tensor '{param_name}' contains NaN or Inf values in layer {self.layer_idx}")
+
+        my_dict[param_name].copy_(tensor.to(dtype=my_dict[param_name].dtype))
+        return my_dict
 
     def load_layer_weights(self, state_dict: Dict[str, torch.Tensor]) -> bool:
         """
@@ -410,16 +801,60 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             "k_proj.weight": ["self_attn.k_proj.weight", "k_proj.weight", "attn.k_proj.weight", "attn_k.weight"],
             "v_proj.weight": ["self_attn.v_proj.weight", "v_proj.weight", "attn.v_proj.weight", "attn_v.weight"],
             "o_proj.weight": ["self_attn.o_proj.weight", "o_proj.weight", "attn.o_proj.weight", "attn_output.weight"],
-            "post_attention_layernorm.weight": ["post_attention_layernorm.weight", "ffn_norm.weight", "post_ffw_norm.weight", "post_attention_norm.weight", "ln_2.weight"],
-            "gate_proj.weight": ["mlp.gate_proj.weight", "gate_proj.weight", "ffn_gate.weight"],
-            "up_proj.weight": ["mlp.up_proj.weight", "up_proj.weight", "ffn_up.weight"],
-            "down_proj.weight": ["mlp.down_proj.weight", "down_proj.weight", "ffn_down.weight"],
         }
+        if self.has_4_norms:
+            mapping["post_attention_layernorm.weight"] = [
+                "post_attention_layernorm.weight",
+                "attn_post_norm.weight",
+                "post_attention_norm.weight",
+                "post_ffw_norm.weight",
+                "ffn_norm.weight",
+            ]
+        else:
+            mapping["post_attention_layernorm.weight"] = [
+                "post_attention_layernorm.weight",
+                "ffn_norm.weight",
+                "post_ffw_norm.weight",
+                "post_attention_norm.weight",
+                "ln_2.weight",
+            ]
+
+        if self.mlp_type == "gelu_2layer":
+            mapping["c_fc.weight"] = ["mlp.c_fc.weight", "c_fc.weight", "ffn_up.weight"]
+            mapping["c_proj.weight"] = ["mlp.c_proj.weight", "c_proj.weight", "ffn_down.weight"]
+        else:
+            mapping["gate_proj.weight"] = ["mlp.gate_proj.weight", "gate_proj.weight", "ffn_gate.weight"]
+            mapping["up_proj.weight"] = ["mlp.up_proj.weight", "up_proj.weight", "ffn_up.weight"]
+            mapping["down_proj.weight"] = ["mlp.down_proj.weight", "down_proj.weight", "ffn_down.weight"]
+
+        optional_mapping: Dict[str, List[str]] = {
+            "q_proj.bias": ["self_attn.q_proj.bias", "q_proj.bias", "attn.q_proj.bias", "attn_q.bias"],
+            "k_proj.bias": ["self_attn.k_proj.bias", "k_proj.bias", "attn.k_proj.bias", "attn_k.bias"],
+            "v_proj.bias": ["self_attn.v_proj.bias", "v_proj.bias", "attn.v_proj.bias", "attn_v.bias"],
+            "o_proj.bias": ["self_attn.o_proj.bias", "o_proj.bias", "attn.o_proj.bias", "attn_output.bias"],
+            "input_layernorm.bias": ["input_layernorm.bias", "attention_norm.bias", "attn_norm.bias", "ln_1.bias"],
+            "post_attention_layernorm.bias": ["post_attention_layernorm.bias", "ffn_norm.bias", "post_attention_norm.bias", "ln_2.bias"],
+        }
+        if self.mlp_type == "gelu_2layer":
+            optional_mapping["c_fc.bias"] = ["mlp.c_fc.bias", "c_fc.bias", "ffn_up.bias"]
+            optional_mapping["c_proj.bias"] = ["mlp.c_proj.bias", "c_proj.bias", "ffn_down.bias"]
+        if self.has_qk_norm:
+            optional_mapping["q_norm.weight"] = ["self_attn.q_norm.weight", "q_norm.weight", "attn_q_norm.weight"]
+            optional_mapping["k_norm.weight"] = ["self_attn.k_norm.weight", "k_norm.weight", "attn_k_norm.weight"]
+        if self.has_4_norms:
+            optional_mapping["pre_feedforward_layernorm.weight"] = [
+                "pre_feedforward_layernorm.weight",
+                "ffn_pre_norm.weight",
+                "ffn_norm.weight",
+            ]
+            optional_mapping["post_feedforward_layernorm.weight"] = [
+                "post_feedforward_layernorm.weight",
+                "ffn_post_norm.weight",
+            ]
 
         # Build clean lookup from incoming state_dict
         clean_incoming = {}
         for k, v in state_dict.items():
-            # Strip common layer prefixes e.g. "model.layers.0." or "layers.0." or "blk.0."
             short_k = k
             if "layers." in short_k:
                 short_k = short_k.split("layers.", 1)[1]
@@ -438,9 +873,11 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         for param_name in required_params:
             aliases = mapping[param_name]
             matched_tensor = None
+            matched_alias = None
             for alias in aliases:
                 if alias in clean_incoming:
                     matched_tensor = clean_incoming[alias]
+                    matched_alias = alias
                     break
 
             if matched_tensor is None:
@@ -448,34 +885,26 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
                     f"Incomplete layer weights: required parameter '{param_name}' is missing for layer {self.layer_idx}"
                 )
 
-            if not isinstance(matched_tensor, torch.Tensor):
-                raise ValueError(
-                    f"Invalid tensor type for '{param_name}' in layer {self.layer_idx}: {type(matched_tensor)}"
-                )
+            # Avoid reusing generic fallback ffn_norm.weight into pre_feedforward_layernorm when it filled post_attn fallback
+            if (
+                param_name == "post_attention_layernorm.weight"
+                and self.has_4_norms
+                and matched_alias == "ffn_norm.weight"
+                and "pre_feedforward_layernorm.weight" in optional_mapping
+            ):
+                optional_mapping["pre_feedforward_layernorm.weight"] = [
+                    a for a in optional_mapping["pre_feedforward_layernorm.weight"] if a != "ffn_norm.weight"
+                ]
 
-            target_shape = my_dict[param_name].shape
-            if matched_tensor.shape != target_shape:
-                attr = param_name.split(".")[0]
-                mod = getattr(self, attr, None)
-                if isinstance(mod, nn.Linear) and matched_tensor.dim() == 2:
-                    out_f, in_f = matched_tensor.shape
-                    if in_f == mod.in_features or out_f == mod.out_features:
-                        new_linear = _fast_linear(in_f, out_f)
-                        setattr(self, attr, new_linear)
-                        my_dict = self.state_dict()
-                        target_shape = my_dict[param_name].shape
-                if matched_tensor.shape != target_shape:
-                    raise ValueError(
-                        f"Shape mismatch for parameter '{param_name}' in layer {self.layer_idx}: "
-                        f"got {tuple(matched_tensor.shape)}, expected {tuple(target_shape)}"
-                    )
+            my_dict = self._copy_validated_param(param_name, matched_tensor, my_dict)
 
-            if torch.isnan(matched_tensor).any() or torch.isinf(matched_tensor).any():
-                raise ValueError(f"Tensor '{param_name}' contains NaN or Inf values in layer {self.layer_idx}")
+        for param_name, aliases in optional_mapping.items():
+            for alias in aliases:
+                if alias in clean_incoming:
+                    my_dict = self._copy_validated_param(param_name, clean_incoming[alias], my_dict)
+                    break
 
-            my_dict[param_name].copy_(matched_tensor.to(dtype=my_dict[param_name].dtype))
-
-        logger.debug(f"Block {self.layer_idx}: Loaded and validated all {len(required_params)} parameter tensors.")
+        logger.debug(f"Block {self.layer_idx}: Loaded and validated all {len(required_params)} required parameter tensors.")
         return True
 
 
@@ -489,6 +918,16 @@ def deserialize_and_validate_layer_weights(
     device: str = "cpu",
     head_dim: Optional[int] = None,
     architecture: str = "llama",
+    eps: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    sliding_window: Any = _UNSET,
+    query_pre_attn_scalar: Optional[float] = None,
+    attn_logit_softcapping: Any = _UNSET,
+    qkv_bias: Optional[bool] = None,
+    o_bias: Optional[bool] = None,
+    mlp_bias: Optional[bool] = None,
+    hidden_act: Optional[str] = None,
+    dtype: Optional[Any] = None,
 ) -> RealTransformerBlock:
     """
     Deserializes raw wire weights (Safetensors or PyTorch bytes), maps tensor names,
@@ -542,6 +981,10 @@ def deserialize_and_validate_layer_weights(
             short_k = short_k.split("layers.", 1)[1]
             if "." in short_k:
                 short_k = short_k.split(".", 1)[1]
+        elif "blk." in short_k:
+            short_k = short_k.split("blk.", 1)[1]
+            if "." in short_k:
+                short_k = short_k.split(".", 1)[1]
         canonical_k = normalize_canonical_tensor_name(short_k)
         clean_incoming[short_k] = v
         clean_incoming[k] = v
@@ -549,13 +992,13 @@ def deserialize_and_validate_layer_weights(
 
     # Derive architecture dimensions dynamically from verified tensor shapes
     actual_h_dim = hidden_dim
-    for k in ("input_layernorm.weight", "attention_norm.weight", "ln_1.weight"):
+    for k in ("input_layernorm.weight", "attention_norm.weight", "attn_norm.weight", "ln_1.weight"):
         if k in clean_incoming and isinstance(clean_incoming[k], torch.Tensor) and clean_incoming[k].dim() >= 1:
             actual_h_dim = clean_incoming[k].shape[0]
             break
 
     actual_inter = intermediate_size
-    for k in ("gate_proj.weight", "mlp.gate_proj.weight"):
+    for k in ("gate_proj.weight", "mlp.gate_proj.weight", "mlp.c_fc.weight", "c_fc.weight", "ffn_up.weight"):
         if k in clean_incoming and isinstance(clean_incoming[k], torch.Tensor) and clean_incoming[k].dim() >= 2:
             actual_inter = clean_incoming[k].shape[0]
             break
@@ -589,6 +1032,16 @@ def deserialize_and_validate_layer_weights(
             f"must be divisible by num_kv_heads ({actual_kv_heads})"
         )
 
+    detected_qkv_bias = qkv_bias
+    if detected_qkv_bias is None and any(bk in clean_incoming for bk in ("attn_q.bias", "q_proj.bias", "self_attn.q_proj.bias")):
+        detected_qkv_bias = True
+    detected_o_bias = o_bias
+    if detected_o_bias is None and any(bk in clean_incoming for bk in ("attn_output.bias", "o_proj.bias", "self_attn.o_proj.bias")):
+        detected_o_bias = True
+    detected_mlp_bias = mlp_bias
+    if detected_mlp_bias is None and any(bk in clean_incoming for bk in ("c_fc.bias", "mlp.c_fc.bias", "c_proj.bias", "mlp.c_proj.bias", "ffn_up.bias", "ffn_down.bias")):
+        detected_mlp_bias = True
+
     # Instantiate block with dynamically verified dimensions
     block = RealTransformerBlock(
         hidden_dim=actual_h_dim,
@@ -597,7 +1050,17 @@ def deserialize_and_validate_layer_weights(
         intermediate_size=actual_inter,
         head_dim=derived_head_dim,
         architecture=architecture,
+        eps=eps,
         layer_idx=layer_idx,
+        dtype=dtype,
+        rope_theta=rope_theta,
+        sliding_window=sliding_window,
+        query_pre_attn_scalar=query_pre_attn_scalar,
+        attn_logit_softcapping=attn_logit_softcapping,
+        qkv_bias=detected_qkv_bias,
+        o_bias=detected_o_bias,
+        mlp_bias=detected_mlp_bias,
+        hidden_act=hidden_act,
     )
 
     # Load and validate tensors (raises ValueError if incomplete, non-finite, or invalid)
@@ -606,7 +1069,9 @@ def deserialize_and_validate_layer_weights(
 
     # Verification: run a test forward pass to confirm numerical validity
     with torch.no_grad():
-        test_in = torch.randn(1, 1, actual_h_dim, device=device)
+        first_param = next(block.parameters(), None)
+        test_dtype = first_param.dtype if first_param is not None else torch.float32
+        test_in = torch.randn(1, 1, actual_h_dim, device=device, dtype=test_dtype)
         test_out, _ = block(test_in)
         if torch.isnan(test_out).any() or torch.isinf(test_out).any():
             raise ValueError(f"Layer {layer_idx} produced NaN or Inf outputs during validation forward pass")
@@ -723,12 +1188,24 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         device: str = "cpu",
         progressive: bool = False,
         dtype: Optional[Any] = None,
+        rms_norm_eps: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        rope_local_base_freq: Optional[float] = None,
+        query_pre_attn_scalar: Optional[float] = None,
+        attn_logit_softcapping: Any = _UNSET,
+        final_logit_softcapping: Any = _UNSET,
+        sliding_window: Any = _UNSET,
+        sliding_window_pattern: Optional[int] = None,
+        qkv_bias: Optional[bool] = None,
+        o_bias: Optional[bool] = None,
+        mlp_bias: Optional[bool] = None,
+        hidden_act: Optional[str] = None,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
             raise ValueError(
                 f"Unsupported model architecture '{architecture}'. "
-                f"DistributedStageModel requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
+                f"DistributedStageModel requires a supported decoder architecture "
                 f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
             )
         for name, val in [
@@ -742,6 +1219,8 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if val is None or not isinstance(val, int) or val <= 0:
                 raise ValueError(f"DistributedStageModel requires verified positive integer for '{name}', got {val}")
 
+        spec = _get_arch_spec(architecture)
+        self.spec = spec
         self.architecture = architecture
         self.layer_start = layer_start
         self.layer_end = layer_end
@@ -754,6 +1233,30 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         self.num_kv_heads = num_kv_heads
         self.intermediate_size = intermediate_size
         self.head_dim = head_dim
+
+        self.rms_norm_eps = float(rms_norm_eps if rms_norm_eps is not None else spec["norm_eps"])
+        self.rope_theta = float(rope_theta if rope_theta is not None else spec["rope_theta"])
+        self.rope_local_base_freq = (
+            rope_local_base_freq if rope_local_base_freq is not None else spec["rope_local_base_freq"]
+        )
+        self.query_pre_attn_scalar = (
+            query_pre_attn_scalar if query_pre_attn_scalar is not None else spec["query_pre_attn_scalar"]
+        )
+        self.attn_logit_softcapping = (
+            spec["attn_logit_softcapping"] if attn_logit_softcapping is _UNSET else attn_logit_softcapping
+        )
+        self.final_logit_softcapping = (
+            spec["final_logit_softcapping"] if final_logit_softcapping is _UNSET else final_logit_softcapping
+        )
+        self.sliding_window_cfg = spec["sliding_window"] if sliding_window is _UNSET else sliding_window
+        self.sliding_window_pattern = (
+            sliding_window_pattern if sliding_window_pattern is not None else spec["sliding_window_pattern"]
+        )
+        self.qkv_bias = spec["qkv_bias"] if qkv_bias is None else bool(qkv_bias)
+        self.o_bias = spec["o_bias"] if o_bias is None else bool(o_bias)
+        self.mlp_bias = spec["mlp_bias"] if mlp_bias is None else bool(mlp_bias)
+        self.hidden_act = str(hidden_act or spec["hidden_act"])
+        self.embed_scale = math.sqrt(float(hidden_dim)) if spec["embed_scale_sqrt"] else 1.0
 
         safe_device = device
         if safe_device.startswith("cuda") and not (HAS_TORCH and torch.cuda.is_available()):
@@ -781,39 +1284,69 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
         # 1. Embeddings (ONLY if first stage)
         if self.is_first_stage:
-            self.embed_tokens = _fast_embedding(vocab_size, hidden_dim, device=self.device, dtype=self.dtype)
+            embed_dev = "cpu" if self.progressive else self.device
+            self.embed_tokens = _fast_embedding(vocab_size, hidden_dim, device=embed_dev, dtype=self.dtype)
             self.early_exit_head = None
         else:
             self.embed_tokens = None
             self.early_exit_head = None
 
-        # 2. Assigned Transformer Layers (always genuine RealTransformerBlock directly placed on target device)
+        # 2. Assigned Transformer Layers (always genuine RealTransformerBlock)
+        # When progressive=True, layers initialize on CPU and are hot-swapped onto target device Just-In-Time as wire chunks arrive
         num_layers = layer_end - layer_start
-        self.layers = nn.ModuleList([
-            RealTransformerBlock(
-                hidden_dim=hidden_dim,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                intermediate_size=self.intermediate_size,
-                head_dim=self.head_dim,
-                architecture=self.architecture,
-                layer_idx=layer_start + i,
-                device=self.device,
-                dtype=self.dtype,
+        layer_dev = "cpu" if self.progressive else self.device
+        layers_list = []
+        for i in range(num_layers):
+            layer_idx = layer_start + i
+            layer_rope, layer_sw = _resolve_layer_sliding_and_rope(
+                self.spec,
+                layer_idx,
+                rope_theta=self.rope_theta,
+                rope_local_base_freq=self.rope_local_base_freq,
+                sliding_window=self.sliding_window_cfg,
+                sliding_window_pattern=self.sliding_window_pattern,
             )
-            for i in range(num_layers)
-        ])
+            layers_list.append(
+                RealTransformerBlock(
+                    hidden_dim=hidden_dim,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    intermediate_size=self.intermediate_size,
+                    head_dim=self.head_dim,
+                    architecture=self.architecture,
+                    eps=self.rms_norm_eps,
+                    layer_idx=layer_idx,
+                    device=layer_dev,
+                    dtype=self.dtype,
+                    rope_theta=layer_rope,
+                    sliding_window=layer_sw,
+                    query_pre_attn_scalar=self.query_pre_attn_scalar,
+                    attn_logit_softcapping=self.attn_logit_softcapping,
+                    qkv_bias=self.qkv_bias,
+                    o_bias=self.o_bias,
+                    mlp_bias=self.mlp_bias,
+                    hidden_act=self.hidden_act,
+                )
+            )
+        self.layers = nn.ModuleList(layers_list)
 
         # 3. Norm and LM Head (ONLY if last stage)
         if self.is_last_stage:
-            is_gemma = "gemma" in (self.architecture.strip().lower() if self.architecture else "")
-            self.norm = RMSNorm(hidden_dim, is_gemma=is_gemma)
-            self.lm_head = _fast_linear(hidden_dim, vocab_size, device=self.device, dtype=self.dtype)
+            head_dev = "cpu" if self.progressive else self.device
+            self.norm = _build_norm(
+                hidden_dim,
+                eps=self.rms_norm_eps,
+                norm_type=self.spec["norm_type"],
+                is_gemma=self.spec["norm_unit_offset"],
+                device=head_dev,
+                dtype=self.dtype,
+            )
+            self.lm_head = _fast_linear(hidden_dim, vocab_size, device=head_dev, dtype=self.dtype, bias=False)
         else:
             self.norm = None
             self.lm_head = None
 
-        if self.device != "cpu":
+        if not self.progressive and self.device != "cpu":
             try:
                 self.to(self.device)
             except Exception as e:
@@ -849,25 +1382,43 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 self.embed_tokens.weight.copy_(src.to(dtype=self.embed_tokens.weight.dtype))
             logger.info(f"Loaded verified embedding weights {tuple(src.shape)} into first stage.")
 
-    def load_head_weights(self, lm_head_weight: Any, norm_weight: Optional[Any] = None):
-        """Loads verified pre-trained final RMSNorm and LM Head weights into the last stage."""
+    def load_head_weights(
+        self,
+        lm_head_weight: Any,
+        norm_weight: Optional[Any] = None,
+        norm_bias: Optional[Any] = None,
+    ):
+        """Loads verified pre-trained final norm and LM Head weights into the last stage."""
         if not self.is_last_stage:
             return
         if not HAS_TORCH:
             return
         with torch.no_grad():
             if norm_weight is not None and self.norm is not None:
+                norm_label = "LayerNorm" if isinstance(self.norm, nn.LayerNorm) else "RMSNorm"
                 if not isinstance(norm_weight, torch.Tensor):
                     raise ValueError(
-                        f"Expected torch.Tensor for RMSNorm weights, got {type(norm_weight).__name__}."
+                        f"Expected torch.Tensor for {norm_label} weights, got {type(norm_weight).__name__}."
                     )
                 n_src = norm_weight.to(device=self.device)
                 if n_src.shape != self.norm.weight.shape:
                     raise ValueError(
-                        f"RMSNorm weight shape mismatch: expected {tuple(self.norm.weight.shape)}, got {tuple(n_src.shape)}. "
+                        f"{norm_label} weight shape mismatch: expected {tuple(self.norm.weight.shape)}, got {tuple(n_src.shape)}. "
                         f"Partial copying is rejected."
                     )
                 self.norm.weight.copy_(n_src.to(dtype=self.norm.weight.dtype))
+            if norm_bias is not None and self.norm is not None and getattr(self.norm, "bias", None) is not None:
+                if not isinstance(norm_bias, torch.Tensor):
+                    raise ValueError(
+                        f"Expected torch.Tensor for LayerNorm bias, got {type(norm_bias).__name__}."
+                    )
+                b_src = norm_bias.to(device=self.device)
+                if b_src.shape != self.norm.bias.shape:
+                    raise ValueError(
+                        f"LayerNorm bias shape mismatch: expected {tuple(self.norm.bias.shape)}, got {tuple(b_src.shape)}. "
+                        f"Partial copying is rejected."
+                    )
+                self.norm.bias.copy_(b_src.to(dtype=self.norm.bias.dtype))
             if lm_head_weight is not None and self.lm_head is not None:
                 if not isinstance(lm_head_weight, torch.Tensor):
                     raise ValueError(
@@ -900,6 +1451,14 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if new_block is not None:
             installed_block = new_block.to(self.device)
         elif weights is not None:
+            layer_rope, layer_sw = _resolve_layer_sliding_and_rope(
+                self.spec,
+                layer_index,
+                rope_theta=self.rope_theta,
+                rope_local_base_freq=self.rope_local_base_freq,
+                sliding_window=self.sliding_window_cfg,
+                sliding_window_pattern=self.sliding_window_pattern,
+            )
             installed_block = deserialize_and_validate_layer_weights(
                 weights_data=weights,
                 hidden_dim=self.hidden_dim,
@@ -910,6 +1469,16 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 architecture=self.architecture,
                 layer_idx=layer_index,
                 device=self.device,
+                eps=self.rms_norm_eps,
+                rope_theta=layer_rope,
+                sliding_window=layer_sw,
+                query_pre_attn_scalar=self.query_pre_attn_scalar,
+                attn_logit_softcapping=self.attn_logit_softcapping,
+                qkv_bias=self.qkv_bias,
+                o_bias=self.o_bias,
+                mlp_bias=self.mlp_bias,
+                hidden_act=self.hidden_act,
+                dtype=self.dtype,
             )
         else:
             raise ValueError(f"Cannot hot-swap layer {layer_index} without weights or new block.")
@@ -977,6 +1546,9 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 )
 
         h = self.embed_tokens(input_ids)
+        if getattr(self, "embed_scale", 1.0) != 1.0:
+            scale = torch.tensor(self.embed_scale, device=h.device, dtype=h.dtype)
+            h = h * scale
         new_kvs = []
         for i, layer in enumerate(self.layers):
             layer_idx = self.layer_start + i
@@ -1010,6 +1582,9 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if self.is_last_stage:
             h = self.norm(h)
             logits = self.lm_head(h)
+            cap = getattr(self, "final_logit_softcapping", None)
+            if cap is not None and cap > 0:
+                logits = (torch.tanh(logits.float() / float(cap)) * float(cap)).to(logits.dtype)
             return logits, new_kvs
 
         return h, new_kvs
@@ -1033,9 +1608,10 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
     if os.path.isdir(hub_dir):
         clean_name = model_name.replace("/", "--").replace(":", "--").lower()
         prefix = model_name.split(":")[0].split("/")[0].lower()
+        known_prefixes = ("gemma", "qwen", "llama", "mistral", "deepseek", "starcoder2")
         for d in os.listdir(hub_dir):
             d_lower = d.lower()
-            if clean_name in d_lower or (prefix in d_lower and ("gemma" in prefix or "qwen" in prefix or "llama" in prefix or "mistral" in prefix)):
+            if clean_name in d_lower or (prefix in d_lower and any(kp in prefix for kp in known_prefixes)):
                 snapshots_dir = os.path.join(hub_dir, d, "snapshots")
                 if os.path.isdir(snapshots_dir):
                     for snap in os.listdir(snapshots_dir):
@@ -1082,7 +1658,7 @@ def load_hf_stage_model(
     if not is_architecture_supported(arch):
         raise ValueError(
             f"Unsupported model architecture '{arch}' for model '{model_name}'. "
-            f"DistributedStageModel requires an architecture compatible with RMSNorm + RoPE + SwiGLU "
+            f"DistributedStageModel requires a supported decoder architecture "
             f"(supported: {sorted(SUPPORTED_ARCHITECTURES)}). Incompatible architectures (e.g. MoE, MPT, GPT-2) are rejected."
         )
 
@@ -1103,6 +1679,11 @@ def load_hf_stage_model(
         elif "float32" in meta_dtype_str.lower():
             stage_dtype = torch.float32
 
+    use_bias_cfg = meta.get("use_bias")
+    qkv_bias_cfg = meta.get("attention_bias") if meta.get("attention_bias") is not None else use_bias_cfg
+    o_bias_cfg = use_bias_cfg
+    mlp_bias_cfg = meta.get("mlp_bias") if meta.get("mlp_bias") is not None else use_bias_cfg
+
     stage = DistributedStageModel(
         layer_start=layer_start,
         layer_end=layer_end,
@@ -1119,6 +1700,18 @@ def load_hf_stage_model(
         head_dim=head_dim,
         architecture=arch,
         dtype=stage_dtype,
+        rms_norm_eps=meta.get("rms_norm_eps"),
+        rope_theta=meta.get("rope_theta"),
+        rope_local_base_freq=meta.get("rope_local_base_freq"),
+        query_pre_attn_scalar=meta.get("query_pre_attn_scalar"),
+        attn_logit_softcapping=meta["attn_logit_softcapping"] if meta.get("attn_logit_softcapping") is not None else _UNSET,
+        final_logit_softcapping=meta["final_logit_softcapping"] if meta.get("final_logit_softcapping") is not None else _UNSET,
+        sliding_window=meta["sliding_window"] if meta.get("sliding_window") is not None else _UNSET,
+        sliding_window_pattern=meta.get("sliding_window_pattern"),
+        qkv_bias=qkv_bias_cfg,
+        o_bias=o_bias_cfg,
+        mlp_bias=mlp_bias_cfg,
+        hidden_act=meta.get("hidden_act"),
     )
 
     if not progressive and HAS_TORCH:
@@ -1142,6 +1735,7 @@ def load_hf_stage_model(
             model_cache_dir = DEFAULT_CACHE_DIR / safe_name
             embed_cache_file = model_cache_dir / "embed_tokens.pt"
             norm_cache_file = model_cache_dir / "norm.pt"
+            norm_bias_cache_file = model_cache_dir / "norm_bias.pt"
             head_cache_file = model_cache_dir / "lm_head.pt"
 
             cached_embed = None
@@ -1155,10 +1749,16 @@ def load_hf_stage_model(
 
             cached_head = None
             cached_norm = None
+            cached_norm_bias = None
             if is_last_stage:
                 if norm_cache_file.is_file():
                     try:
                         cached_norm = torch.load(norm_cache_file, weights_only=True)
+                    except Exception:
+                        pass
+                if norm_bias_cache_file.is_file():
+                    try:
+                        cached_norm_bias = torch.load(norm_bias_cache_file, weights_only=True)
                     except Exception:
                         pass
                 if head_cache_file.is_file():
@@ -1170,7 +1770,11 @@ def load_hf_stage_model(
                     cached_head = cached_embed
 
                 if cached_head is not None:
-                    stage.load_head_weights(lm_head_weight=cached_head, norm_weight=cached_norm)
+                    stage.load_head_weights(
+                        lm_head_weight=cached_head,
+                        norm_weight=cached_norm,
+                        norm_bias=cached_norm_bias,
+                    )
 
             need_embed = is_first_stage and cached_embed is None
             need_head = is_last_stage and (cached_head is None or cached_norm is None)
@@ -1208,6 +1812,7 @@ def load_hf_stage_model(
 
                             embed_weight = cached_embed
                             norm_weight = cached_norm
+                            norm_bias = cached_norm_bias
                             lm_head_weight = cached_head
 
                             # Check embedding weights if needed
@@ -1223,6 +1828,8 @@ def load_hf_stage_model(
                                 for t in reader.tensors:
                                     if norm_weight is None and t.name in ("output_norm.weight", "norm.weight", "model.norm.weight"):
                                         norm_weight = torch.from_numpy(t.data.copy())
+                                    elif norm_bias is None and t.name in ("output_norm.bias", "norm.bias", "model.norm.bias"):
+                                        norm_bias = torch.from_numpy(t.data.copy())
                                     elif lm_head_weight is None and t.name in ("output.weight", "lm_head.weight"):
                                         arr = gguf.quants.dequantize(t.data, t.tensor_type) if t.tensor_type != 0 else t.data
                                         lm_head_weight = torch.from_numpy(arr.copy())
@@ -1239,11 +1846,17 @@ def load_hf_stage_model(
                                     pass
 
                             if is_last_stage and lm_head_weight is not None and cached_head is None:
-                                stage.load_head_weights(lm_head_weight=lm_head_weight, norm_weight=norm_weight)
+                                stage.load_head_weights(
+                                    lm_head_weight=lm_head_weight,
+                                    norm_weight=norm_weight,
+                                    norm_bias=norm_bias,
+                                )
                                 try:
                                     model_cache_dir.mkdir(parents=True, exist_ok=True)
                                     if norm_weight is not None:
                                         torch.save(norm_weight, norm_cache_file)
+                                    if norm_bias is not None:
+                                        torch.save(norm_bias, norm_bias_cache_file)
                                     torch.save(lm_head_weight, head_cache_file)
                                 except Exception:
                                     pass
@@ -1282,6 +1895,7 @@ def load_hf_stage_model(
                     import safetensors.torch
                     embed_weight = None
                     norm_weight = None
+                    norm_bias = None
                     lm_head_weight = None
 
                     for sf in sfiles:
@@ -1290,23 +1904,43 @@ def load_hf_stage_model(
                         try:
                             with safetensors.safe_open(sf, framework="pt", device="cpu") as f:
                                 f_keys = set(f.keys())
-                                # Check embeddings
-                                if is_first_stage and embed_weight is None:
-                                    for ek in ("model.embed_tokens.weight", "embed_tokens.weight", "token_embd.weight"):
+                                # Load embeddings for first stage OR tied-lm_head fallback on last stage
+                                if embed_weight is None and (is_first_stage or (is_last_stage and lm_head_weight is None)):
+                                    for ek in (
+                                        "model.embed_tokens.weight",
+                                        "language_model.model.embed_tokens.weight",
+                                        "embed_tokens.weight",
+                                        "token_embd.weight",
+                                    ):
                                         if ek in f_keys:
                                             embed_weight = f.get_tensor(ek)
                                             break
 
-                                # Check norm
+                                # Check norm weight & optional bias (e.g. StarCoder2 LayerNorm)
                                 if is_last_stage and norm_weight is None:
-                                    for nk in ("model.norm.weight", "norm.weight", "output_norm.weight"):
+                                    for nk in (
+                                        "model.norm.weight",
+                                        "language_model.model.norm.weight",
+                                        "norm.weight",
+                                        "output_norm.weight",
+                                    ):
                                         if nk in f_keys:
                                             norm_weight = f.get_tensor(nk)
+                                            break
+                                if is_last_stage and norm_bias is None:
+                                    for nbk in (
+                                        "model.norm.bias",
+                                        "language_model.model.norm.bias",
+                                        "norm.bias",
+                                        "output_norm.bias",
+                                    ):
+                                        if nbk in f_keys:
+                                            norm_bias = f.get_tensor(nbk)
                                             break
 
                                 # Check lm_head
                                 if is_last_stage and lm_head_weight is None:
-                                    for hk in ("lm_head.weight", "output.weight"):
+                                    for hk in ("lm_head.weight", "language_model.lm_head.weight", "output.weight"):
                                         if hk in f_keys:
                                             lm_head_weight = f.get_tensor(hk)
                                             break
@@ -1315,17 +1949,21 @@ def load_hf_stage_model(
                                 for l_idx in range(layer_start, layer_end):
                                     if stage.is_layer_ready(l_idx):
                                         continue
-                                    layer_prefix = f"model.layers.{l_idx}."
-                                    alt_prefix = f"layers.{l_idx}."
-                                    alt_blk = f"blk.{l_idx}."
-                                    matched_keys = [
-                                        k for k in f_keys
-                                        if k.startswith(layer_prefix) or k.startswith(alt_prefix) or k.startswith(alt_blk)
-                                    ]
+                                    prefixes = (
+                                        f"model.layers.{l_idx}.",
+                                        f"language_model.model.layers.{l_idx}.",
+                                        f"layers.{l_idx}.",
+                                        f"blk.{l_idx}.",
+                                    )
+                                    matched_keys = [k for k in f_keys if k.startswith(prefixes)]
                                     if matched_keys:
                                         layer_state = {}
                                         for k in matched_keys:
-                                            short_k = k.replace(layer_prefix, "").replace(alt_prefix, "").replace(alt_blk, "")
+                                            short_k = k
+                                            for p in prefixes:
+                                                if short_k.startswith(p):
+                                                    short_k = short_k[len(p):]
+                                                    break
                                             layer_state[short_k] = f.get_tensor(k)
                                         try:
                                             stage.hot_swap_layer(l_idx, weights=layer_state)
@@ -1337,15 +1975,20 @@ def load_hf_stage_model(
                                         except Exception as e:
                                             logger.debug(f"Failed to load layer {l_idx} from {sf}: {e}")
 
-                                    if is_first_stage and embed_weight is not None:
-                                        stage.load_embedding_weights(embed_weight)
-                                    if is_last_stage:
-                                        if lm_head_weight is None and embed_weight is not None:
-                                            lm_head_weight = embed_weight
-                                        stage.load_head_weights(lm_head_weight=lm_head_weight, norm_weight=norm_weight)
-
                         except Exception:
                             pass
+
+                    if is_first_stage and embed_weight is not None:
+                        stage.load_embedding_weights(embed_weight)
+                    if is_last_stage:
+                        if lm_head_weight is None and embed_weight is not None:
+                            lm_head_weight = embed_weight
+                        if lm_head_weight is not None or norm_weight is not None:
+                            stage.load_head_weights(
+                                lm_head_weight=lm_head_weight,
+                                norm_weight=norm_weight,
+                                norm_bias=norm_bias,
+                            )
                 except Exception as e:
                     logger.warning(f"Error loading safetensors for {model_name}: {e}")
 

@@ -14,17 +14,32 @@ import platform
 import logging
 import json
 import time
+import threading
+import ctypes
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
 
 logger = logging.getLogger("situs.hardware")
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None
+_torch = None
+_torch_checked = False
+HAS_TORCH = None
+
+
+def _get_torch():
+    global _torch, _torch_checked, HAS_TORCH
+    if HAS_TORCH is False:
+        return None
+    if not _torch_checked:
+        _torch_checked = True
+        try:
+            import torch
+            _torch = torch
+            HAS_TORCH = True
+        except (ImportError, Exception):
+            _torch = None
+            HAS_TORCH = False
+    return _torch
 
 
 @dataclass
@@ -125,16 +140,119 @@ def find_nvidia_smi() -> Optional[str]:
     return None
 
 
+_nvml_lock = threading.Lock()
+_nvml_lib = None
+_nvml_init_attempted = False
+_nvml_init_ok = False
+_last_nvml_time: float = 0.0
+_last_nvml_cache: Dict[int, Tuple[str, int, int, int]] = {}
+
+
+class _NvmlMemoryV1(ctypes.Structure):
+    _fields_ = [
+        ("total", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
+    ]
+
+
+class _NvmlMemoryV2(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_uint),
+        ("total", ctypes.c_ulonglong),
+        ("reserved", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
+    ]
+
+
+def _query_nvml(dev_idx: int = 0, force_refresh: bool = False) -> Optional[Tuple[str, int, int, int]]:
+    """Fast in-process dGPU VRAM query via NVML shared library (0 subprocesses, ~0.05ms)."""
+    global _nvml_lib, _nvml_init_attempted, _nvml_init_ok, _last_nvml_time, _last_nvml_cache
+    now = time.time()
+    with _nvml_lock:
+        if not force_refresh and dev_idx in _last_nvml_cache and (now - _last_nvml_time) < 0.20:
+            return _last_nvml_cache[dev_idx]
+
+        if not _nvml_init_attempted:
+            _nvml_init_attempted = True
+            lib_candidates = (
+                [
+                    "nvml.dll",
+                    r"C:\Windows\System32\nvml.dll",
+                    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll",
+                ]
+                if sys.platform == "win32"
+                else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+            )
+            for cand in lib_candidates:
+                try:
+                    lib = ctypes.CDLL(cand)
+                    if hasattr(lib, "nvmlInit_v2") and lib.nvmlInit_v2() == 0:
+                        _nvml_lib = lib
+                        _nvml_init_ok = True
+                        break
+                    elif hasattr(lib, "nvmlInit") and lib.nvmlInit() == 0:
+                        _nvml_lib = lib
+                        _nvml_init_ok = True
+                        break
+                except Exception:
+                    continue
+
+        if not _nvml_init_ok or _nvml_lib is None:
+            return None
+
+        try:
+            handle = ctypes.c_void_p()
+            get_handle = getattr(_nvml_lib, "nvmlDeviceGetHandleByIndex_v2", None) or getattr(_nvml_lib, "nvmlDeviceGetHandleByIndex", None)
+            if get_handle is None or get_handle(dev_idx, ctypes.byref(handle)) != 0:
+                return None
+
+            gpu_name = f"NVIDIA GPU ({dev_idx})"
+            name_buf = ctypes.create_string_buffer(96)
+            if hasattr(_nvml_lib, "nvmlDeviceGetName") and _nvml_lib.nvmlDeviceGetName(handle, name_buf, 96) == 0:
+                decoded = name_buf.value.decode("utf-8", errors="replace").strip()
+                if decoded:
+                    gpu_name = decoded
+
+            # Prefer v2 memory info so NVIDIA driver-reserved memory is separated from real active VRAM usage
+            if hasattr(_nvml_lib, "nvmlDeviceGetMemoryInfo_v2"):
+                mem2 = _NvmlMemoryV2()
+                mem2.version = (2 << 24) | ctypes.sizeof(_NvmlMemoryV2)
+                if _nvml_lib.nvmlDeviceGetMemoryInfo_v2(handle, ctypes.byref(mem2)) == 0:
+                    res = (gpu_name, int(mem2.total), int(mem2.free), int(mem2.used))
+                    _last_nvml_cache[dev_idx] = res
+                    _last_nvml_time = now
+                    return res
+
+            if hasattr(_nvml_lib, "nvmlDeviceGetMemoryInfo"):
+                mem1 = _NvmlMemoryV1()
+                if _nvml_lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem1)) == 0:
+                    res = (gpu_name, int(mem1.total), int(mem1.free), int(mem1.used))
+                    _last_nvml_cache[dev_idx] = res
+                    _last_nvml_time = now
+                    return res
+        except Exception:
+            pass
+    return None
+
+
 _last_smi_query_time: float = 0.0
 _last_smi_result: Optional[Tuple[str, int, int, int]] = None
-_SMI_CACHE_TTL: float = 5.0
+_SMI_CACHE_TTL: float = 2.0
 
 
-def query_nvidia_smi(force_refresh: bool = False) -> Optional[Tuple[str, int, int, int]]:
-    """Queries nvidia-smi tool for GPU name, total VRAM, free VRAM, and used VRAM.
-    Uses cached result within TTL to prevent blocking the async event loop with repeated child processes.
+def query_nvidia_smi(force_refresh: bool = False, dev_idx: int = 0) -> Optional[Tuple[str, int, int, int]]:
+    """Queries live dGPU telemetry (name, total_bytes, free_bytes, used_bytes).
+    Uses fast in-process NVML when available, falling back to nvidia-smi subprocess.
     """
     global _last_smi_query_time, _last_smi_result
+    nvml_res = _query_nvml(dev_idx=dev_idx, force_refresh=force_refresh)
+    if nvml_res is not None:
+        _last_smi_result = nvml_res
+        _last_smi_query_time = time.time()
+        return nvml_res
+
     now = time.time()
     if not force_refresh and _last_smi_result is not None and (now - _last_smi_query_time) < _SMI_CACHE_TTL:
         return _last_smi_result
@@ -152,7 +270,8 @@ def query_nvidia_smi(force_refresh: bool = False) -> Optional[Tuple[str, int, in
         )
         output = res.stdout.strip()
         if output:
-            line = output.splitlines()[0]
+            lines = output.splitlines()
+            line = lines[dev_idx] if dev_idx < len(lines) else lines[0]
             parts = [p.strip() for p in line.split(",")]
             gpu_name = parts[0]
             total_mb = float(parts[1]) if len(parts) > 1 else 6144.0
@@ -169,34 +288,45 @@ def query_nvidia_smi(force_refresh: bool = False) -> Optional[Tuple[str, int, in
     return _last_smi_result
 
 
+_vram_lock = threading.Lock()
+
+
 def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
     """
-    Returns live (total_bytes, used_bytes, free_bytes) from dedicated GPU VRAM.
-    Accurately reports process-allocated VRAM for used_bytes (0 when idle, matching Task Manager),
-    and true available GPU memory for free_bytes.
+    Returns live (total_bytes, used_bytes, free_bytes) from dedicated dGPU VRAM.
+    Uses live hardware NVML/nvidia-smi telemetry so external CUDA engines (Ollama, llama.cpp)
+    and PyTorch allocations are both reflected accurately in real time.
     """
-    if HAS_TORCH:
-        try:
-            if torch.cuda.is_available():
-                free_b, total_b = torch.cuda.mem_get_info(dev_idx)
-                alloc_b = torch.cuda.memory_allocated(dev_idx)
-                res_b = torch.cuda.memory_reserved(dev_idx)
-                effective_free_b = free_b + max(0, res_b - alloc_b)
-                # Used bytes reflects actual dedicated GPU VRAM used, matching OS Task Manager
-                driver_used_b = max(0, total_b - free_b)
-                used_b = max(alloc_b, driver_used_b)
-                return (total_b, used_b, effective_free_b)
-        except Exception:
-            pass
+    with _vram_lock:
+        smi = query_nvidia_smi() if dev_idx == 0 else query_nvidia_smi(dev_idx=dev_idx)
+        if smi is not None:
+            _name, total_b, free_b, used_b = smi
+            if _torch_checked and _torch is not None:
+                try:
+                    if _torch.cuda.is_available():
+                        alloc_b = _torch.cuda.memory_allocated(dev_idx)
+                        if alloc_b > used_b:
+                            used_b = alloc_b
+                except Exception:
+                    pass
+            return (total_b, used_b, free_b)
 
-    smi = query_nvidia_smi()
-    if smi is not None:
-        # For non-torch fallback, return SMI total & free; process used is 0 when idle
-        return (smi[1], 0, smi[2])
+        t = _get_torch()
+        if t is not None:
+            try:
+                if t.cuda.is_available():
+                    free_b, total_b = t.cuda.mem_get_info(dev_idx)
+                    alloc_b = t.cuda.memory_allocated(dev_idx)
+                    res_b = t.cuda.memory_reserved(dev_idx)
+                    effective_free_b = free_b + max(0, res_b - alloc_b)
+                    used_b = max(alloc_b, max(0, total_b - effective_free_b))
+                    return (total_b, used_b, effective_free_b)
+            except Exception:
+                pass
 
     cim = query_windows_cim_gpus()
     if cim is not None:
-        return (cim[1], 0, cim[2])
+        return (cim[1], cim[3], cim[2])
 
     tot_ram, free_ram, _ = get_system_ram_and_cpu()
     used_ram = 0
@@ -294,7 +424,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
             total_memory_bytes=total_ram,
             free_memory_bytes=free_ram,
             memory_type="RAM",
-            status_message=f"CPU compute mode explicitly requested ({total_ram / 1e9:.1f} GB RAM).",
+            status_message=f"CPU compute mode explicitly requested ({total_ram / (1024**3):.1f} GB RAM).",
             physical_gpu_detected=bool(smi),
             physical_gpu_name=phys_name,
             cuda_runtime_working=False,
@@ -305,13 +435,14 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
 
     # 2. Check if PyTorch has functional CUDA runtime
     cuda_works = False
-    if HAS_TORCH:
+    t = _get_torch()
+    if t is not None:
         try:
-            cuda_works = bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
+            cuda_works = bool(t.cuda.is_available() and t.cuda.device_count() > 0)
         except Exception:
             cuda_works = False
 
-    if cuda_works:
+    if cuda_works and t is not None:
         try:
             dev_idx = 0
             if ":" in req and req.startswith("cuda:"):
@@ -321,13 +452,19 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
                     dev_idx = 0
 
             target_device = f"cuda:{dev_idx}"
-            gpu_name = torch.cuda.get_device_name(dev_idx)
-            free_b, total_b = torch.cuda.mem_get_info(dev_idx)
-            alloc_b = torch.cuda.memory_allocated(dev_idx)
-            res_b = torch.cuda.memory_reserved(dev_idx)
-            eff_free_b = free_b + max(0, res_b - alloc_b)
-            # Used VRAM must reflect process allocations (0 when idle, matching Task Manager)
-            used_b = alloc_b
+            gpu_name = t.cuda.get_device_name(dev_idx)
+            nvml_live = _query_nvml(dev_idx=dev_idx)
+            if nvml_live is not None:
+                _, total_b, eff_free_b, used_b = nvml_live
+                alloc_b = t.cuda.memory_allocated(dev_idx)
+                if alloc_b > used_b:
+                    used_b = alloc_b
+            else:
+                free_b, total_b = t.cuda.mem_get_info(dev_idx)
+                alloc_b = t.cuda.memory_allocated(dev_idx)
+                res_b = t.cuda.memory_reserved(dev_idx)
+                eff_free_b = free_b + max(0, res_b - alloc_b)
+                used_b = max(alloc_b, max(0, total_b - eff_free_b))
 
             info = HardwareInfo(
                 gpu_available=True,
@@ -338,7 +475,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
                 free_memory_bytes=eff_free_b,
                 used_memory_bytes=used_b,
                 memory_type="VRAM",
-                status_message=f"CUDA GPU detected: {gpu_name} ({total_b / 1e9:.1f} GB VRAM). Proceeding with GPU acceleration.",
+                status_message=f"CUDA GPU detected: {gpu_name} ({total_b / (1024**3):.1f} GB VRAM). Proceeding with GPU acceleration.",
                 physical_gpu_detected=True,
                 physical_gpu_name=gpu_name,
                 cuda_runtime_working=True,
@@ -349,7 +486,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
         except Exception as e:
             logger.debug(f"PyTorch CUDA query failed: {e}")
 
-    # 3. Check Physical NVIDIA GPU via nvidia-smi (even if PyTorch is CPU-only)
+    # 3. Check Physical NVIDIA GPU via nvidia-smi / NVML (even if PyTorch is CPU-only)
     smi_info = query_nvidia_smi()
     if smi_info is not None:
         gpu_name, total_vram, free_vram, used_vram = smi_info
@@ -364,7 +501,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
             used_memory_bytes=used_vram,
             memory_type="VRAM",
             status_message=(
-                f"NVIDIA GPU detected: {gpu_name} ({total_vram / 1e9:.1f} GB VRAM). Proceeding with CUDA acceleration."
+                f"NVIDIA GPU detected: {gpu_name} ({total_vram / (1024**3):.1f} GB VRAM). Proceeding with CUDA acceleration."
                 if is_cuda_usable
                 else f"NVIDIA GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode."
             ),
@@ -391,7 +528,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
             used_memory_bytes=used_vram,
             memory_type="VRAM",
             status_message=(
-                f"Physical GPU detected: {gpu_name} ({total_vram / 1e9:.1f} GB VRAM). Proceeding with GPU pooling."
+                f"Physical GPU detected: {gpu_name} ({total_vram / (1024**3):.1f} GB VRAM). Proceeding with GPU pooling."
                 if is_cuda_usable
                 else f"Physical GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode."
             ),
@@ -404,7 +541,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
         return info
 
     # 5. Check Apple Silicon MPS
-    if HAS_TORCH and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if t is not None and hasattr(t.backends, "mps") and t.backends.mps.is_available():
         if req in ("auto", "mps"):
             total_ram, free_ram, cpu_name = get_system_ram_and_cpu()
             info = HardwareInfo(
@@ -434,7 +571,7 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
         total_memory_bytes=total_ram,
         free_memory_bytes=free_ram,
         memory_type="RAM",
-        status_message=f"No dedicated GPU detected. Proceeding with CPU compute mode ({total_ram / 1e9:.1f} GB RAM).",
+        status_message=f"No dedicated GPU detected. Proceeding with CPU compute mode ({total_ram / (1024**3):.1f} GB RAM).",
         physical_gpu_detected=False,
         physical_gpu_name=None,
         cuda_runtime_working=False,

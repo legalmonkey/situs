@@ -165,32 +165,37 @@ class WorkerDaemon:
 
     def query_gpu_info(self):
         try:
-            if HAS_TORCH and torch.cuda.is_available() and self.config.device != "cpu":
-                dev_idx = 0
-                if ":" in str(self.config.device):
-                    try:
-                        dev_idx = int(str(self.config.device).split(":")[1])
-                    except Exception:
-                        dev_idx = 0
-                free_b, tot_b = torch.cuda.mem_get_info(dev_idx)
-                alloc_b = torch.cuda.memory_allocated(dev_idx)
-                res_b = torch.cuda.memory_reserved(dev_idx)
-                eff_free_b = free_b + max(0, res_b - alloc_b)
-                dev_name = torch.cuda.get_device_name(dev_idx)
-                driver_used_b = max(0, tot_b - free_b)
-                used_b = max(alloc_b, driver_used_b)
-                return dev_name, tot_b, eff_free_b, "cuda", used_b
+            from situs.hardware import detect_hardware, get_live_gpu_vram, get_system_ram_and_cpu
+            if str(self.config.device).strip().lower() == "cpu":
+                tot_ram, free_ram, cpu_name = get_system_ram_and_cpu()
+                used_ram = max(0, tot_ram - free_ram)
+                return f"{cpu_name} (CPU)", tot_ram, free_ram, "cpu", used_ram
 
-            from situs.hardware import detect_hardware, get_live_gpu_vram
+            dev_idx = 0
+            if ":" in str(self.config.device):
+                try:
+                    dev_idx = int(str(self.config.device).split(":")[1])
+                except Exception:
+                    dev_idx = 0
+
             if self._cached_hw is None:
                 hw = detect_hardware(requested_device=self.config.device)
-                if hw.device != self.config.device and self.config.device.startswith("cuda"):
+                if hw.device != self.config.device and str(self.config.device).startswith("cuda"):
                     self.config.device = hw.device
                 self._cached_hw = (hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type, hw.used_memory_bytes)
             dev_name, tot_b, free_b, dev_type, used_b = self._cached_hw
-            live_tot, live_used, live_free = get_live_gpu_vram()
-            if live_tot > 0:
-                return dev_name, live_tot, live_free, dev_type, live_used
+
+            if dev_type == "cuda":
+                live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
+                if HAS_TORCH and torch.cuda.is_available():
+                    try:
+                        alloc_b = torch.cuda.memory_allocated(dev_idx)
+                        if alloc_b > live_used:
+                            live_used = alloc_b
+                    except Exception:
+                        pass
+                if live_tot > 0:
+                    return dev_name, live_tot, live_free, "cuda", live_used
             return dev_name, tot_b, free_b, dev_type, used_b
         except Exception as e:
             logger.warning(f"Hardware query failed, falling back to real CPU/RAM: {e}")
@@ -245,17 +250,7 @@ class WorkerDaemon:
         logger.info(f"Connecting outbound to Coordinator Relay: {ws_url}")
 
         gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
-        logger.info(f"Hardware: {gpu_name} (Used: {used_vram / 1e9:.2f} GB | Free: {free_vram / 1e9:.2f} GB | Total: {total_vram / 1e9:.2f} GB VRAM)")
-
-        # Pre-warm tokenizer from local cache only (no online downloads that spam worker console)
-        async def _prewarm_tok():
-            try:
-                from situs.tokenizer import get_or_load_tokenizer
-                await asyncio.to_thread(get_or_load_tokenizer, self.config.model_name, local_files_only=True)
-            except Exception as e:
-                logger.debug(f"Tokenizer pre-warm notice: {e}")
-
-        asyncio.create_task(_prewarm_tok())
+        logger.info(f"Hardware: {gpu_name} (Used: {used_vram / (1024**3):.2f} GB | Free: {free_vram / (1024**3):.2f} GB | Total: {total_vram / (1024**3):.2f} GB VRAM)")
 
         connect_kwargs = {"ping_interval": 20, "ping_timeout": 120}
         if getattr(self.config, "auth_token", None):
@@ -326,14 +321,15 @@ class WorkerDaemon:
                                         f"First={assign.is_first_stage}, Last={assign.is_last_stage}"
                                     )
                                     from situs.coordinator.registry import resolve_model_metadata
-                                    from situs.worker.loader import is_architecture_supported
+                                    from situs.worker.loader import is_architecture_supported, find_local_safetensors_files
                                     try:
                                         meta = resolve_model_metadata(assign.model_name)
                                         arch = meta.get("architecture") or meta.get("model_type")
                                     except Exception:
                                         arch = None
-    
-                                    if not is_architecture_supported(arch):
+
+                                    sfiles = find_local_safetensors_files(assign.model_name)
+                                    if not is_architecture_supported(arch) or (not sfiles and not assign.progressive):
                                         logger.info(
                                             f"Model '{assign.model_name}' (architecture '{arch}') executes via local engine/Ollama runtime. "
                                             f"Pipeline assignment [{assign.layer_start}..{assign.layer_end}) recorded for cluster topology."
