@@ -47,11 +47,34 @@ def enable_windows_vt_support():
 
 enable_windows_vt_support()
 
+
+def set_pitch_black_terminal():
+    """Sets terminal default background to pure pitch black (#000000) using OSC 11 and clears canvas."""
+    if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        try:
+            # OSC 11 sets terminal background to #000000, OSC 10 sets foreground to #e2e8f0
+            sys.stdout.write("\x1b]11;#000000\x1b\\\x1b]10;#e2e8f0\x1b\\\x1b[48;2;0;0;0m")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def restore_terminal_colors():
+    """Restores terminal default foreground and background colors using OSC 111/110."""
+    if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        try:
+            sys.stdout.write("\x1b]111\x1b\\\x1b]110\x1b\\\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
 # Silence HTTP request loggers to prevent leaking HTTP GET/POST logs into the TUI
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import httpx
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -123,30 +146,35 @@ RED_SITUS_LOGO = (
 
 TAGLINE_TEXT = "D I S T R I B U T E D   G P U   S W A R M   R U N T I M E"
 
-# High-Precision KiloCode Palette: Pitch Black (#000000) & Hot Pink (#ff2a85)
+# High-Precision Modern Palette: Pitch Black (#000000) & Electric Pink (#ff2a85)
 TUI_STYLE = Style.from_dict({
     "": "bg:#000000 #e2e8f0",               # Pure pitch-black terminal canvas
-    "card.border": "#22101b",              # Subtle dark plum border
-    "card.border.active": "#ff2a85",       # Vibrant hot-pink active focus border
-    "prompt.bar": "#ff2a85 bold",          # Vertical hot-pink focus bar (Kilo style)
-    "prompt.text": "#ffffff",              # Crisp modern white input text
+    "window": "bg:#000000",
+    "frame": "bg:#000000",
+    "card": "bg:#000000",
+    "card.border": "bg:#000000 #27272a",   # Muted modern zinc border
+    "card.border.active": "bg:#000000 #ff2a85", # Vibrant hot-pink active focus border
+    "prompt.bar": "bg:#000000 #ff2a85 bold",# Vertical accent focus bar
+    "prompt.text": "bg:#000000 #ffffff",   # Crisp modern white input text
     "text-area": "bg:#000000 #ffffff",     # Crisp modern white typed text in input card
-    "text-area.cursor-line": "#ffffff",
-    "placeholder": "#6b7280 italic",       # Muted placeholder text
-    "status.badge": "#ff2a85 bold",        # Pink status tag
-    "status.text": "#ff70a6",              # Soft rose status text
-    "status.ready": "#22c55e bold",        # Vibrant green status indicator
-    "status.waiting": "#f59e0b bold",      # Warm amber waiting indicator
-    "shortcuts": "#6b7280",                # Subtle muted shortcuts text
-    "shortcuts.key": "#ff70a6 bold",       # Soft pink shortcut keys
-    "bottom-toolbar": "bg:#000000 #6b7280",# Pitch-black bottom bar
-    "bottom-toolbar.branch": "#ff2a85 bold",
-    "bottom-toolbar.version": "#ff70a6",
-    "completion-menu": "bg:#0b080e #ffffff",
-    "completion-menu.completion": "bg:#0b080e #ff70a6",
-    "completion-menu.completion.current": "bg:#2a1220 #ff2a85 bold",
-    "completion-menu.meta": "bg:#050508 #6b7280 italic",
-    "completion-menu.meta.current": "bg:#2a1220 #fda4af italic",
+    "text-area.cursor-line": "bg:#000000 #ffffff",
+    "placeholder": "bg:#000000 #64748b italic", # Muted placeholder text
+    "status.badge": "bg:#000000 #ff2a85 bold", # Pink status tag
+    "status.text": "bg:#000000 #ff70a6",   # Soft rose status text
+    "status.ready": "bg:#000000 #22c55e bold", # Vibrant green status indicator
+    "status.waiting": "bg:#000000 #f59e0b bold", # Warm amber waiting indicator
+    "shortcuts": "bg:#000000 #64748b",     # Subtle muted shortcuts text
+    "shortcuts.key": "bg:#000000 #ff70a6 bold", # Soft pink shortcut keys
+    "bottom-toolbar": "bg:#000000 #64748b",# Pitch-black bottom bar
+    "bottom-toolbar.branch": "bg:#000000 #ff2a85 bold",
+    "bottom-toolbar.version": "bg:#000000 #ff70a6",
+    "completion-menu": "bg:#09090b #ffffff",
+    "completion-menu.completion": "bg:#09090b #ff70a6",
+    "completion-menu.completion.current": "bg:#27272a #ff2a85 bold",
+    "completion-menu.meta": "bg:#09090b #64748b italic",
+    "completion-menu.meta.current": "bg:#27272a #fda4af italic",
+    "sidebar": "bg:#000000",
+    "history": "bg:#000000",
 })
 
 
@@ -376,6 +404,7 @@ class OpenCodeSlashCompleter(Completer):
         ("/model", "Select or switch models (e.g. /model 1, /model 2, /model <name>)"),
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
         ("/speculative", "Toggle prompt-lookup speculative candidate drafting"),
+        ("/tokens", "View or set maximum generation tokens: /tokens [count] (default: 2048)"),
         ("/clear", "Clear chat memory and reset interface"),
         ("/system", "View or update system prompt instructions"),
         ("/help", "Show all commands, custom worker IDs & model selection guide"),
@@ -489,7 +518,8 @@ def is_coordinator_online(url: str, timeout: Optional[float] = None) -> bool:
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         if timeout is None:
-            timeout = 0.08 if host in ("127.0.0.1", "localhost", "::1") else 0.25
+            is_wan = not is_rfc1918_private_ip(host) and host not in ("127.0.0.1", "localhost", "::1")
+            timeout = 0.08 if host in ("127.0.0.1", "localhost", "::1") else (2.0 if is_wan else 0.5)
         return is_port_open(host, port, timeout=timeout)
     except Exception:
         return False
@@ -599,10 +629,15 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
     if cached and (now - cached[0]) < ttl:
         return cached[1]
 
-    # 2. HTTP status fetch directly with short timeout
+    parsed = urlparse(normalized if "://" in normalized else f"http://{normalized}")
+    host = parsed.hostname or "127.0.0.1"
+    is_wan = not is_rfc1918_private_ip(host) and host not in ("127.0.0.1", "localhost", "::1")
+    http_timeout = 3.5 if is_wan else 0.8
+
+    # 2. HTTP status fetch directly with appropriate timeout
     try:
-        with httpx.Client(timeout=0.8) as client:
-            resp = client.get(f"{normalized}/status")
+        with httpx.Client(timeout=http_timeout, follow_redirects=True) as client:
+            resp = client.get(f"{normalized.rstrip('/')}/status")
             if resp.status_code == 200:
                 data = resp.json()
                 _metadata_cache[normalized] = (now, data)
@@ -611,7 +646,8 @@ def fetch_cluster_metadata(coordinator_url: str, ttl: float = 1.0) -> Dict[str, 
         pass
 
     # 3. Fast socket check fallback
-    if is_coordinator_online(normalized, timeout=0.08):
+    probe_timeout = 2.0 if is_wan else 0.08
+    if is_coordinator_online(normalized, timeout=probe_timeout):
         if cached:
             _metadata_cache[normalized] = (now, cached[1])
             return cached[1]
@@ -897,10 +933,13 @@ def start_in_process_worker(
         local_subnets = [get_subnet_24(lip) for lip in local_ips if lip]
         subnet_mismatch = is_target_private and target_subnet and (target_subnet not in local_subnets)
 
+        is_wan = not is_target_private and target_host not in ("127.0.0.1", "localhost", "::1")
+        probe_timeout = 8.0 if is_wan else 2.5
+
         existing_workers = []
         try:
-            with httpx.Client(timeout=2.5) as probe_c:
-                st = probe_c.get(f"{parsed_http}/status")
+            with httpx.Client(timeout=probe_timeout, follow_redirects=True) as probe_c:
+                st = probe_c.get(f"{parsed_http.rstrip('/')}/status")
                 if st.status_code == 200:
                     existing_workers = [w.get("id") or w.get("worker_id") for w in st.json().get("workers", [])]
                 else:
@@ -962,13 +1001,14 @@ def start_in_process_worker(
         t = threading.Thread(target=runner, daemon=True)
         t.start()
         
-        # Wait synchronously up to 6.0 seconds for confirmed registration with the coordinator
+        # Wait synchronously up to 15.0s on WAN (6.0s on LAN) for confirmed registration with the coordinator
+        reg_timeout = 15.0 if is_wan else 6.0
         is_registered = False
         if hasattr(daemon, "registered_event"):
-            is_registered = daemon.registered_event.wait(timeout=6.0)
+            is_registered = daemon.registered_event.wait(timeout=reg_timeout)
         else:
             start_wait = time.time()
-            while time.time() - start_wait < 6.0:
+            while time.time() - start_wait < reg_timeout:
                 if getattr(daemon, "is_registered", False):
                     is_registered = True
                     break
@@ -989,6 +1029,8 @@ def start_in_process_worker(
                     f"Private RFC 1918 IPs cannot route between different Wi-Fi networks.\n"
                     f"Connect both devices to the same Wi-Fi, or use Tailscale (/join 100.x.y.z:8000)."
                 )
+            if is_wan:
+                return False, f"Worker could not register with Coordinator at {addr} ({err_desc}). Check your internet connection and verify the Cloudflare tunnel link is active."
             return False, f"Worker could not register with Coordinator at {addr} ({err_desc}). Ensure coordinator is running and port 8000 is accessible."
 
         return True, f"Worker {w_id} connected to {addr}"
@@ -1040,39 +1082,40 @@ def prompt_in_centered_box(
     status_line_html = "  " + badge_html
 
     card_inner = HSplit([
-        Window(height=1),
+        Window(height=1, char=" ", style="bg:#000000"),
         input_box,
-        Window(height=1),
-        Window(content=FormattedTextControl(HTML(status_line_html)), height=1),
-        Window(height=1),
-    ])
+        Window(height=1, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(HTML(status_line_html)), height=1, char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#000000"),
+    ], style="bg:#000000")
 
     # Clean Unicode Rounded Card Borders (╭ ─ ╮ / ╰ ─ ╯)
     card_top = VSplit([
         Window(width=1, height=1, char="╭", style="class:card.border"),
         Window(char="─", style="class:card.border"),
         Window(width=1, height=1, char="╮", style="class:card.border"),
-    ], height=1)
+    ], height=1, style="bg:#000000")
 
     card_middle = VSplit([
         Window(width=1, char="│", style="class:card.border"),
         card_inner,
         Window(width=1, char="│", style="class:card.border"),
-    ])
+    ], style="bg:#000000")
 
     card_bottom = VSplit([
         Window(width=1, height=1, char="╰", style="class:card.border"),
         Window(char="─", style="class:card.border"),
         Window(width=1, height=1, char="╯", style="class:card.border"),
-    ], height=1)
+    ], height=1, style="bg:#000000")
 
-    card_box = HSplit([card_top, card_middle, card_bottom], width=card_width)
+    card_box = HSplit([card_top, card_middle, card_bottom], width=card_width, style="bg:#000000")
 
     float_container = FloatContainer(
         content=card_box,
         floats=[
             Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=8))
-        ]
+        ],
+        style="bg:#000000"
     )
 
     shortcuts_html = (
@@ -1083,21 +1126,21 @@ def prompt_in_centered_box(
     )
 
     shortcuts_view = VSplit([
-        Window(width=D()),
-        Window(content=FormattedTextControl(HTML(shortcuts_html)), width=card_width),
-        Window(width=D()),
-    ], height=1)
+        Window(width=D(), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(HTML(shortcuts_html)), width=card_width, char=" ", style="bg:#000000"),
+        Window(width=D(), char=" ", style="bg:#000000"),
+    ], height=1, style="bg:#000000")
 
     footer_view = VSplit([
-        Window(content=FormattedTextControl(HTML(" <style color='#6b7280'>~/situs/cluster:HEAD</style>"))),
-        Window(content=FormattedTextControl(HTML(f"<style color='#22c55e'>●</style> <style color='#6b7280'>swarm active ({workers_cnt} nodes)</style> " if workers_cnt > 0 else "<style color='#6b7280'>local</style> ")), align="RIGHT")
-    ], height=1)
+        Window(content=FormattedTextControl(HTML(" <style color='#6b7280'>~/situs/cluster:HEAD</style>")), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(HTML(f"<style color='#22c55e'>●</style> <style color='#6b7280'>swarm active ({workers_cnt} nodes)</style> " if workers_cnt > 0 else "<style color='#6b7280'>local</style> ")), align="RIGHT", char=" ", style="bg:#000000")
+    ], height=1, style="bg:#000000")
 
     elements = []
     if show_splash:
         # Optical vertical centering
         top_pad = max(1, (lines - 17) // 2 - 1)
-        elements.append(Window(height=top_pad))
+        elements.append(Window(height=top_pad, char=" ", style="bg:#000000"))
 
         # Centered logo
         logo_lines = RED_SITUS_LOGO.strip().splitlines()
@@ -1106,25 +1149,25 @@ def prompt_in_centered_box(
             pad_l = max(0, (cols - len(l)) // 2)
             logo_html_parts.append((" " * pad_l) + f'<style color="#ff2a85"><b>{l}</b></style>')
         centered_logo_html = "\n".join(logo_html_parts)
-        elements.append(Window(content=FormattedTextControl(HTML(centered_logo_html)), height=len(logo_lines)))
-        elements.append(Window(height=1))
+        elements.append(Window(content=FormattedTextControl(HTML(centered_logo_html)), height=len(logo_lines), char=" ", style="bg:#000000"))
+        elements.append(Window(height=1, char=" ", style="bg:#000000"))
 
         # Centered tagline
         pad_tag = max(0, (cols - len(TAGLINE_TEXT)) // 2)
         centered_tag_html = (" " * pad_tag) + f'<style color="#ff70a6"><b>{TAGLINE_TEXT}</b></style>'
-        elements.append(Window(content=FormattedTextControl(HTML(centered_tag_html)), height=1))
-        elements.append(Window(height=2))
+        elements.append(Window(content=FormattedTextControl(HTML(centered_tag_html)), height=1, char=" ", style="bg:#000000"))
+        elements.append(Window(height=2, char=" ", style="bg:#000000"))
     else:
-        elements.append(Window(height=1))
+        elements.append(Window(height=1, char=" ", style="bg:#000000"))
 
     # Add centered card and shortcuts
-    elements.append(VSplit([Window(width=D()), float_container, Window(width=D())]))
-    elements.append(Window(height=1))
+    elements.append(VSplit([Window(width=D(), char=" ", style="bg:#000000"), float_container, Window(width=D(), char=" ", style="bg:#000000")], style="bg:#000000"))
+    elements.append(Window(height=1, char=" ", style="bg:#000000"))
     elements.append(shortcuts_view)
-    elements.append(Window(height=D()))  # Spring pushing footer down
+    elements.append(Window(height=D(), char=" ", style="bg:#000000"))  # Spring pushing footer down
     elements.append(footer_view)
 
-    root = HSplit(elements)
+    root = HSplit(elements, style="bg:#000000")
 
     kb = KeyBindings()
 
@@ -1151,6 +1194,7 @@ def prompt_in_centered_box(
             buf.start_completion(select_first=True)
 
     try:
+        set_pitch_black_terminal()
         app = Application(
             layout=Layout(root),
             key_bindings=kb,
@@ -1178,6 +1222,8 @@ def prompt_in_centered_box(
                 return input()
             except (KeyboardInterrupt, EOFError):
                 return "/exit"
+    finally:
+        restore_terminal_colors()
 
 
 def execute_slash_command(
@@ -1294,7 +1340,7 @@ def execute_slash_command(
         tunnel_url = get_active_tunnel_url()
         if not tunnel_url:
             emit("[cyan]Establishing ephemeral public WAN tunnel for cross-Wi-Fi clustering...[/cyan]", "Public Ingress")
-            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=6.0)
+            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=15.0)
             if succ and t_url:
                 tunnel_url = t_url
 
@@ -1363,7 +1409,7 @@ def execute_slash_command(
 
         if sub in ("start", "on", "new") or not is_tunnel_active():
             emit("[cyan]Establishing Cloudflare Quick Tunnel for cross-Wi-Fi clustering...[/cyan]", "Public Tunnel")
-            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=8.0)
+            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=15.0)
             if succ and t_url:
                 panel = Panel(
                     f"[bold green]✓ Public WAN Tunnel Active[/bold green]\n\n"
@@ -1558,7 +1604,9 @@ def execute_slash_command(
                 "Then connect workers with:\n"
                 "  [bold cyan]/join 127.0.0.1:8000[/bold cyan]",
                 title="Cluster Status (Offline)",
-                border_style="yellow",
+                border_style="#ff2a85",
+                box=box.ROUNDED,
+                title_align="left",
             )
             emit(off_panel, "Cluster Status")
             return True
@@ -1572,7 +1620,10 @@ def execute_slash_command(
                 "[bold yellow]No workers currently connected to Coordinator.[/bold yellow]\n\n"
                 "To join this machine or another laptop, type:\n"
                 "  [bold cyan]/join 127.0.0.1:8000[/bold cyan]",
-                border_style="yellow"
+                title="Cluster Status",
+                border_style="#ff70a6",
+                box=box.ROUNDED,
+                title_align="left",
             )
             emit(no_workers_panel, "Cluster Status")
         return True
@@ -1913,6 +1964,26 @@ def execute_slash_command(
             emit(f"[cyan]Current system prompt:[/cyan] {session_state.get('system_prompt')}", "System Prompt")
         return True
 
+    elif root_cmd in ("/tokens", "tokens", "/max_tokens", "max_tokens"):
+        if len(parts) > 1:
+            try:
+                cnt = int(parts[1].strip())
+                if cnt <= 0 or cnt > 32768:
+                    emit("[yellow]Token limit must be between 1 and 32768.[/yellow]", "Max Tokens")
+                else:
+                    session_state["max_tokens"] = cnt
+                    emit(f"[bold green]Maximum generation tokens set to {cnt}.[/bold green]", "Max Tokens")
+            except ValueError:
+                emit("[yellow]Usage: /tokens <count> (e.g. /tokens 2048, /tokens 4096)[/yellow]", "Max Tokens")
+        else:
+            curr_tok = session_state.get("max_tokens", 2048)
+            emit(
+                f"[bold white]Current max tokens:[/bold white] [bold green]{curr_tok}[/bold green]\n"
+                f"[dim]To change: [bold cyan]/tokens <count>[/bold cyan] (e.g. /tokens 4096)[/dim]",
+                "Max Tokens"
+            )
+        return True
+
     elif root_cmd in ("chat", "/chat"):
         emit("[white]You are already inside the interactive chat interface! Type your prompt or command.[/white]", "Chat")
         return True
@@ -2199,8 +2270,8 @@ def run_opencode_tui(
             elif "[" in renderable and "]" in renderable:
                 buf = io.StringIO()
                 cols = shutil.get_terminal_size().columns
-                c_width = min(72, max(40, cols - 32))
-                c = Console(file=buf, force_terminal=True, width=c_width, color_system="truecolor", highlight=False)
+                c_width = max(40, cols - 42)
+                c = Console(file=buf, force_terminal=True, width=c_width, color_system="truecolor", highlight=False, style="on black")
                 c.print(renderable)
                 history_entries.append(("system", buf.getvalue().rstrip(), title))
             else:
@@ -2208,8 +2279,8 @@ def run_opencode_tui(
         else:
             buf = io.StringIO()
             cols = shutil.get_terminal_size().columns
-            c_width = min(72, max(40, cols - 32))
-            c = Console(file=buf, force_terminal=True, width=c_width, color_system="truecolor", highlight=False)
+            c_width = max(40, cols - 42)
+            c = Console(file=buf, force_terminal=True, width=c_width, color_system="truecolor", highlight=False, style="on black")
             c.print(renderable)
             history_entries.append(("system", buf.getvalue().rstrip(), title))
 
@@ -2244,8 +2315,10 @@ def run_opencode_tui(
         elif role == "user":
             user_html = (
                 f'<style color="#ff2a85"><b>❯</b></style> <style color="#ffffff"><b>{html.escape(text)}</b></style>\n'
-                f'<style color="#ff70a6">  {html.escape(meta)}</style>\n\n'
             )
+            if meta:
+                user_html += f'<style color="#64748b">  {html.escape(meta)}</style>\n'
+            user_html += '\n'
             frags.extend(to_formatted_text(HTML(user_html)))
         elif role == "assistant":
             asst_html = f'<style color="#e2e8f0">{html.escape(text)}</style>\n\n'
@@ -2254,19 +2327,19 @@ def run_opencode_tui(
             lines = text.strip().split("\n")
             content_html = ""
             for l in lines:
-                content_html += f'<style color="#2b1420"><b>│</b></style> <style color="#ff70a6">{html.escape(l)}</style>\n'
+                content_html += f'<style color="#27272a"><b>│</b></style> <style color="#ff70a6">{html.escape(l)}</style>\n'
             tag = f" ({html.escape(meta)})" if meta else ""
             load_html = (
                 f'<style color="#ff2a85"><b>╭─ [Online Model Streaming]</b></style><style color="#ff70a6"><b>{tag}</b></style>\n'
                 f'{content_html}'
-                f'<style color="#2b1420"><b>╰──────────────────────────────────────────────────────────</b></style>\n\n'
+                f'<style color="#27272a"><b>╰──────────────────────────────────────────────────────────</b></style>\n\n'
             )
             try:
                 frags.extend(to_formatted_text(HTML(load_html)))
             except Exception:
                 frags.append(("", f"[{meta}] {text}\n\n"))
         elif role == "metric":
-            metric_html = f'<style color="#ff70a6">{html.escape(text)}</style>\n\n'
+            metric_html = f'<style color="#64748b">  ✦ </style><style color="#ff70a6">{html.escape(text)}</style>\n\n'
             frags.extend(to_formatted_text(HTML(metric_html)))
         elif role == "stage":
             parts = text.split(" · ")
@@ -2276,16 +2349,16 @@ def run_opencode_tui(
                 m_title = right.split(" (")[0]
                 layers_part = (" (" + right.split(" (")[-1]) if " (" in right else ""
                 stage_html = (
-                    f'<style color="#64748b">{html.escape(left)} · </style>'
+                    f'<style color="#64748b">  {html.escape(left)} · </style>'
                     f'<style color="#ffffff"><b>{html.escape(m_title)}</b></style>'
                     f'<style color="#64748b">{html.escape(layers_part)}</style>\n\n'
                 )
             else:
-                stage_html = f'<style color="#64748b">{html.escape(text)}</style>\n\n'
+                stage_html = f'<style color="#64748b">  {html.escape(text)}</style>\n\n'
             try:
                 frags.extend(to_formatted_text(HTML(stage_html)))
             except Exception:
-                frags.append(("#64748b", f"{text}\n\n"))
+                frags.append(("#64748b", f"  {text}\n\n"))
         elif role == "info":
             clean_t = re.sub(r"\[/?(bold|dim|yellow|white|pink|red|green|cyan)[^\]]*\]", "", text)
             info_html = f'<style color="#f59e0b">{html.escape(clean_t)}</style>\n\n'
@@ -2380,6 +2453,8 @@ def run_opencode_tui(
     history_win = Window(
         content=history_control,
         wrap_lines=True,
+        char=" ",
+        style="bg:#000000",
     )
 
     def get_card_status_fragments():
@@ -2452,13 +2527,37 @@ def run_opencode_tui(
             (stat_style, stat_text),
         ]
 
-    card_inner = HSplit([
-        Window(height=1),
+    # Startup Screen Card: Centered Splash Card
+    startup_card_inner = HSplit([
+        Window(height=1, char=" ", style="bg:#000000"),
         input_box,
-        Window(height=1),
-        Window(content=FormattedTextControl(get_card_status_fragments), height=1),
-        Window(height=1),
-    ])
+        Window(height=1, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_card_status_fragments), height=1, char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#000000"),
+    ], style="bg:#000000")
+
+    # Active Screen Card: Docked Minimal Input Box (Eliminates redundant status bar, saves screen space)
+    active_card_inner = HSplit([
+        input_box,
+    ], style="bg:#000000")
+
+    def get_active_card_ticker():
+        is_gen = session_state.get("is_generating", False)
+        if not is_gen:
+            return []
+        if session_state.get("is_pulling"):
+            pct = session_state.get("pull_percent", 0.0)
+            stage = session_state.get("pull_stage", "Streaming Layers...")
+            bar = make_progress_bar(pct, width=14)
+            sp = session_state.get("pull_speed", "")
+            sp_txt = f" · {sp}" if sp else ""
+            return to_formatted_text(HTML(f'<style color="#f59e0b">  ● <b>Pulling Weights:</b> {bar} {pct:.1f}%{sp_txt} ({html.escape(stage)})</style>'))
+        s_tok = session_state.get("stream_tokens", 0)
+        s_tps = session_state.get("stream_tps", 0.0)
+        return to_formatted_text(HTML(
+            f'<style color="#ff70a6">  ● <b>Streaming:</b> {s_tok} tokens · {s_tps:.1f} tok/s</style> '
+            f'<style color="#64748b">· press <b>esc</b> to stop</style>'
+        ))
 
     def get_shortcuts_formatted():
         is_gen = session_state.get("is_generating", False)
@@ -2481,6 +2580,8 @@ def run_opencode_tui(
     shortcuts_line = Window(
         content=FormattedTextControl(get_shortcuts_formatted),
         height=1,
+        char=" ",
+        style="bg:#000000",
     )
 
     def show_temporary_notice(text: str, duration: float = 2.5) -> None:
@@ -2705,10 +2806,10 @@ def run_opencode_tui(
         ]
 
     sidebar_pane = HSplit([
-        Window(content=FormattedTextControl(get_sidebar_fragments), wrap_lines=True),
-        Window(height=D()),
-        Window(content=FormattedTextControl(get_sidebar_footer), height=2, wrap_lines=True),
-    ], width=38)
+        Window(content=FormattedTextControl(get_sidebar_fragments), wrap_lines=True, char=" ", style="bg:#000000"),
+        Window(height=D(), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_sidebar_footer), height=2, wrap_lines=True, char=" ", style="bg:#000000"),
+    ], width=38, style="bg:#000000")
 
     def _get_active_columns():
         if app_instance[0] and hasattr(app_instance[0], "output") and app_instance[0].output:
@@ -2723,7 +2824,7 @@ def run_opencode_tui(
     divider = ConditionalContainer(content=Window(width=1, char="│", style="class:card.border"), filter=is_wide)
     sidebar_cond = ConditionalContainer(content=sidebar_pane, filter=is_wide)
 
-    # ── Screen 1 (Startup Screen): Exact Kilo CLI 1:1 Clean Centered Layout ─────────
+    # ── Screen 1 (Startup Screen): Exact Clean Centered Layout ─────────
     def get_centered_logo():
         cols = _get_active_columns()
         logo_lines = RED_SITUS_LOGO.strip().splitlines()
@@ -2769,49 +2870,66 @@ def run_opencode_tui(
         return to_formatted_text(HTML("<style color='#64748b'>local</style> "))
 
     startup_card_box = HSplit([
-        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1),
-        VSplit([Window(width=1, char="│", style="class:card.border"), card_inner, Window(width=1, char="│", style="class:card.border")]),
-        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1),
-    ], width=_get_responsive_card_dim, height=7)
+        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1, style="bg:#000000"),
+        VSplit([Window(width=1, char="│", style="class:card.border"), startup_card_inner, Window(width=1, char="│", style="class:card.border")], style="bg:#000000"),
+        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1, style="bg:#000000"),
+    ], width=_get_responsive_card_dim, height=7, style="bg:#000000")
 
     startup_card_row = VSplit([
-        Window(width=D()),
+        Window(width=D(), char=" ", style="bg:#000000"),
         startup_card_box,
-        Window(width=D()),
-    ], height=7)
+        Window(width=D(), char=" ", style="bg:#000000"),
+    ], height=7, style="bg:#000000")
 
     startup_shortcuts_line = VSplit([
-        Window(width=D()),
-        Window(content=FormattedTextControl(get_startup_shortcuts_formatted), width=_get_responsive_card_dim, align="RIGHT"),
-        Window(width=D()),
-    ], height=1)
+        Window(width=D(), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_startup_shortcuts_formatted), width=_get_responsive_card_dim, align="RIGHT", char=" ", style="bg:#000000"),
+        Window(width=D(), char=" ", style="bg:#000000"),
+    ], height=1, style="bg:#000000")
 
     startup_bottom_bar = VSplit([
-        Window(content=FormattedTextControl(get_bottom_bar_left), height=1),
-        Window(content=FormattedTextControl(get_bottom_bar_right), height=1, align="RIGHT"),
-    ], height=1)
+        Window(content=FormattedTextControl(get_bottom_bar_left), height=1, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_bottom_bar_right), height=1, align="RIGHT", char=" ", style="bg:#000000"),
+    ], height=1, style="bg:#000000")
 
     startup_view = HSplit([
-        Window(height=D(min=0, weight=1)),
-        Window(content=FormattedTextControl(get_centered_logo), height=len(RED_SITUS_LOGO.strip().splitlines())),
-        Window(height=1),
-        Window(content=FormattedTextControl(get_centered_tagline), height=1),
-        Window(height=1),
+        Window(height=D(min=0, weight=1), char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_centered_logo), height=len(RED_SITUS_LOGO.strip().splitlines()), char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_centered_tagline), height=1, char=" ", style="bg:#000000"),
+        Window(height=1, char=" ", style="bg:#000000"),
         startup_card_row,
-        Window(height=1),
+        Window(height=1, char=" ", style="bg:#000000"),
         startup_shortcuts_line,
-        Window(height=D(min=0, weight=1.2)),
+        Window(height=D(min=0, weight=1.2), char=" ", style="bg:#000000"),
         startup_bottom_bar,
-    ])
+    ], style="bg:#000000")
 
-    # ── Screen 2 (Active Screen): Top Session Bar + Dual-Pane Workspace ─────────
+    # ── Screen 2 (Active Screen): Modern Integrated Telemetry Header + Docked Chat ──
     def get_top_session_bar_left():
         last_q = session_state.get("last_query", "")
         if not last_q:
             last_q = "Cluster Session"
-        if len(last_q) > 42:
-            last_q = last_q[:40] + ".."
-        return to_formatted_text(HTML(f" <style color='#ff2a85'><b>#</b></style> <style color='#ffffff'><b>{html.escape(last_q)}</b></style>"))
+        if len(last_q) > 36:
+            last_q = last_q[:34] + ".."
+
+        curr_m = session_state.get("model", model)
+        m_short = curr_m.split(":")[0] if ":" in curr_m else curr_m
+        w_cnt = session_state.get("workers_count", 0)
+        coord_st = session_state.get("coord_status", "offline")
+
+        if w_cnt > 0:
+            cluster_chip = f"<style color='#22c55e'>● {w_cnt} Nodes Active</style>"
+        elif coord_st in ("healthy", "online", "no_workers"):
+            cluster_chip = f"<style color='#eab308'>● Ready (/join)</style>"
+        else:
+            cluster_chip = f"<style color='#64748b'>○ Offline</style>"
+
+        return to_formatted_text(HTML(
+            f" <style color='#ff2a85'><b>✦ SITUS</b></style> <style color='#27272a'>│</style> "
+            f"<style color='#ff70a6'><b>#</b></style> <style color='#ffffff'><b>{html.escape(last_q)}</b></style> <style color='#27272a'>│</style> "
+            f"<style color='#ff70a6'><b>[{html.escape(m_short)}]</b></style> <style color='#475569'>·</style> {cluster_chip}"
+        ))
 
     def get_top_session_bar_right():
         s_tok = session_state.get("stream_tokens", 0)
@@ -2825,7 +2943,7 @@ def run_opencode_tui(
         tot_v = session_state.get("total_vram_gb", 0.0)
         pct_v = session_state.get("vram_usage_pct", 0.0)
         vram_str = f"{used_v:.1f}/{tot_v:.1f} GB ({pct_v:.0f}%)" if tot_v > 0 else "0.0 GB"
-        trans = "p2p direct" if session_state.get("p2p", True) else "relay ws"
+        trans = "WebRTC P2P" if session_state.get("p2p", True) else "Relay WS"
 
         tok_part = f"<style color='#ffffff'><b>{disp_tok} tok</b></style>" if disp_tok > 0 else "<style color='#64748b'>ready</style>"
         tps_part = f"<style color='#ff70a6'><b>{disp_tps:.1f} t/s</b></style>" if disp_tps > 0 else ""
@@ -2838,35 +2956,60 @@ def run_opencode_tui(
         return to_formatted_text(HTML(" ".join(parts)))
 
     top_session_bar = VSplit([
-        Window(content=FormattedTextControl(get_top_session_bar_left), height=1),
-        Window(content=FormattedTextControl(get_top_session_bar_right), height=1, align="RIGHT"),
-    ], height=1)
+        Window(content=FormattedTextControl(get_top_session_bar_left), height=1, char=" ", style="bg:#000000"),
+        Window(content=FormattedTextControl(get_top_session_bar_right), height=1, align="RIGHT", char=" ", style="bg:#000000"),
+    ], height=1, style="bg:#000000")
 
     top_session_sep = Window(height=1, char="─", style="class:card.border")
 
+    # Docked Minimal 3-Line Input Card for active chat (saves 4 lines of vertical space, no redundant status)
+    active_card_top = VSplit([
+        Window(width=1, height=1, char="╭", style="class:card.border"),
+        Window(char="─", style="class:card.border"),
+        Window(width=1, height=1, char="╮", style="class:card.border"),
+    ], height=1, style="bg:#000000")
+
+    active_card_middle = VSplit([
+        Window(width=1, char="│", style="class:card.border"),
+        active_card_inner,
+        Window(width=1, char="│", style="class:card.border"),
+    ], style="bg:#000000")
+
+    active_ticker_window = ConditionalContainer(
+        content=Window(content=FormattedTextControl(get_active_card_ticker), height=1, char=" ", style="bg:#000000"),
+        filter=Condition(lambda: session_state.get("is_generating", False))
+    )
+
+    active_card_bottom = VSplit([
+        Window(width=1, height=1, char="╰", style="class:card.border"),
+        Window(char="─", style="class:card.border"),
+        Window(width=1, height=1, char="╯", style="class:card.border"),
+    ], height=1, style="bg:#000000")
+
     active_card_box = HSplit([
-        VSplit([Window(width=1, char="╭", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╮", style="class:card.border")], height=1),
-        VSplit([Window(width=1, char="│", style="class:card.border"), card_inner, Window(width=1, char="│", style="class:card.border")]),
-        VSplit([Window(width=1, char="╰", style="class:card.border"), Window(char="─", style="class:card.border"), Window(width=1, char="╯", style="class:card.border")], height=1),
-    ], height=7)
+        active_card_top,
+        active_card_middle,
+        active_ticker_window,
+        active_card_bottom,
+    ], style="bg:#000000")
 
     active_left_pane = HSplit([
         history_win,
         active_card_box,
         shortcuts_line,
-    ])
+    ], style="bg:#000000")
 
     active_main_split = VSplit([
         active_left_pane,
         divider,
         sidebar_cond,
-    ])
+    ], style="bg:#000000")
 
     active_view = HSplit([
         top_session_bar,
         top_session_sep,
         active_main_split,
-    ])
+    ], style="bg:#000000")
 
     def get_current_main_view():
         if session_state.get("active_screen", "startup") == "startup":
@@ -3005,10 +3148,12 @@ def run_opencode_tui(
             hdr_line = f"← {stages_txt} · {disp_m} ({disp_layers} Layers)"
             history_entries.append(("stage", hdr_line, disp_m))
 
+            max_tokens_val = session_state.get("max_tokens", 2048)
             payload = {
                 "model": session_state.get("model", model),
                 "messages": messages,
                 "temperature": temperature,
+                "max_tokens": max_tokens_val,
                 "stream": True,
             }
             try:
@@ -3116,7 +3261,8 @@ def run_opencode_tui(
                         t_mode = "Single-Node CUDA Direct"
                     else:
                         t_mode = "WebRTC P2P Direct" if session_state.get("p2p", True) else "WebSocket Relay"
-                    badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs{v_str} | {t_mode}"
+                    limit_hint = " [dim yellow](hit max_tokens limit)[/dim yellow]" if tok_cnt >= max_tokens_val else ""
+                    badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs{v_str} | {t_mode}{limit_hint}"
                     history_entries.append(("metric", badge, ""))
                     messages.append({"role": "assistant", "content": full_resp})
 
@@ -3514,6 +3660,7 @@ def run_opencode_tui(
     sync_thread.start()
 
     try:
+        set_pitch_black_terminal()
         try:
             app = Application(
                 layout=Layout(root),
@@ -3544,20 +3691,11 @@ def run_opencode_tui(
                 return ""
     finally:
         stop_bg_sync.set()
-        try:
-            # Unconditionally restore terminal mouse reporting and cursor visibility
-            sys.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h")
-            sys.stdout.flush()
-        except Exception:
-            pass
+        restore_terminal_colors()
 
 
 def _restore_terminal_modes():
-    try:
-        sys.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h")
-        sys.stdout.flush()
-    except Exception:
-        pass
+    restore_terminal_colors()
 
 
 import atexit

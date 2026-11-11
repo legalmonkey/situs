@@ -12,6 +12,8 @@ from typing import Optional, List, Any, Dict
 # Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = logging.getLogger("situs.tokenizer")
 
@@ -32,7 +34,11 @@ class EnglishFallbackTokenizer:
 _tokenizers_cache: Dict[str, Any] = {}
 
 
-def get_or_load_tokenizer(model_name: Optional[str] = None, allow_fallback: bool = False) -> Any:
+def get_or_load_tokenizer(
+    model_name: Optional[str] = None,
+    allow_fallback: bool = False,
+    local_files_only: bool = False,
+) -> Any:
     """
     Retrieves or initializes a verified HuggingFace tokenizer with caching per model.
     Checks local snapshot directories first for instant offline loading.
@@ -133,17 +139,21 @@ def get_or_load_tokenizer(model_name: Optional[str] = None, allow_fallback: bool
                 except Exception:
                     pass
 
-    # 3. Online attempt if allowed and connected
-    for cand in candidates:
-        if not os.path.exists(cand):
-            try:
-                tok = AutoTokenizer.from_pretrained(cand)
-                if tok is not None:
-                    _tokenizers_cache[cache_key] = tok
-                    logger.info(f"Downloaded and loaded tokenizer for '{model_name}' from {cand}")
-                    return tok
-            except Exception:
-                pass
+    # 3. Online attempt if allowed and connected (never attempted if local_files_only is requested)
+    if not local_files_only:
+        for cand in candidates:
+            if not os.path.exists(cand):
+                try:
+                    tok = AutoTokenizer.from_pretrained(cand)
+                    if tok is not None:
+                        _tokenizers_cache[cache_key] = tok
+                        logger.info(f"Downloaded and loaded tokenizer for '{model_name}' from {cand}")
+                        return tok
+                except Exception:
+                    pass
+
+    if local_files_only:
+        return None
 
     raise RuntimeError(
         f"Could not load valid tokenizer for model '{model_name}'. "

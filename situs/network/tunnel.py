@@ -263,7 +263,7 @@ class PublicTunnelManager:
 
 def start_public_tunnel(
     port: int = 8000,
-    timeout: float = 10.0,
+    timeout: float = 15.0,
     progress_fn: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], str]:
     """Helper to start the global public ingress tunnel.

@@ -162,6 +162,14 @@ def test_tui_execute_slash_commands():
     assert execute_slash_command("situs status", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
     assert execute_slash_command("help", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is True
 
+    # Test /tokens
+    assert execute_slash_command("/tokens", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/tokens 4096", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+    assert session_state["max_tokens"] == 4096
+    assert execute_slash_command("/tokens 0", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/tokens 50000", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+    assert execute_slash_command("/tokens invalid", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state, log_output_fn=log_capture) is True
+
     # Test /exit
     assert execute_slash_command("/exit", "http://localhost:8000", "llama-3.1:8b-instruct-q8_0", messages, session_state) is False
 
@@ -408,6 +416,55 @@ def test_tui_cuda_command():
 
     assert execute_slash_command("/cuda", "http://localhost:8000", "gemma3:4b", messages, session_state, log_output_fn=log_capture) is True
     assert any("CUDA" in t for t, _ in captured)
+
+
+def test_sanitize_coordinator_address_trailing_slash_and_tunnel():
+    from situs.config import sanitize_coordinator_address
+    from situs.cli import normalize_http_url, normalize_ws_url
+
+    sanitized = sanitize_coordinator_address("https://idol-detroit-educated.trycloudflare.com/")
+    assert sanitized == "https://idol-detroit-educated.trycloudflare.com"
+
+    http_url = normalize_http_url("https://idol-detroit-educated.trycloudflare.com/")
+    ws_url = normalize_ws_url("https://idol-detroit-educated.trycloudflare.com/")
+    assert http_url == "https://idol-detroit-educated.trycloudflare.com"
+    assert ws_url == "wss://idol-detroit-educated.trycloudflare.com/ws/worker"
+    assert "//ws" not in ws_url
+    assert "//status" not in f"{http_url}/status"
+
+
+def test_cli_connect_alias():
+    result = runner.invoke(app, ["connect", "--help"])
+    assert result.exit_code == 0
+    assert "Join a Situs coordinator cluster" in result.output or "Connect to" in result.output or "join" in result.output.lower()
+
+
+def test_cli_main_tunnel_url_rerouting():
+    import sys
+    from unittest.mock import patch
+    from situs.cli import main
+
+    test_args = ["situs", "https://idol-detroit-educated.trycloudflare.com"]
+    with patch.object(sys, "argv", test_args.copy()), patch("situs.cli.app") as mock_app:
+        main()
+        mock_app.assert_called_once()
+        assert sys.argv == ["situs", "join", "https://idol-detroit-educated.trycloudflare.com"]
+
+
+def test_cors_allows_trycloudflare():
+    from situs.coordinator.app import StrictCORSMiddleware
+    from starlette.datastructures import Headers
+
+    # Mock app for middleware instance
+    dummy_app = lambda scope, receive, send: None
+    middleware = StrictCORSMiddleware(dummy_app, allow_origins=["http://localhost:3000"])
+
+    # StrictCORSMiddleware should allow trycloudflare origins
+    assert middleware.is_allowed_origin("https://idol-detroit-educated.trycloudflare.com") is True
+    assert middleware.is_allowed_origin("https://any-subdomain.trycloudflare.com") is True
+    assert middleware.is_allowed_origin("http://localhost:3000") is True
+    assert middleware.is_allowed_origin("https://untrusted-malicious-site.com") is False
+
 
 
 

@@ -337,7 +337,7 @@ class StageExecutionEngine:
                 temperature = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
                 top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
                 seed = getattr(cfg, "seed", None)
-                max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 256
+                max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
                 stop_token_ids = cfg.stop_token_ids if cfg else []
                 step_idx = act_frame.step_index
 
@@ -452,7 +452,7 @@ class StageExecutionEngine:
         cfg = self.session_configs.get(request_id)
         temp = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
         top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
-        max_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 256
+        max_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
 
         accepted_tokens, correction = self.verifier.verify_candidates(
             cand_frame.candidate_tokens,

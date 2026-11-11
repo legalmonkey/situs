@@ -49,7 +49,8 @@ def sanitize_coordinator_address(raw: str, default_port: int = 8000) -> str:
     if "/" in host_part:
         parts = host_part.split("/", 1)
         host_port = parts[0]
-        path_part = "/" + parts[1]
+        stripped_subpath = parts[1].strip("/")
+        path_part = ("/" + stripped_subpath) if stripped_subpath else ""
     else:
         host_port = host_part
 

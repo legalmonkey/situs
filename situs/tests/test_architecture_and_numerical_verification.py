@@ -420,8 +420,8 @@ def test_mistral_layer_numerical_parity_matching_weights():
 
 
 def test_unverified_architectures_rejected():
-    """Verify that unverified architectures (qwen, gemma, gpt2, moe, etc.) are strictly rejected."""
-    for bad_arch in ("qwen", "qwen2", "qwen2.5", "transformer", "gpt2", "mpt", "bert", "gemma", "gemma2", "gemma3", "moe"):
+    """Verify that unverified architectures (qwen, gpt2, moe, etc.) are strictly rejected."""
+    for bad_arch in ("qwen", "qwen2", "qwen2.5", "transformer", "gpt2", "mpt", "bert", "moe", "falcon", "chatglm"):
         assert not is_architecture_supported(bad_arch)
         with pytest.raises(ValueError, match="Unsupported model architecture"):
             RealTransformerBlock(

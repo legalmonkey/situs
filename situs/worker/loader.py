@@ -33,6 +33,10 @@ SUPPORTED_ARCHITECTURES: Set[str] = {
     "llama",
     "llama2",
     "llama3",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma3forcausallm",
     "mistral",
 }
 
@@ -106,7 +110,7 @@ def is_architecture_supported(arch: Optional[str]) -> bool:
     norm = arch.strip().lower()
     incompatible = (
         "moe", "mixture", "mpt", "gpt2", "gpt_neox", "falcon",
-        "chatglm", "bloom", "opt", "bert", "t5", "qwen", "gemma", "transformer"
+        "chatglm", "bloom", "opt", "bert", "t5", "qwen", "transformer"
     )
     for bad in incompatible:
         if bad in norm:
@@ -120,12 +124,13 @@ def is_architecture_supported(arch: Optional[str]) -> bool:
 
 
 class RMSNorm(nn.Module if HAS_TORCH else object):
-    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral)."""
-    def __init__(self, dim: int, eps: float = 1e-6):
+    """Root Mean Square Layer Normalization (standard for LLaMA, Mistral, with Gemma unit-offset support)."""
+    def __init__(self, dim: int, eps: float = 1e-6, is_gemma: bool = False):
         super().__init__()
         self.eps = eps
+        self.is_gemma = is_gemma
         if HAS_TORCH:
-            self.weight = nn.Parameter(torch.ones(dim))
+            self.weight = nn.Parameter(torch.zeros(dim) if is_gemma else torch.ones(dim))
 
     def forward(self, x):
         if not HAS_TORCH:
@@ -133,7 +138,8 @@ class RMSNorm(nn.Module if HAS_TORCH else object):
         if not isinstance(x, torch.Tensor):
             return x
         variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight
+        w = (1.0 + self.weight) if self.is_gemma else self.weight
+        return x * torch.rsqrt(variance + self.eps) * w
 
 
 class RotaryEmbedding(nn.Module if HAS_TORCH else object):
@@ -205,18 +211,15 @@ def _fast_linear(in_features: int, out_features: int, device: str = "cpu", dtype
     dt = dtype if dtype is not None else (
         torch.float16 if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else torch.float32
     )
-    linear = nn.Linear.__new__(nn.Linear)
-    super(nn.Linear, linear).__init__()
-    linear.in_features = in_features
-    linear.out_features = out_features
-    linear.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dt, device="cpu"))
-    linear.bias = None
-    if device != "cpu" and torch.cuda.is_available() and "cuda" in str(device):
-        try:
-            linear = linear.to(device)
-        except Exception:
-            pass
-    return linear
+    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
+    try:
+        return nn.Linear(in_features, out_features, bias=False, device=dev, dtype=dt)
+    except Exception:
+        linear = nn.Linear(in_features, out_features, bias=False)
+        linear.to(dtype=dt)
+        if dev != "cpu":
+            linear.to(dev)
+        return linear
 
 
 def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu", dtype: Any = None) -> Any:
@@ -226,16 +229,17 @@ def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu"
     dt = dtype if dtype is not None else (
         torch.float16 if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else torch.float32
     )
+    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
     emb = nn.Embedding.__new__(nn.Embedding)
-    super(nn.Embedding, emb).__init__()
+    nn.Module.__init__(emb)
     emb.num_embeddings = num_embeddings
     emb.embedding_dim = embedding_dim
-    emb.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=dt, device="cpu"))
-    if device != "cpu" and torch.cuda.is_available() and "cuda" in str(device):
-        try:
-            emb = emb.to(device)
-        except Exception:
-            pass
+    emb.padding_idx = None
+    emb.max_norm = None
+    emb.norm_type = 2.0
+    emb.scale_grad_by_freq = False
+    emb.sparse = False
+    emb.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=dt, device=dev))
     return emb
 
 
@@ -293,7 +297,8 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         if not HAS_TORCH:
             return
 
-        self.input_layernorm = RMSNorm(hidden_dim, eps=eps)
+        is_gemma = "gemma" in str(architecture).lower()
+        self.input_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=is_gemma)
 
         # Self-Attention projections (instant zero initialization directly on target device)
         self.q_proj = _fast_linear(hidden_dim, self.num_heads * self.head_dim, device=self.device, dtype=self.dtype)
@@ -302,7 +307,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device, dtype=self.dtype)
 
         # Feed-Forward Network (SwiGLU for LLaMA/Mistral/Qwen, GeGLU for Gemma)
-        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps)
+        self.post_attention_layernorm = RMSNorm(hidden_dim, eps=eps, is_gemma=is_gemma)
         self.gate_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype)
         self.up_proj = _fast_linear(hidden_dim, self.intermediate_size, device=self.device, dtype=self.dtype)
         self.down_proj = _fast_linear(self.intermediate_size, hidden_dim, device=self.device, dtype=self.dtype)
@@ -801,7 +806,8 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
         # 3. Norm and LM Head (ONLY if last stage)
         if self.is_last_stage:
-            self.norm = RMSNorm(hidden_dim)
+            is_gemma = "gemma" in (self.architecture.strip().lower() if self.architecture else "")
+            self.norm = RMSNorm(hidden_dim, is_gemma=is_gemma)
             self.lm_head = _fast_linear(hidden_dim, vocab_size, device=self.device, dtype=self.dtype)
         else:
             self.norm = None

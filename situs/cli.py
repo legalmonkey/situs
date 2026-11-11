@@ -413,7 +413,7 @@ def start_coordinator(
     if public or os.getenv("SITUS_PUBLIC_TUNNEL", "").strip().lower() in ("1", "true", "yes"):
         if console:
             console.print("[cyan]Establishing ephemeral public WAN tunnel for cross-Wi-Fi clustering...[/cyan]")
-        succ, t_url, t_msg = start_public_tunnel(port=port, timeout=8.0)
+        succ, t_url, t_msg = start_public_tunnel(port=port, timeout=15.0)
         if succ and t_url:
             public_tunnel_url = t_url
         elif console:
@@ -515,7 +515,7 @@ def join_cluster(
         try:
             http_url = normalize_http_url(coordinator)
             import httpx
-            with httpx.Client(timeout=0.4) as probe_client:
+            with httpx.Client(timeout=3.5, follow_redirects=True) as probe_client:
                 r = probe_client.get(f"{http_url}/status")
                 if r.status_code == 200:
                     existing = [w.get("id") or w.get("worker_id") for w in r.json().get("workers", [])]
@@ -577,7 +577,7 @@ def join_cluster(
             )
             console.print(cuda_hint)
 
-        console.print("\n[white]Outbound duplex connection established. Waiting for pipeline partition...[/white]\n")
+        console.print(f"\n[cyan]Connecting to Coordinator Relay at {normalized_ws}...[/cyan]\n")
 
     try:
         cfg = WorkerConfig(
@@ -611,6 +611,45 @@ def join_cluster(
     except KeyboardInterrupt:
         if console:
             console.print("\n[yellow]Worker disconnected cleanly.[/yellow]")
+        return
+
+    if not daemon.is_registered:
+        err_msg = daemon.connection_error or daemon.last_error or "Connection closed or timed out before registration"
+        if console:
+            console.print(f"\n[bold red]Failed to connect to Coordinator:[/bold red] {err_msg}")
+            is_tunnel = "trycloudflare.com" in coordinator or "https://" in coordinator
+            if is_tunnel:
+                console.print("[dim]💡 Tip: Ensure the host coordinator has Cloudflare Tunnel active and the URL is correct.[/dim]\n")
+            else:
+                console.print("[dim]💡 Tip: Ensure the coordinator is running and reachable on this network.[/dim]\n")
+        raise typer.Exit(code=1)
+
+
+@app.command("connect", help="Alias for 'join' - connect this device to a cluster coordinator.")
+def connect_cluster(
+    coordinator: str = typer.Argument(
+        "http://localhost:8000",
+        help="Coordinator address (e.g., '192.168.1.10:8000', 'ws://192.168.1.10:8000/ws/worker', or WAN URL)",
+    ),
+    worker_id: Optional[str] = typer.Option(None, "--worker-id", "--id", "-w", help="Custom worker ID"),
+    device: str = typer.Option("auto", "--device", "-d", help="Compute device ('cuda', 'cuda:0', 'cpu', or 'auto')"),
+    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Target model identifier"),
+    compression: str = typer.Option("int8", "--compression", "-c", help="Activation compression ('int8', 'fp16', 'none')"),
+    speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
+    p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),
+):
+    """Alias for 'situs join'."""
+    return join_cluster(
+        coordinator=coordinator,
+        worker_id=worker_id,
+        device=device,
+        model=model,
+        compression=compression,
+        speculative=speculative,
+        p2p=p2p,
+        token=token,
+    )
 
 
 def build_status_renderable(data: Dict[str, Any], base_url: str):
@@ -948,6 +987,21 @@ def one_shot_run(
 
 def main():
     """Main CLI entrypoint."""
+    import re
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        first_arg = sys.argv[1].strip()
+        known_cmds = {"setup", "cuda", "coordinator", "join", "connect", "status", "partition", "remove", "chat", "run"}
+        if first_arg.lower() not in known_cmds:
+            # Check if first_arg looks like an address, URL, or tunnel domain
+            is_url_or_addr = (
+                "://" in first_arg
+                or ".trycloudflare.com" in first_arg
+                or ":8000" in first_arg
+                or any(first_arg.endswith(s) for s in (".loca.lt", ".ngrok-free.app", ".ngrok.io", ".pinggy.link", ".trycloudflare.com"))
+                or re.match(r'^\d+\.\d+\.\d+\.\d+(:\d+)?$', first_arg) is not None
+            )
+            if is_url_or_addr:
+                sys.argv.insert(1, "join")
     app()
 
 

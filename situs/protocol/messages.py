@@ -88,7 +88,7 @@ class InferenceStart(BaseModel):
     input_ids: List[int]
     prompt: Optional[str] = None
     real_response: Optional[str] = None
-    max_new_tokens: int = 256
+    max_new_tokens: int = 2048
     temperature: float = 0.7
     top_p: float = 0.9
     seed: Optional[int] = None

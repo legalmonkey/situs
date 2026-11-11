@@ -58,6 +58,14 @@ class WorkerDaemon:
         self.last_error: Optional[str] = None
         self._cached_hw = None
 
+    @property
+    def running(self) -> bool:
+        return self.is_running
+
+    @running.setter
+    def running(self, val: bool):
+        self.is_running = val
+
     def stop(self):
         """Signals the daemon to shut down and disconnects WebSocket."""
         self.is_running = False
@@ -169,7 +177,9 @@ class WorkerDaemon:
                 res_b = torch.cuda.memory_reserved(dev_idx)
                 eff_free_b = free_b + max(0, res_b - alloc_b)
                 dev_name = torch.cuda.get_device_name(dev_idx)
-                return dev_name, tot_b, eff_free_b, "cuda", alloc_b
+                driver_used_b = max(0, tot_b - free_b)
+                used_b = max(alloc_b, driver_used_b)
+                return dev_name, tot_b, eff_free_b, "cuda", used_b
 
             from situs.hardware import detect_hardware, get_live_gpu_vram
             if self._cached_hw is None:
@@ -214,6 +224,8 @@ class WorkerDaemon:
                 logger.debug("Heartbeat loop: connection closed")
                 break
             except Exception as e:
+                if (not self.running) or ("cannot schedule new futures after shutdown" in str(e)):
+                    break
                 logger.warning(f"Heartbeat transient error: {e}")
                 await asyncio.sleep(2.0)
 
@@ -235,11 +247,11 @@ class WorkerDaemon:
         gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
         logger.info(f"Hardware: {gpu_name} (Used: {used_vram / 1e9:.2f} GB | Free: {free_vram / 1e9:.2f} GB | Total: {total_vram / 1e9:.2f} GB VRAM)")
 
-        # Pre-warm tokenizer in background so registration is instant without network delays
+        # Pre-warm tokenizer from local cache only (no online downloads that spam worker console)
         async def _prewarm_tok():
             try:
                 from situs.tokenizer import get_or_load_tokenizer
-                await asyncio.to_thread(get_or_load_tokenizer, self.config.model_name)
+                await asyncio.to_thread(get_or_load_tokenizer, self.config.model_name, local_files_only=True)
             except Exception as e:
                 logger.debug(f"Tokenizer pre-warm notice: {e}")
 
@@ -258,198 +270,215 @@ class WorkerDaemon:
             elif "extra_headers" in sig_params:
                 connect_kwargs["extra_headers"] = dict(auth_headers)
 
-        try:
-            async for websocket in websockets.connect(ws_url, **connect_kwargs):
-                if not self.is_running:
-                    break
-                self.ws = websocket
-                self.is_connected = True
-                try:
-                    # 1. Register with Coordinator
-                    reg = WorkerRegister(
-                        worker_id=self.worker_id,
-                        gpu_name=gpu_name,
-                        total_vram_bytes=total_vram,
-                        free_vram_bytes=free_vram,
-                        used_vram_bytes=used_vram,
-                        device_type=dev_type,
-                        supported_models=[self.config.model_name],
-                    )
-                    reg_frame = ProtocolFrame(
-                        type=MessageType.WORKER_REGISTER,
-                        source=self.worker_id,
-                        target="coordinator",
-                        payload=reg.model_dump(),
-                    )
-                    await websocket.send(reg_frame.model_dump_json())
-                    logger.info(f"Registered with coordinator as {self.worker_id}")
+        retry_count = 0
+        max_connect_retries = 3
+        while self.is_running:
+            try:
+                async for websocket in websockets.connect(ws_url, **connect_kwargs):
+                    if not self.is_running:
+                        break
+                    retry_count = 0
+                    self.ws = websocket
+                    self.is_connected = True
+                    try:
+                        # 1. Register with Coordinator
+                        reg = WorkerRegister(
+                            worker_id=self.worker_id,
+                            gpu_name=gpu_name,
+                            total_vram_bytes=total_vram,
+                            free_vram_bytes=free_vram,
+                            used_vram_bytes=used_vram,
+                            device_type=dev_type,
+                            supported_models=[self.config.model_name],
+                        )
+                        reg_frame = ProtocolFrame(
+                            type=MessageType.WORKER_REGISTER,
+                            source=self.worker_id,
+                            target="coordinator",
+                            payload=reg.model_dump(),
+                        )
+                        await websocket.send(reg_frame.model_dump_json())
+                        logger.info(f"Registered with coordinator as {self.worker_id}")
 
-                    # 2. Start Heartbeat background task
-                    hb_task = asyncio.create_task(self.heartbeat_loop())
+                        # 2. Start Heartbeat background task
+                        hb_task = asyncio.create_task(self.heartbeat_loop())
 
-                    # 3. Main message listening loop
-                    async for message in websocket:
-                        frame = ProtocolFrame.model_validate_json(message)
+                        # 3. Main message listening loop
+                        async for message in websocket:
+                            frame = ProtocolFrame.model_validate_json(message)
 
-                        if frame.type == MessageType.WORKER_REGISTERED:
-                            self.is_registered = True
-                            self.registered_event.set()
-                            logger.info(f"Coordinator confirmed registration for worker {self.worker_id}")
+                            if frame.type == MessageType.WORKER_REGISTERED:
+                                self.is_registered = True
+                                self.registered_event.set()
+                                logger.info(f"Coordinator confirmed registration for worker {self.worker_id}")
 
-                        elif frame.type == MessageType.WORKER_REMOVED:
-                            logger.info(f"Worker '{self.worker_id}' was removed by coordinator. Stopping daemon cleanly.")
-                            self.is_running = False
-                            break
-
-                        elif frame.type == MessageType.ASSIGN_LAYERS:
-                            try:
-                                self.engine_ready_event.clear()
-                                assign = AssignLayers.model_validate(frame.payload)
-                                logger.info(
-                                    f"Assigned layers [{assign.layer_start}..{assign.layer_end}) of {assign.model_name}. "
-                                    f"First={assign.is_first_stage}, Last={assign.is_last_stage}"
-                                )
-                                from situs.coordinator.registry import resolve_model_metadata
-                                from situs.worker.loader import is_architecture_supported
+                            elif frame.type == MessageType.WORKER_REMOVED:
+                                logger.info(f"Worker '{self.worker_id}' was removed by coordinator. Stopping daemon cleanly.")
+                                self.is_running = False
+                                break
+    
+                            elif frame.type == MessageType.ASSIGN_LAYERS:
                                 try:
-                                    meta = resolve_model_metadata(assign.model_name)
-                                    arch = meta.get("architecture") or meta.get("model_type")
-                                except Exception:
-                                    arch = None
-
-                                if not is_architecture_supported(arch):
+                                    self.engine_ready_event.clear()
+                                    assign = AssignLayers.model_validate(frame.payload)
                                     logger.info(
-                                        f"Model '{assign.model_name}' (architecture '{arch}') executes via local engine/Ollama runtime. "
-                                        f"Pipeline assignment [{assign.layer_start}..{assign.layer_end}) recorded for cluster topology."
+                                        f"Assigned layers [{assign.layer_start}..{assign.layer_end}) of {assign.model_name}. "
+                                        f"First={assign.is_first_stage}, Last={assign.is_last_stage}"
                                     )
-                                    self.engine = None
+                                    from situs.coordinator.registry import resolve_model_metadata
+                                    from situs.worker.loader import is_architecture_supported
+                                    try:
+                                        meta = resolve_model_metadata(assign.model_name)
+                                        arch = meta.get("architecture") or meta.get("model_type")
+                                    except Exception:
+                                        arch = None
+    
+                                    if not is_architecture_supported(arch):
+                                        logger.info(
+                                            f"Model '{assign.model_name}' (architecture '{arch}') executes via local engine/Ollama runtime. "
+                                            f"Pipeline assignment [{assign.layer_start}..{assign.layer_end}) recorded for cluster topology."
+                                        )
+                                        self.engine = None
+                                        self.engine_ready_event.set()
+                                        continue
+    
+                                    stage_model = await asyncio.to_thread(
+                                        load_hf_stage_model,
+                                        model_name=assign.model_name,
+                                        layer_start=assign.layer_start,
+                                        layer_end=assign.layer_end,
+                                        total_layers=assign.total_layers,
+                                        is_first_stage=assign.is_first_stage,
+                                        is_last_stage=assign.is_last_stage,
+                                        device=self.config.device,
+                                        progressive=assign.progressive,
+                                    )
+                                    from situs.tokenizer import get_or_load_tokenizer
+                                    tok = await asyncio.to_thread(
+                                        get_or_load_tokenizer,
+                                        assign.model_name,
+                                        local_files_only=True,
+                                    )
+                                    self.engine = StageExecutionEngine(
+                                        stage_model=stage_model,
+                                        assignment=assign,
+                                        compression_dtype=self.config.compression_dtype,
+                                        tokenizer=tok,
+                                    )
                                     self.engine_ready_event.set()
-                                    continue
-
-                                stage_model = await asyncio.to_thread(
-                                    load_hf_stage_model,
-                                    model_name=assign.model_name,
-                                    layer_start=assign.layer_start,
-                                    layer_end=assign.layer_end,
-                                    total_layers=assign.total_layers,
-                                    is_first_stage=assign.is_first_stage,
-                                    is_last_stage=assign.is_last_stage,
-                                    device=self.config.device,
-                                    progressive=assign.progressive,
-                                )
-                                from situs.tokenizer import get_or_load_tokenizer
-                                tok = await asyncio.to_thread(
-                                    get_or_load_tokenizer,
-                                    assign.model_name,
-                                )
-                                self.engine = StageExecutionEngine(
-                                    stage_model=stage_model,
-                                    assignment=assign,
-                                    compression_dtype=self.config.compression_dtype,
-                                    tokenizer=tok,
-                                )
-                                self.engine_ready_event.set()
-
-                                # Initialize WebRTC direct P2P connection to partner worker
-                                target_id = assign.next_worker_id or assign.prev_worker_id
-                                if target_id:
-                                    self.p2p_node = P2PDataChannelNode(
-                                        worker_id=self.worker_id,
-                                        target_worker_id=target_id,
-                                        signaling_send_fn=self.send_signaling_frame,
-                                        on_message_fn=self.on_p2p_message,
-                                    )
-                                    # First stage initiates the WebRTC offer
-                                    asyncio.create_task(self.p2p_node.initialize(is_initiator=assign.is_first_stage))
-                            except Exception as e:
-                                logger.error(f"Error handling ASSIGN_LAYERS: {e}", exc_info=True)
-
-                        elif frame.type in (MessageType.ICE_OFFER, MessageType.ICE_ANSWER):
-                            if self.p2p_node:
-                                await self.p2p_node.handle_signaling_message(frame.payload)
-
-                        elif frame.type == MessageType.INFERENCE_START:
-                            try:
-                                await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
-                            except asyncio.TimeoutError:
-                                logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within 60s")
-                            if self.engine:
-                                start_msg = InferenceStart.model_validate(frame.payload)
-                                if self.engine.is_first_stage():
-                                    out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
+    
+                                    # Initialize WebRTC direct P2P connection to partner worker
+                                    target_id = assign.next_worker_id or assign.prev_worker_id
+                                    if target_id:
+                                        self.p2p_node = P2PDataChannelNode(
+                                            worker_id=self.worker_id,
+                                            target_worker_id=target_id,
+                                            signaling_send_fn=self.send_signaling_frame,
+                                            on_message_fn=self.on_p2p_message,
+                                        )
+                                        # First stage initiates the WebRTC offer
+                                        asyncio.create_task(self.p2p_node.initialize(is_initiator=assign.is_first_stage))
+                                except Exception as e:
+                                    if (not self.is_running) or ("cannot schedule new futures after shutdown" in str(e)):
+                                        pass
+                                    else:
+                                        logger.error(f"Error handling ASSIGN_LAYERS: {e}", exc_info=True)
+    
+                            elif frame.type in (MessageType.ICE_OFFER, MessageType.ICE_ANSWER):
+                                if self.p2p_node:
+                                    await self.p2p_node.handle_signaling_message(frame.payload)
+    
+                            elif frame.type == MessageType.INFERENCE_START:
+                                try:
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within 60s")
+                                if self.engine:
+                                    start_msg = InferenceStart.model_validate(frame.payload)
+                                    if self.engine.is_first_stage():
+                                        out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
+                                        if out_frame:
+                                            await self.send_frame_out(out_frame)
+                                    else:
+                                        self.engine.session_configs[start_msg.request_id] = start_msg
+                                        self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
+    
+                            elif frame.type == MessageType.FORWARD_ACTIVATION:
+                                try:
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within 60s")
+                                if self.engine:
+                                    act_frame = ForwardActivation.model_validate(frame.payload)
+                                    out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
                                     if out_frame:
                                         await self.send_frame_out(out_frame)
-                                else:
-                                    self.engine.session_configs[start_msg.request_id] = start_msg
-                                    self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
-
-                        elif frame.type == MessageType.FORWARD_ACTIVATION:
-                            try:
-                                await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
-                            except asyncio.TimeoutError:
-                                logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within 60s")
-                            if self.engine:
-                                act_frame = ForwardActivation.model_validate(frame.payload)
-                                out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
-                                if out_frame:
-                                    await self.send_frame_out(out_frame)
-
-                        elif frame.type == MessageType.SPECULATIVE_CANDIDATES:
-                            if self.engine:
-                                cand_frame = SpeculativeCandidates.model_validate(frame.payload)
-                                out_frame = await asyncio.to_thread(self.engine.process_speculative_candidates, cand_frame)
-                                if out_frame:
-                                    await self.send_frame_out(out_frame)
-
-                        elif frame.type == MessageType.SPECULATIVE_VERIFIED:
-                            if self.engine:
-                                ver_frame = SpeculativeVerified.model_validate(frame.payload)
-                                out_frame = await asyncio.to_thread(self.engine.process_speculative_verified, ver_frame)
-                                if out_frame:
-                                    await self.send_frame_out(out_frame)
-
-                        elif frame.type == MessageType.NEXT_TOKEN:
-                            if self.engine:
-                                tok_frame = NextToken.model_validate(frame.payload)
-                                out_frame = await asyncio.to_thread(self.engine.process_next_token, tok_frame)
-                                if out_frame:
-                                    await self.send_frame_out(out_frame)
-
-                        elif frame.type == MessageType.STREAM_LAYER_CHUNK:
-                            if self.engine:
-                                chunk = StreamLayerChunk.model_validate(frame.payload)
-                                out_frame = await asyncio.to_thread(self.engine.process_layer_chunk, chunk, frame.source)
-                                if out_frame:
-                                    await self.send_frame_out(out_frame)
-
-                        elif frame.type == MessageType.INFERENCE_ABORT:
-                            if self.engine:
-                                req_id = frame.payload.get("request_id")
-                                if req_id:
-                                    self.engine.abort_inference(req_id)
-
-                except websockets.ConnectionClosed as e:
-                    self.is_connected = False
-                    self.last_error = getattr(e, 'reason', str(e))
-                    if getattr(e, "code", None) == 1008:
-                        logger.error(f"Registration rejected by coordinator policy (1008): {getattr(e, 'reason', e)}")
-                        await asyncio.sleep(5.0)
-                    else:
-                        logger.warning(f"Connection closed ({e}). Reconnecting in 3 seconds...")
+    
+                            elif frame.type == MessageType.SPECULATIVE_CANDIDATES:
+                                if self.engine:
+                                    cand_frame = SpeculativeCandidates.model_validate(frame.payload)
+                                    out_frame = await asyncio.to_thread(self.engine.process_speculative_candidates, cand_frame)
+                                    if out_frame:
+                                        await self.send_frame_out(out_frame)
+    
+                            elif frame.type == MessageType.SPECULATIVE_VERIFIED:
+                                if self.engine:
+                                    ver_frame = SpeculativeVerified.model_validate(frame.payload)
+                                    out_frame = await asyncio.to_thread(self.engine.process_speculative_verified, ver_frame)
+                                    if out_frame:
+                                        await self.send_frame_out(out_frame)
+    
+                            elif frame.type == MessageType.NEXT_TOKEN:
+                                if self.engine:
+                                    tok_frame = NextToken.model_validate(frame.payload)
+                                    out_frame = await asyncio.to_thread(self.engine.process_next_token, tok_frame)
+                                    if out_frame:
+                                        await self.send_frame_out(out_frame)
+    
+                            elif frame.type == MessageType.STREAM_LAYER_CHUNK:
+                                if self.engine:
+                                    chunk = StreamLayerChunk.model_validate(frame.payload)
+                                    out_frame = await asyncio.to_thread(self.engine.process_layer_chunk, chunk, frame.source)
+                                    if out_frame:
+                                        await self.send_frame_out(out_frame)
+    
+                            elif frame.type == MessageType.INFERENCE_ABORT:
+                                if self.engine:
+                                    req_id = frame.payload.get("request_id")
+                                    if req_id:
+                                        self.engine.abort_inference(req_id)
+    
+                    except websockets.ConnectionClosed as e:
+                        self.is_connected = False
+                        self.last_error = getattr(e, 'reason', str(e))
+                        if getattr(e, "code", None) == 1008:
+                            logger.error(f"Registration rejected by coordinator policy (1008): {getattr(e, 'reason', e)}")
+                            await asyncio.sleep(5.0)
+                        else:
+                            logger.warning(f"Connection closed ({e}). Reconnecting in 3 seconds...")
+                            await asyncio.sleep(3.0)
+                    except Exception as e:
+                        self.is_connected = False
+                        self.last_error = str(e)
+                        logger.error(f"Worker runtime exception: {e}", exc_info=True)
                         await asyncio.sleep(3.0)
-                except Exception as e:
-                    self.is_connected = False
-                    self.last_error = str(e)
-                    logger.error(f"Worker runtime exception: {e}", exc_info=True)
-                    await asyncio.sleep(3.0)
-                finally:
-                    self.is_connected = False
-                    if 'hb_task' in locals() and not hb_task.done():
-                        hb_task.cancel()
-        except Exception as conn_err:
-            self.connection_error = str(conn_err)
-            self.last_error = str(conn_err)
-            logger.warning(f"Could not connect to Coordinator at {ws_url}: {conn_err}")
+                    finally:
+                        self.is_connected = False
+                        if 'hb_task' in locals() and not hb_task.done():
+                            hb_task.cancel()
+                    # If connection closed normally and self.is_running is False
+                    break
+            except Exception as conn_err:
+                self.connection_error = str(conn_err)
+                self.last_error = str(conn_err)
+                if not self.is_running:
+                    break
+                retry_count += 1
+                if retry_count >= max_connect_retries:
+                    logger.warning(f"Could not connect to Coordinator at {ws_url} after {retry_count} attempts: {conn_err}")
+                    break
+                logger.info(f"Connection attempt {retry_count}/{max_connect_retries} to {ws_url} failed ({conn_err}). Retrying in 2.0s...")
+                await asyncio.sleep(2.0)
 
 
 def main():

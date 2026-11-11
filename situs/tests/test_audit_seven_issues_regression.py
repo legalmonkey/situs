@@ -213,7 +213,7 @@ def test_issue2_numerical_parity_with_reference_layer_prefill_and_cached():
     assert parity_cached is True, "Cached autoregressive step must achieve numerical parity with reference"
 
     # 2. Strict rejection of architectures without established numerical parity
-    for unverified_arch in ("gemma", "gemma2", "gemma3", "Gemma3ForCausalLM", "qwen", "qwen2", "transformer", "mixtral", "moe"):
+    for unverified_arch in ("qwen", "qwen2", "transformer", "mixtral", "moe", "gpt2", "mpt", "falcon", "chatglm"):
         assert not is_architecture_supported(unverified_arch), f"Expected unverified {unverified_arch} to be rejected"
         with pytest.raises(ValueError, match="Unsupported model architecture"):
             RealTransformerBlock(
@@ -225,8 +225,9 @@ def test_issue2_numerical_parity_with_reference_layer_prefill_and_cached():
                 architecture=unverified_arch,
             )
 
-    # 3. Mistral architecture supported and verified
+    # 3. Mistral and Gemma architectures supported and verified
     assert is_architecture_supported("mistral")
+    assert is_architecture_supported("gemma3")
     mistral_real = RealTransformerBlock(
         hidden_dim=hidden_dim,
         num_heads=num_heads,

@@ -347,25 +347,22 @@ def optimal_heterogeneous_partition(
     num_kv_heads = meta.get("num_kv_heads") or num_heads
     head_dim = meta.get("head_dim") or max(1, h_dim // max(1, num_heads))
 
-    # Context length for KV-cache footprint budgeting (clamped to working context 2048 unless explicitly set)
-    context_length = (
+    # Context length for KV-cache footprint budgeting
+    raw_ctx = (
         (runtime_config.get("context_length") or runtime_config.get("max_seq_len"))
         if runtime_config else None
     ) or (
-        min(
-            2048,
-            meta.get("context_length")
-            or meta.get("max_position_embeddings")
-            or meta.get("seq_length")
-            or meta.get("max_seq_len")
-            or 2048
-        )
+        meta.get("context_length")
+        or meta.get("max_position_embeddings")
+        or meta.get("seq_length")
+        or meta.get("max_seq_len")
     )
-    if context_length is None or context_length <= 0:
+    if raw_ctx is None or raw_ctx <= 0:
         raise ValueError(
             "optimal_heterogeneous_partition requires verified 'context_length' (or 'max_position_embeddings') "
             "in model_metadata or runtime_config. Assumed fixed sequence lengths have been removed."
         )
+    context_length = int(raw_ctx)
 
     # Precision: dtype bytes per param (fp32=4, fp16/bf16=2, int8/fp8=1, int4=0.5)
     explicit_precision = bool(
@@ -496,7 +493,7 @@ def optimal_heterogeneous_partition(
         if getattr(w, "device_type", "cuda") == "cuda" and w.total_vram_bytes > 0:
             eff_avail = max(0, w.free_vram_bytes) + max(0, getattr(w, "used_vram_bytes", 0))
             dedicated_margin = max(0, w.total_vram_bytes - int(500 * 1024**2))
-            avail_vram = max(int(eff_avail * 0.90), int(dedicated_margin * 0.85))
+            avail_vram = int(min(eff_avail, dedicated_margin) * 0.90)
         else:
             avail_vram = max(0, int(w.free_vram_bytes * 0.90))
 

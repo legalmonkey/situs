@@ -44,6 +44,11 @@ class StrictCORSMiddleware(CORSMiddleware):
         if not origin or origin.lower() in ("*", "null"):
             return False
         norm_origin = origin.rstrip("/").lower()
+        if norm_origin.endswith(".trycloudflare.com"):
+            return True
+        tunnel_url = get_active_tunnel_url()
+        if tunnel_url and tunnel_url.rstrip("/").lower() == norm_origin:
+            return True
         # Dynamically check current config.allowed_origins in addition to middleware's allow_origins
         allowed = set(self.allow_origins) | set(config.allowed_origins)
         for allowed_orig in allowed:
@@ -173,7 +178,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., min_length=1)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0)
-    max_tokens: Optional[int] = Field(default=256, ge=0, le=32768)
+    max_tokens: Optional[int] = Field(default=2048, ge=0, le=32768)
     seed: Optional[int] = None
     stream: Optional[bool] = False
 
@@ -418,6 +423,8 @@ async def trigger_partition(
     codec: str = "zstd",
 ):
     verify_admin_key(request)
+    if not registry.get_alive_workers():
+        raise HTTPException(status_code=400, detail="Cannot partition cluster: no alive workers connected.")
     try:
         assignments = await rebalance_and_assign_layers(
             model_name=model_name, total_layers=total_layers, progressive=progressive, codec=codec
@@ -759,7 +766,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     input_ids=input_ids,
                     prompt=prompt,
                     real_response=None,
-                    max_new_tokens=req.max_tokens if req.max_tokens is not None else 256,
+                    max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
                     temperature=req.temperature if req.temperature is not None else 0.7,
                     top_p=req.top_p if req.top_p is not None else 0.9,
                     seed=req.seed,
@@ -835,6 +842,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
                     if frame.type == MessageType.NEXT_TOKEN:
                         token_info = NextToken.model_validate(frame.payload)
+                        tok_txt = token_info.token_text
+                        if (not tok_txt) and token_info.token_id is not None and tokenizer:
+                            try:
+                                tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=False)
+                            except Exception:
+                                tok_txt = ""
                         chunk = {
                             "id": request_id,
                             "object": "chat.completion.chunk",
@@ -843,7 +856,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": token_info.token_text},
+                                    "delta": {"content": tok_txt},
                                     "finish_reason": token_info.finish_reason if token_info.is_finished else None,
                                 }
                             ],
@@ -968,7 +981,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             input_ids=input_ids,
             prompt=prompt,
             real_response=None,
-            max_new_tokens=req.max_tokens if req.max_tokens is not None else 256,
+            max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
             temperature=req.temperature if req.temperature is not None else 0.7,
             top_p=req.top_p if req.top_p is not None else 0.9,
             seed=req.seed,
@@ -1045,7 +1058,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
                 if frame.type == MessageType.NEXT_TOKEN:
                     token_info = NextToken.model_validate(frame.payload)
-                    generated_text += token_info.token_text
+                    tok_txt = token_info.token_text
+                    if (not tok_txt) and token_info.token_id is not None and tokenizer:
+                        try:
+                            tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=False)
+                        except Exception:
+                            tok_txt = ""
+                    generated_text += tok_txt
                     if not token_info.is_verified:
                         has_unverified_draft = True
                     if token_info.is_finished:

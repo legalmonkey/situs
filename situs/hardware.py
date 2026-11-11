@@ -182,8 +182,9 @@ def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
                 alloc_b = torch.cuda.memory_allocated(dev_idx)
                 res_b = torch.cuda.memory_reserved(dev_idx)
                 effective_free_b = free_b + max(0, res_b - alloc_b)
-                # Used bytes must reflect actual process VRAM allocated by Situs, matching OS Task Manager
-                used_b = alloc_b
+                # Used bytes reflects actual dedicated GPU VRAM used, matching OS Task Manager
+                driver_used_b = max(0, total_b - free_b)
+                used_b = max(alloc_b, driver_used_b)
                 return (total_b, used_b, effective_free_b)
         except Exception:
             pass
