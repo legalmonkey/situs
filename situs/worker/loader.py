@@ -95,6 +95,7 @@ CANONICAL_TENSOR_MAP: Dict[str, str] = {
     "ffn_norm.bias": "ffn_norm.bias",
     "ffn_pre_norm.weight": "pre_ffn_norm.weight",
     "ffn_post_norm.weight": "post_ffn_norm.weight",
+    "post_ffw_norm.weight": "post_ffn_norm.weight",
 }
 
 SUPPORTED_QUANTIZATION_SCHEMES: Set[str] = {
@@ -452,11 +453,11 @@ def _build_norm(
     """Initialize RMSNorm or LayerNorm matching the model architecture."""
     if not HAS_TORCH:
         return None
+    dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
     if norm_type == "layernorm":
         dt = dtype if dtype is not None else (
-            torch.float16 if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else torch.float32
+            torch.float16 if dev != "cpu" else torch.float32
         )
-        dev = device if (device != "cpu" and torch.cuda.is_available() and "cuda" in str(device)) else "cpu"
         try:
             return nn.LayerNorm(dim, eps=eps, elementwise_affine=True, device=dev, dtype=dt)
         except Exception:
@@ -465,7 +466,364 @@ def _build_norm(
             if dev != "cpu":
                 ln.to(dev)
             return ln
-    return RMSNorm(dim, eps=eps, is_gemma=is_gemma)
+    norm_mod = RMSNorm(dim, eps=eps, is_gemma=is_gemma)
+    if dev != "cpu":
+        norm_mod.to(dev)
+    return norm_mod
+
+
+class Int8WeightLinear(nn.Module if HAS_TORCH else object):
+    """Compact symmetric per-row INT8 linear layer cutting GPU VRAM 2x vs float16."""
+
+    def __init__(self, in_features: int, out_features: int, weight: Any, weight_scale: Any, bias: Optional[Any] = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        if HAS_TORCH:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+            self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+            self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
+
+    @classmethod
+    def from_float(cls, weight_tensor: "torch.Tensor", bias_tensor: Optional["torch.Tensor"] = None) -> "Int8WeightLinear":
+        scale_dtype = weight_tensor.dtype if weight_tensor.dtype in (torch.float16, torch.bfloat16) else torch.float32
+        w_work = weight_tensor.float()
+        abs_max = w_work.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+        scale = (abs_max / 127.0).to(dtype=scale_dtype)
+        q = torch.round(w_work / scale.float()).clamp(-127, 127).to(torch.int8)
+        b = bias_tensor.to(dtype=scale_dtype, device=weight_tensor.device) if bias_tensor is not None else None
+        return cls(weight_tensor.shape[1], weight_tensor.shape[0], q, scale, b)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
+        b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, w, b)
+
+
+class Int8WeightEmbedding(nn.Module if HAS_TORCH else object):
+    """Compact symmetric per-row INT8 embedding table cutting embedding VRAM 2x vs float16."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, weight: Any, weight_scale: Any):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        if HAS_TORCH:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+            self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+
+    @classmethod
+    def from_float_chunked(
+        cls,
+        tensor_iter,
+        num_embeddings: int,
+        embedding_dim: int,
+        device: str,
+        scale_dtype: Any,
+    ) -> "Int8WeightEmbedding":
+        q_out = torch.empty((num_embeddings, embedding_dim), dtype=torch.int8, device=device)
+        s_out = torch.empty((num_embeddings, 1), dtype=scale_dtype, device=device)
+        offset = 0
+        for chunk in tensor_iter:
+            rows = chunk.shape[0]
+            c_work = chunk.to(device=device, dtype=torch.float32)
+            abs_max = c_work.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+            scale = (abs_max / 127.0).to(dtype=scale_dtype)
+            q_out[offset : offset + rows].copy_(torch.round(c_work / scale.float()).clamp(-127, 127).to(torch.int8))
+            s_out[offset : offset + rows].copy_(scale)
+            offset += rows
+        return cls(num_embeddings, embedding_dim, q_out, s_out)
+
+    def forward(self, input_ids: "torch.Tensor") -> "torch.Tensor":
+        idx_w = F.embedding(input_ids, self.weight)
+        idx_s = F.embedding(input_ids, self.weight_scale)
+        return idx_w.to(dtype=self.weight_scale.dtype) * idx_s
+
+
+def set_norm_unit_offset(module: Any, is_gemma_offset: bool) -> None:
+    """Recursively configure RMSNorm Gemma +1.0 offset mode (GGUF already pre-adds +1.0)."""
+    if module is None or not HAS_TORCH or not isinstance(module, nn.Module):
+        return
+    if isinstance(module, RMSNorm):
+        module.is_gemma = is_gemma_offset
+    for child in module.modules():
+        if isinstance(child, RMSNorm):
+            child.is_gemma = is_gemma_offset
+
+
+def quantize_block_to_int8(block: "RealTransformerBlock") -> None:
+    """Converts all 2D linear projections in a loaded RealTransformerBlock to Int8WeightLinear."""
+    if not HAS_TORCH:
+        return
+    for attr in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "c_fc", "c_proj"):
+        mod = getattr(block, attr, None)
+        if isinstance(mod, nn.Linear):
+            setattr(block, attr, Int8WeightLinear.from_float(mod.weight.data, mod.bias.data if mod.bias is not None else None))
+
+
+def _dequantize_gguf_raw_chunk(raw_arr: Any, qtype_int: int, n_rows: int, target_device: str, out_dtype: Any) -> "torch.Tensor":
+    """Vectorized PyTorch dequantization for common GGUF block formats with gguf.quants fallback."""
+    import numpy as np
+    if qtype_int == 0:  # F32
+        t = torch.from_numpy(np.array(raw_arr, dtype=np.float32, copy=True)).to(device=target_device)
+        return t.to(dtype=out_dtype)
+    if qtype_int == 1:  # F16
+        t = torch.from_numpy(np.array(raw_arr, dtype=np.float16, copy=True)).to(device=target_device)
+        return t.to(dtype=out_dtype)
+    if qtype_int == 30:  # BF16
+        u16 = torch.from_numpy(np.array(raw_arr, dtype=np.uint16, copy=True)).to(device=target_device)
+        return u16.view(torch.bfloat16).to(dtype=out_dtype)
+
+    if qtype_int in (8, 12, 14):
+        u8 = torch.from_numpy(np.array(raw_arr, dtype=np.uint8, copy=True)).to(device=target_device)
+        if qtype_int == 8:  # Q8_0: 34 bytes per 32 weights
+            blocks = u8.view(-1, 34)
+            d = blocks[:, :2].contiguous().view(torch.float16).float()
+            x = blocks[:, 2:].contiguous().view(torch.int8).float()
+            return (x * d).reshape(n_rows, -1).to(dtype=out_dtype)
+        if qtype_int == 12:  # Q4_K: 144 bytes per 256 weights
+            blocks = u8.view(-1, 144)
+            nb = blocks.shape[0]
+            d = blocks[:, :2].contiguous().view(torch.float16).float()
+            dmin = blocks[:, 2:4].contiguous().view(torch.float16).float()
+            sc_raw = blocks[:, 4:16].reshape(nb, 3, 4)
+            d_p, m_p, md_p = sc_raw[:, 0], sc_raw[:, 1], sc_raw[:, 2]
+            sc = torch.cat([d_p & 0x3F, (md_p & 0x0F) | ((d_p >> 2) & 0x30)], dim=-1).float().reshape(nb, 8, 1)
+            m = torch.cat([m_p & 0x3F, (md_p >> 4) | ((m_p >> 2) & 0x30)], dim=-1).float().reshape(nb, 8, 1)
+            d_eff = d.reshape(nb, 1, 1) * sc
+            dm_eff = dmin.reshape(nb, 1, 1) * m
+            qs = blocks[:, 16:].reshape(nb, 4, 1, 32)
+            shifts = torch.tensor([0, 4], device=target_device, dtype=torch.uint8).reshape(1, 1, 2, 1)
+            qs = ((qs >> shifts) & 0x0F).reshape(nb, 8, 32).float()
+            return (d_eff * qs - dm_eff).reshape(n_rows, -1).to(dtype=out_dtype)
+        if qtype_int == 14:  # Q6_K: 210 bytes per 256 weights
+            blocks = u8.view(-1, 210)
+            nb = blocks.shape[0]
+            ql = blocks[:, :128].reshape(nb, -1, 1, 64)
+            qh = blocks[:, 128:192].reshape(nb, -1, 1, 32)
+            scales = blocks[:, 192:208].contiguous().view(torch.int8).float().reshape(nb, 16, 1)
+            d = blocks[:, 208:210].contiguous().view(torch.float16).float().reshape(nb, 1, 1)
+            d_eff = d * scales
+            ql = ((ql >> torch.tensor([0, 4], device=target_device, dtype=torch.uint8).reshape(1, 1, 2, 1)) & 0x0F).reshape(nb, -1, 32)
+            qh = ((qh >> torch.tensor([0, 2, 4, 6], device=target_device, dtype=torch.uint8).reshape(1, 1, 4, 1)) & 0x03).reshape(nb, -1, 32)
+            q = ((ql | (qh << 4)).to(torch.int8) - 32).reshape(nb, 16, 16).float()
+            return (d_eff * q).reshape(n_rows, -1).to(dtype=out_dtype)
+
+    import gguf
+    arr = gguf.quants.dequantize(raw_arr, qtype_int)
+    return torch.from_numpy(arr.copy()).to(device=target_device, dtype=out_dtype)
+
+
+def _iter_dequantized_gguf_chunks(gguf_tensor: Any, out_dtype: Any, target_device: str, chunk_rows: int = 2048):
+    """Yield row-chunked dequantized tensors from a GGUFReader tensor entry cleanly bounding RAM/VRAM."""
+    data = gguf_tensor.data
+    qt = int(gguf_tensor.tensor_type)
+    if data.ndim <= 1 or data.shape[0] <= chunk_rows:
+        yield _dequantize_gguf_raw_chunk(data, qt, data.shape[0] if data.ndim > 1 else 1, target_device, out_dtype)
+        return
+    total_rows = data.shape[0]
+    for start in range(0, total_rows, chunk_rows):
+        end = min(total_rows, start + chunk_rows)
+        yield _dequantize_gguf_raw_chunk(data[start:end], qt, end - start, target_device, out_dtype)
+
+
+def _dequantize_gguf_tensor_fast(gguf_tensor: Any, out_dtype: Any, target_device: str) -> "torch.Tensor":
+    """Dequantize a GGUFReader tensor entry into a PyTorch tensor."""
+    chunks = list(_iter_dequantized_gguf_chunks(gguf_tensor, out_dtype=out_dtype, target_device=target_device))
+    return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+
+
+class _FastGGUFTensor:
+    __slots__ = ("name", "shape", "tensor_type", "data")
+
+    def __init__(self, name: str, shape: Tuple[int, ...], tensor_type: int, data: Any):
+        self.name = name
+        self.shape = shape
+        self.tensor_type = tensor_type
+        self.data = data
+
+
+class FastGGUFFile:
+    """
+    Lightweight binary GGUF reader (~50ms vs ~30s in pure-Python gguf.GGUFReader)
+    that skips unrequested KV string arrays in O(1) mmap scans and exposes zero-copy
+    memmap views matching GGUFReader.tensors.
+    """
+
+    _SCALAR_FMTS = {
+        0: ("B", 1),   # UINT8
+        1: ("b", 1),   # INT8
+        2: ("H", 2),   # UINT16
+        3: ("h", 2),   # INT16
+        4: ("I", 4),   # UINT32
+        5: ("i", 4),   # INT32
+        6: ("f", 4),   # FLOAT32
+        7: ("?", 1),   # BOOL
+        10: ("Q", 8),  # UINT64
+        11: ("q", 8),  # INT64
+        12: ("d", 8),  # FLOAT64
+    }
+    _QUANT_BLOCKS = {
+        0: (1, 4),     # F32
+        1: (1, 2),     # F16
+        2: (32, 18),   # Q4_0
+        3: (32, 20),   # Q4_1
+        6: (32, 22),   # Q5_0
+        7: (32, 24),   # Q5_1
+        8: (32, 34),   # Q8_0
+        9: (32, 36),   # Q8_1
+        10: (256, 84), # Q2_K
+        11: (256, 110),# Q3_K
+        12: (256, 144),# Q4_K
+        13: (256, 176),# Q5_K
+        14: (256, 210),# Q6_K
+        30: (1, 2),    # BF16
+    }
+
+    def __init__(self, path: str, wanted_kv: Optional[Set[str]] = None):
+        import mmap
+        import struct
+        import numpy as np
+
+        self.path = path
+        self.kv: Dict[str, Any] = {}
+        self.tensors: List[_FastGGUFTensor] = []
+        want = set(wanted_kv) if wanted_kv else set()
+        want.add("general.alignment")
+
+        f = open(path, "rb")
+        self._file = f
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        self._mm = mm
+        try:
+            pos = 0
+            magic = mm[0:4]
+            if magic != b"GGUF":
+                raise ValueError(f"Not a valid GGUF file: {path}")
+            version, tensor_count, kv_count = struct.unpack_from("<IQQ", mm, 4)
+            if version not in (2, 3):
+                raise ValueError(f"Unsupported GGUF version {version} in {path}")
+            pos = 24
+
+            def _read_str(p: int) -> Tuple[str, int]:
+                slen = struct.unpack_from("<Q", mm, p)[0]
+                p += 8
+                s = mm[p : p + slen].decode("utf-8", errors="replace")
+                return s, p + slen
+
+            def _skip_str(p: int) -> int:
+                slen = struct.unpack_from("<Q", mm, p)[0]
+                return p + 8 + slen
+
+            def _read_val(vtype: int, p: int, keep: bool) -> Tuple[Any, int]:
+                if vtype == 8:  # STRING
+                    if keep:
+                        return _read_str(p)
+                    return None, _skip_str(p)
+                if vtype in self._SCALAR_FMTS:
+                    fmt, width = self._SCALAR_FMTS[vtype]
+                    val = struct.unpack_from(f"<{fmt}", mm, p)[0] if keep else None
+                    return val, p + width
+                if vtype == 9:  # ARRAY
+                    etype, count = struct.unpack_from("<IQ", mm, p)
+                    p += 12
+                    if etype == 8:
+                        if keep:
+                            arr = []
+                            for _ in range(count):
+                                s, p = _read_str(p)
+                                arr.append(s)
+                            return arr, p
+                        for _ in range(count):
+                            p = _skip_str(p)
+                        return None, p
+                    if etype in self._SCALAR_FMTS:
+                        fmt, width = self._SCALAR_FMTS[etype]
+                        total_b = count * width
+                        if keep:
+                            vals = list(struct.unpack_from(f"<{count}{fmt}", mm, p))
+                            return vals, p + total_b
+                        return None, p + total_b
+                    # Nested array fallback
+                    out = [] if keep else None
+                    for _ in range(count):
+                        v, p = _read_val(etype, p, keep)
+                        if keep:
+                            out.append(v)
+                    return out, p
+                raise ValueError(f"Unknown GGUF metadata type {vtype}")
+
+            for _ in range(kv_count):
+                klen = struct.unpack_from("<Q", mm, pos)[0]
+                pos += 8
+                key_bytes = mm[pos : pos + klen]
+                pos += klen
+                vtype = struct.unpack_from("<I", mm, pos)[0]
+                pos += 4
+                key_str = key_bytes.decode("utf-8", errors="replace")
+                keep = key_str in want
+                val, pos = _read_val(vtype, pos, keep)
+                if keep:
+                    self.kv[key_str] = val
+
+            tensor_infos = []
+            for _ in range(tensor_count):
+                tname, pos = _read_str(pos)
+                ndims = struct.unpack_from("<I", mm, pos)[0]
+                pos += 4
+                dims = struct.unpack_from(f"<{ndims}Q", mm, pos)
+                pos += 8 * ndims
+                qtype, rel_off = struct.unpack_from("<IQ", mm, pos)
+                pos += 12
+                tensor_infos.append((tname, tuple(int(d) for d in dims), int(qtype), int(rel_off)))
+
+            alignment = int(self.kv.get("general.alignment") or 32)
+            data_offset = (pos + alignment - 1) & ~(alignment - 1)
+
+            for tname, dims, qtype, rel_off in tensor_infos:
+                if qtype in self._QUANT_BLOCKS:
+                    bs, ts = self._QUANT_BLOCKS[qtype]
+                else:
+                    import gguf
+                    bs, ts = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(qtype)]
+
+                ne0 = dims[0] if dims else 1
+                n_rows = 1
+                for d in dims[1:]:
+                    n_rows *= d
+                row_bytes = (ne0 // bs) * ts
+                byte_start = data_offset + rel_off
+                byte_len = n_rows * row_bytes
+
+                if qtype == 0:
+                    np_view = np.frombuffer(mm, dtype=np.float32, count=ne0 * n_rows, offset=byte_start)
+                    arr = np_view.reshape(dims[::-1]) if len(dims) > 1 else np_view
+                elif qtype == 1:
+                    np_view = np.frombuffer(mm, dtype=np.float16, count=ne0 * n_rows, offset=byte_start)
+                    arr = np_view.reshape(dims[::-1]) if len(dims) > 1 else np_view
+                else:
+                    np_view = np.frombuffer(mm, dtype=np.uint8, count=byte_len, offset=byte_start)
+                    arr = np_view.reshape((n_rows, row_bytes)) if len(dims) > 1 else np_view
+                self.tensors.append(_FastGGUFTensor(tname, dims, qtype, arr))
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        self.tensors.clear()
+        mm = getattr(self, "_mm", None)
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+            self._mm = None
+        f = getattr(self, "_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._file = None
 
 
 def _fast_embedding(num_embeddings: int, embedding_dim: int, device: str = "cpu", dtype: Any = None) -> Any:
@@ -590,8 +948,8 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         self.o_proj = _fast_linear(self.num_heads * self.head_dim, hidden_dim, device=self.device, dtype=self.dtype, bias=self.o_bias)
 
         if self.has_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=norm_eps, is_gemma=self.is_gemma)
-            self.k_norm = RMSNorm(self.head_dim, eps=norm_eps, is_gemma=self.is_gemma)
+            self.q_norm = _build_norm(self.head_dim, eps=norm_eps, norm_type="rmsnorm", is_gemma=self.is_gemma, device=self.device)
+            self.k_norm = _build_norm(self.head_dim, eps=norm_eps, norm_type="rmsnorm", is_gemma=self.is_gemma, device=self.device)
 
         self.post_attention_layernorm = _build_norm(
             hidden_dim, eps=norm_eps, norm_type=self.norm_type, is_gemma=self.is_gemma, device=self.device, dtype=self.dtype
@@ -807,7 +1165,6 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
                 "post_attention_layernorm.weight",
                 "attn_post_norm.weight",
                 "post_attention_norm.weight",
-                "post_ffw_norm.weight",
                 "ffn_norm.weight",
             ]
         else:
@@ -850,6 +1207,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             optional_mapping["post_feedforward_layernorm.weight"] = [
                 "post_feedforward_layernorm.weight",
                 "ffn_post_norm.weight",
+                "post_ffw_norm.weight",
             ]
 
         # Build clean lookup from incoming state_dict
@@ -1200,6 +1558,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         o_bias: Optional[bool] = None,
         mlp_bias: Optional[bool] = None,
         hidden_act: Optional[str] = None,
+        _lazy_alloc: bool = False,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -1280,6 +1639,28 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 ev.set()
 
         if not HAS_TORCH:
+            return
+
+        if _lazy_alloc:
+            # Weights & layer blocks will be populated sequentially onto target device without pre-allocating empty buffers
+            self.embed_tokens = None
+            self.early_exit_head = None
+            self.layers = nn.ModuleList([nn.Identity() for _ in range(layer_end - layer_start)])
+            self.norm = (
+                _build_norm(
+                    hidden_dim,
+                    eps=self.rms_norm_eps,
+                    norm_type=self.spec["norm_type"],
+                    is_gemma=self.spec["norm_unit_offset"],
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                if self.is_last_stage
+                else None
+            )
+            self.lm_head = None
+            if self.norm is not None and self.device != "cpu":
+                self.norm.to(self.device)
             return
 
         # 1. Embeddings (ONLY if first stage)
@@ -1638,6 +2019,83 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
     return results
 
 
+def find_local_ollama_gguf_file(model_name: str) -> Optional[str]:
+    """Resolves a locally installed Ollama model tag to its on-disk GGUF blob path, if present."""
+    import json
+    import os
+    import pathlib
+
+    if not model_name:
+        return None
+
+    ollama_root = pathlib.Path(os.environ.get("OLLAMA_MODELS") or os.path.expanduser("~/.ollama/models"))
+    manifests_root = ollama_root / "manifests" / "registry.ollama.ai"
+    blobs_dir = ollama_root / "blobs"
+    if not manifests_root.is_dir() or not blobs_dir.is_dir():
+        return None
+
+    candidates_names = [model_name.strip()]
+    try:
+        from situs.inference_backend import normalize_ollama_model
+        norm_name = normalize_ollama_model(model_name)
+        if norm_name and norm_name not in candidates_names:
+            candidates_names.append(norm_name)
+    except Exception:
+        pass
+
+    manifest_candidates: List[pathlib.Path] = []
+    for cand in candidates_names:
+        if "/" in cand:
+            ns_repo, _, tag = cand.partition(":")
+            repo_parts = ns_repo.split("/")
+            base = manifests_root.joinpath(*repo_parts) if len(repo_parts) >= 2 else manifests_root / "library" / repo_parts[0]
+        else:
+            repo, _, tag = cand.partition(":")
+            base = manifests_root / "library" / repo
+        tag = tag or "latest"
+        manifest_candidates.append(base / tag)
+        manifest_candidates.append(base / "latest")
+        if base.is_dir():
+            # Fallback to first matching tag file in repo directory
+            for f in sorted(base.iterdir()):
+                if f.is_file() and f not in manifest_candidates:
+                    manifest_candidates.append(f)
+
+    seen = set()
+    for mf in manifest_candidates:
+        if mf in seen or not mf.is_file():
+            continue
+        seen.add(mf)
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+            for layer in data.get("layers", []):
+                if layer.get("mediaType") == "application/vnd.ollama.image.model":
+                    digest = str(layer.get("digest", ""))
+                    if not digest:
+                        continue
+                    blob = blobs_dir / digest.replace(":", "-")
+                    if blob.is_file():
+                        with open(blob, "rb") as probe:
+                            if probe.read(4) == b"GGUF":
+                                return str(blob)
+        except Exception:
+            continue
+    return None
+
+
+def find_local_weight_files(model_name: str) -> List[str]:
+    """Finds local weights from HuggingFace safetensors/bin, direct GGUF paths, or Ollama GGUF blobs."""
+    sfiles = find_local_safetensors_files(model_name)
+    if sfiles:
+        return sfiles
+    if model_name and os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
+        return [model_name]
+    gguf_blob = find_local_ollama_gguf_file(model_name)
+    if gguf_blob:
+        return [gguf_blob]
+    return []
+
+
 def load_hf_stage_model(
     model_name: str,
     layer_start: int,
@@ -1684,6 +2142,36 @@ def load_hf_stage_model(
     o_bias_cfg = use_bias_cfg
     mlp_bias_cfg = meta.get("mlp_bias") if meta.get("mlp_bias") is not None else use_bias_cfg
 
+    sfiles: List[str] = []
+    has_gguf_source = False
+    fast_gguf_files: Dict[str, FastGGUFFile] = {}
+    if not progressive and HAS_TORCH:
+        sfiles = find_local_weight_files(model_name)
+        for sf in sfiles:
+            if os.path.isfile(sf):
+                try:
+                    with open(sf, "rb") as probe_f:
+                        if probe_f.read(4) == b"GGUF":
+                            has_gguf_source = True
+                            try:
+                                probe_reader = FastGGUFFile(sf)
+                                fast_gguf_files[sf] = probe_reader
+                                for pt in probe_reader.tensors:
+                                    if pt.name in ("token_embd.weight", "model.embed_tokens.weight") and len(pt.shape) == 2:
+                                        vocab_size = int(pt.shape[1])
+                                        break
+                            except Exception:
+                                pass
+                            break
+                except Exception:
+                    pass
+
+    if has_gguf_source and HAS_TORCH:
+        if "cuda" in str(device) and torch.cuda.is_available():
+            stage_dtype = torch.float16
+        else:
+            stage_dtype = torch.float32
+
     stage = DistributedStageModel(
         layer_start=layer_start,
         layer_end=layer_end,
@@ -1712,23 +2200,23 @@ def load_hf_stage_model(
         o_bias=o_bias_cfg,
         mlp_bias=mlp_bias_cfg,
         hidden_act=meta.get("hidden_act"),
+        _lazy_alloc=(has_gguf_source and not progressive),
     )
 
     if not progressive and HAS_TORCH:
         from situs.worker.jit_streamer import is_layer_cached, load_layer_from_cache, save_layer_to_cache
         loaded_cached = 0
-        for l_idx in range(layer_start, layer_end):
-            if is_layer_cached(model_name, l_idx):
-                cached = load_layer_from_cache(model_name, l_idx)
-                if cached:
-                    try:
-                        stage.hot_swap_layer(l_idx, weights=cached)
-                        loaded_cached += 1
-                    except Exception as e:
-                        logger.debug(f"Could not load cached weights for layer {l_idx}: {e}")
+        if not has_gguf_source:
+            for l_idx in range(layer_start, layer_end):
+                if is_layer_cached(model_name, l_idx):
+                    cached = load_layer_from_cache(model_name, l_idx)
+                    if cached:
+                        try:
+                            stage.hot_swap_layer(l_idx, weights=cached)
+                            loaded_cached += 1
+                        except Exception as e:
+                            logger.debug(f"Could not load cached weights for layer {l_idx}: {e}")
 
-        # Check local safetensors, GGUF, or Ollama checkpoints
-        sfiles = find_local_safetensors_files(model_name)
         if sfiles:
             from situs.worker.jit_streamer import DEFAULT_CACHE_DIR
             safe_name = model_name.replace("/", "_").replace(":", "_")
@@ -1739,7 +2227,7 @@ def load_hf_stage_model(
             head_cache_file = model_cache_dir / "lm_head.pt"
 
             cached_embed = None
-            if embed_cache_file.is_file():
+            if not has_gguf_source and embed_cache_file.is_file():
                 try:
                     cached_embed = torch.load(embed_cache_file, weights_only=True)
                     if is_first_stage:
@@ -1750,7 +2238,7 @@ def load_hf_stage_model(
             cached_head = None
             cached_norm = None
             cached_norm_bias = None
-            if is_last_stage:
+            if not has_gguf_source and is_last_stage:
                 if norm_cache_file.is_file():
                     try:
                         cached_norm = torch.load(norm_cache_file, weights_only=True)
@@ -1778,116 +2266,158 @@ def load_hf_stage_model(
 
             need_embed = is_first_stage and cached_embed is None
             need_head = is_last_stage and (cached_head is None or cached_norm is None)
-            all_layers_ready = all(stage.is_layer_ready(l_idx) for l_idx in range(layer_start, layer_end))
+            all_layers_ready = (not has_gguf_source) and all(
+                stage.is_layer_ready(l_idx) for l_idx in range(layer_start, layer_end)
+            )
 
             if all_layers_ready and not need_embed and not need_head:
                 logger.info(f"All stage [{layer_start}..{layer_end}) layers and embeddings loaded from local disk cache.")
                 sfiles = []
 
-            # 1. Try GGUF reader if file has GGUF format
-            try:
-                import gguf
-                for sf in sfiles:
-                    if not os.path.isfile(sf):
-                        continue
-                    is_gguf = False
+            # 1. Try FastGGUFFile reader if file has GGUF format (handles quantized Ollama blobs & unquantized GGUF)
+            gguf_loaded_files = set()
+            for sf in sfiles:
+                if not os.path.isfile(sf):
+                    continue
+                is_gguf = sf in fast_gguf_files
+                if not is_gguf:
                     try:
                         with open(sf, "rb") as probe_f:
                             is_gguf = (probe_f.read(4) == b"GGUF")
                     except Exception:
                         is_gguf = False
 
-                    if is_gguf:
-                        try:
-                            reader = gguf.GGUFReader(sf)
-                            # Strictly check whether file has quantized weights (which require llama.cpp / Ollama runtime).
-                            # Pure-Python CPU dequantization across dozens of layers allocates 18+ GB host RAM, exhausting commit limit.
-                            has_quant = any(t.tensor_type not in (0, 1) for t in reader.tensors)
-                            if has_quant:
-                                logger.info(
-                                    f"GGUF file '{sf}' contains quantized tensors. "
-                                    f"Skipping pure-Python CPU dequantization to prevent host RAM exhaustion."
+                if is_gguf:
+                    gguf_loaded_files.add(sf)
+                    reader = fast_gguf_files.get(sf) or FastGGUFFile(sf)
+                    try:
+                        tensor_by_name = {t.name: t for t in reader.tensors}
+                        use_int8 = bool(load_in_8bit and any(t.tensor_type not in (0, 1, 30) for t in reader.tensors))
+
+                        # Stage 1: Token embeddings
+                        emb_entry = tensor_by_name.get("token_embd.weight") or tensor_by_name.get("model.embed_tokens.weight")
+                        if is_first_stage and emb_entry is not None:
+                            n_vocab = int(emb_entry.shape[1]) if len(emb_entry.shape) == 2 else stage.vocab_size
+                            stage.vocab_size = n_vocab
+                            chunks = _iter_dequantized_gguf_chunks(emb_entry, out_dtype=stage.dtype, target_device=stage.device)
+                            if use_int8:
+                                stage.embed_tokens = Int8WeightEmbedding.from_float_chunked(
+                                    chunks, num_embeddings=n_vocab, embedding_dim=hidden_dim, device=stage.device, scale_dtype=stage.dtype
                                 )
-                                continue
+                            else:
+                                emb_mod = _fast_embedding(n_vocab, hidden_dim, device=stage.device, dtype=stage.dtype)
+                                with torch.no_grad():
+                                    offset = 0
+                                    for c in chunks:
+                                        emb_mod.weight[offset : offset + c.shape[0]].copy_(c)
+                                        offset += c.shape[0]
+                                stage.embed_tokens = emb_mod
+                            logger.info(f"Loaded GGUF embedding table {(n_vocab, hidden_dim)} ({'int8' if use_int8 else stage.dtype}) onto {stage.device}.")
 
-                            embed_weight = cached_embed
-                            norm_weight = cached_norm
-                            norm_bias = cached_norm_bias
-                            lm_head_weight = cached_head
+                        # Stage N: Final norm & LM head
+                        if is_last_stage:
+                            set_norm_unit_offset(stage.norm, False)
+                            norm_entry = (
+                                tensor_by_name.get("output_norm.weight")
+                                or tensor_by_name.get("norm.weight")
+                                or tensor_by_name.get("model.norm.weight")
+                            )
+                            norm_bias_entry = (
+                                tensor_by_name.get("output_norm.bias")
+                                or tensor_by_name.get("norm.bias")
+                                or tensor_by_name.get("model.norm.bias")
+                            )
+                            if norm_entry is not None and stage.norm is not None:
+                                nw = _dequantize_gguf_tensor_fast(norm_entry, out_dtype=stage.norm.weight.dtype, target_device=stage.device)
+                                with torch.no_grad():
+                                    stage.norm.weight.copy_(nw.to(dtype=stage.norm.weight.dtype))
+                            if norm_bias_entry is not None and stage.norm is not None and getattr(stage.norm, "bias", None) is not None:
+                                nb = _dequantize_gguf_tensor_fast(norm_bias_entry, out_dtype=stage.norm.bias.dtype, target_device=stage.device)
+                                with torch.no_grad():
+                                    stage.norm.bias.copy_(nb.to(dtype=stage.norm.bias.dtype))
 
-                            # Check embedding weights if needed
-                            if need_embed or (need_head and lm_head_weight is None):
-                                for t in reader.tensors:
-                                    if t.name in ("token_embd.weight", "model.embed_tokens.weight"):
-                                        arr = gguf.quants.dequantize(t.data, t.tensor_type) if t.tensor_type != 0 else t.data
-                                        embed_weight = torch.from_numpy(arr.copy())
-                                        break
+                            head_entry = tensor_by_name.get("output.weight") or tensor_by_name.get("lm_head.weight") or emb_entry
+                            if head_entry is not None:
+                                n_vocab = int(head_entry.shape[1]) if len(head_entry.shape) == 2 else stage.vocab_size
+                                if use_int8 and head_entry is emb_entry and isinstance(stage.embed_tokens, Int8WeightEmbedding):
+                                    stage.lm_head = Int8WeightLinear(
+                                        hidden_dim, n_vocab, stage.embed_tokens.weight, stage.embed_tokens.weight_scale, None
+                                    )
+                                elif use_int8:
+                                    h_chunks = _iter_dequantized_gguf_chunks(head_entry, out_dtype=stage.dtype, target_device=stage.device)
+                                    tmp_emb = Int8WeightEmbedding.from_float_chunked(
+                                        h_chunks, num_embeddings=n_vocab, embedding_dim=hidden_dim, device=stage.device, scale_dtype=stage.dtype
+                                    )
+                                    stage.lm_head = Int8WeightLinear(hidden_dim, n_vocab, tmp_emb.weight, tmp_emb.weight_scale, None)
+                                else:
+                                    lm_mod = _fast_linear(hidden_dim, n_vocab, device=stage.device, dtype=stage.dtype, bias=False)
+                                    with torch.no_grad():
+                                        offset = 0
+                                        for c in _iter_dequantized_gguf_chunks(head_entry, out_dtype=stage.dtype, target_device=stage.device):
+                                            lm_mod.weight[offset : offset + c.shape[0]].copy_(c)
+                                            offset += c.shape[0]
+                                    stage.lm_head = lm_mod
+                                logger.info(f"Loaded GGUF LM head {(n_vocab, hidden_dim)} ({'int8' if use_int8 else stage.dtype}) onto {stage.device}.")
 
-                            # Check norm and head if needed
-                            if need_head:
-                                for t in reader.tensors:
-                                    if norm_weight is None and t.name in ("output_norm.weight", "norm.weight", "model.norm.weight"):
-                                        norm_weight = torch.from_numpy(t.data.copy())
-                                    elif norm_bias is None and t.name in ("output_norm.bias", "norm.bias", "model.norm.bias"):
-                                        norm_bias = torch.from_numpy(t.data.copy())
-                                    elif lm_head_weight is None and t.name in ("output.weight", "lm_head.weight"):
-                                        arr = gguf.quants.dequantize(t.data, t.tensor_type) if t.tensor_type != 0 else t.data
-                                        lm_head_weight = torch.from_numpy(arr.copy())
+                        # Transformer layers [layer_start..layer_end)
+                        for l_idx in range(layer_start, layer_end):
+                            prefix = f"blk.{l_idx}."
+                            matched = [t for t in reader.tensors if t.name.startswith(prefix)]
+                            if not matched:
+                                raise RuntimeError(f"GGUF file '{sf}' is missing assigned transformer layer {l_idx}.")
 
-                                if lm_head_weight is None and embed_weight is not None:
-                                    lm_head_weight = embed_weight
-
-                            if is_first_stage and embed_weight is not None and cached_embed is None:
-                                stage.load_embedding_weights(embed_weight)
-                                try:
-                                    model_cache_dir.mkdir(parents=True, exist_ok=True)
-                                    torch.save(embed_weight, embed_cache_file)
-                                except Exception:
-                                    pass
-
-                            if is_last_stage and lm_head_weight is not None and cached_head is None:
-                                stage.load_head_weights(
-                                    lm_head_weight=lm_head_weight,
-                                    norm_weight=norm_weight,
-                                    norm_bias=norm_bias,
+                            layer_rope, layer_sw = _resolve_layer_sliding_and_rope(
+                                stage.spec,
+                                l_idx,
+                                rope_theta=stage.rope_theta,
+                                rope_local_base_freq=stage.rope_local_base_freq,
+                                sliding_window=stage.sliding_window_cfg,
+                                sliding_window_pattern=stage.sliding_window_pattern,
+                            )
+                            layer_state = {}
+                            for t in matched:
+                                short_k = t.name[len(prefix):]
+                                layer_state[short_k] = _dequantize_gguf_tensor_fast(
+                                    t, out_dtype=stage.dtype, target_device=stage.device
                                 )
-                                try:
-                                    model_cache_dir.mkdir(parents=True, exist_ok=True)
-                                    if norm_weight is not None:
-                                        torch.save(norm_weight, norm_cache_file)
-                                    if norm_bias is not None:
-                                        torch.save(norm_bias, norm_bias_cache_file)
-                                    torch.save(lm_head_weight, head_cache_file)
-                                except Exception:
-                                    pass
 
-                            # Extract assigned layers
-                            for l_idx in range(layer_start, layer_end):
-                                if stage.is_layer_ready(l_idx):
-                                    continue
-                                prefix = f"blk.{l_idx}."
-                                matched = [t for t in reader.tensors if t.name.startswith(prefix)]
-                                if matched:
-                                    layer_state = {}
-                                    for t in matched:
-                                        short_k = t.name.replace(prefix, "")
-                                        arr = gguf.quants.dequantize(t.data, t.tensor_type) if t.tensor_type != 0 else t.data
-                                        layer_state[short_k] = torch.from_numpy(arr.copy())
-                                    try:
-                                        stage.hot_swap_layer(l_idx, weights=layer_state)
-                                        loaded_cached += 1
-                                        try:
-                                            buf = io.BytesIO()
-                                            torch.save(layer_state, buf)
-                                            save_layer_to_cache(model_name, l_idx, buf.getvalue())
-                                        except Exception:
-                                            pass
-                                    except Exception as e:
-                                        logger.debug(f"Failed to load layer {l_idx} from GGUF {sf}: {e}")
-                        except Exception as e:
-                            logger.warning(f"Error loading GGUF model from {sf}: {e}")
-            except ImportError:
-                pass
+                            block = RealTransformerBlock(
+                                hidden_dim=hidden_dim,
+                                num_heads=num_heads,
+                                num_kv_heads=num_kv_heads,
+                                intermediate_size=intermediate_size,
+                                head_dim=head_dim,
+                                architecture=arch,
+                                eps=stage.rms_norm_eps,
+                                layer_idx=l_idx,
+                                device=stage.device,
+                                dtype=stage.dtype,
+                                rope_theta=layer_rope,
+                                sliding_window=layer_sw,
+                                query_pre_attn_scalar=stage.query_pre_attn_scalar,
+                                attn_logit_softcapping=stage.attn_logit_softcapping,
+                                qkv_bias=stage.qkv_bias,
+                                o_bias=stage.o_bias,
+                                mlp_bias=stage.mlp_bias,
+                                hidden_act=stage.hidden_act,
+                            )
+                            set_norm_unit_offset(block, False)
+                            block.load_layer_weights(layer_state)
+                            del layer_state
+                            if use_int8:
+                                quantize_block_to_int8(block)
+
+                            local_idx = l_idx - layer_start
+                            stage.layers[local_idx] = block
+                            stage.ready_layers.add(l_idx)
+                            if l_idx in stage._layer_events:
+                                stage._layer_events[l_idx].set()
+                            loaded_cached += 1
+
+                        if stage.device != "cpu" and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    finally:
+                        reader.close()
 
             # 2. Try Safetensors loader
             if HAS_SAFETENSORS:
@@ -1899,7 +2429,7 @@ def load_hf_stage_model(
                     lm_head_weight = None
 
                     for sf in sfiles:
-                        if sf.endswith(".gguf") or not os.path.isfile(sf):
+                        if sf in gguf_loaded_files or sf.endswith(".gguf") or not os.path.isfile(sf):
                             continue
                         try:
                             with safetensors.safe_open(sf, framework="pt", device="cpu") as f:

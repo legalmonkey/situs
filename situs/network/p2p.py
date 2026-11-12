@@ -19,6 +19,10 @@ DEFAULT_STUN_SERVERS = [
     "stun:stun1.l.google.com:19302",
 ]
 
+# Conservative SCTP message limit so prefill tensors fall back to WebSocket relay
+# instead of overflowing aiortc DataChannel maxMessageSize (~64-256 KB).
+SAFE_SCTP_MAX_BYTES = 48 * 1024
+
 
 class P2PDataChannelNode:
     """
@@ -48,6 +52,13 @@ class P2PDataChannelNode:
         try:
             config = RTCConfiguration(iceServers=[RTCIceServer(urls=DEFAULT_STUN_SERVERS)])
             self.pc = RTCPeerConnection(configuration=config)
+
+            @self.pc.on("iceconnectionstatechange")
+            def on_ice_state_change():
+                state = getattr(self.pc, "iceConnectionState", "")
+                if state in ("failed", "closed", "disconnected"):
+                    self.is_connected = False
+                    logger.warning(f"P2P ICE state changed to '{state}' for {self.target_worker_id}; falling back to WebSocket relay.")
 
             if is_initiator:
                 # Worker A initiates the DataChannel
@@ -119,11 +130,18 @@ class P2PDataChannelNode:
                 logger.debug(f"Ignoring ice_answer in signaling state {self.pc.signalingState}")
 
     def send_frame(self, data_str: str) -> bool:
-        """Sends data over direct P2P UDP DataChannel if open."""
-        if self.is_connected and self.channel and self.channel.readyState == "open":
+        """Sends data over direct P2P UDP DataChannel if open and within safe SCTP bounds."""
+        if not (self.is_connected and self.channel and self.channel.readyState == "open"):
+            return False
+        if len(data_str.encode("utf-8")) > SAFE_SCTP_MAX_BYTES:
+            return False
+        try:
             self.channel.send(data_str)
             return True
-        return False
+        except Exception as e:
+            logger.debug(f"P2P DataChannel send failed ({e}); falling back to WebSocket relay.")
+            self.is_connected = False
+            return False
 
     async def close(self):
         if self.pc:

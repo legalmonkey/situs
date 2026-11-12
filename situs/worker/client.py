@@ -56,6 +56,7 @@ class WorkerDaemon:
         self.registered_event = threading.Event()
         self.connection_error: Optional[str] = None
         self.last_error: Optional[str] = None
+        self.engine_error: Optional[str] = None
         self._cached_hw = None
 
     @property
@@ -105,7 +106,14 @@ class WorkerDaemon:
                 except asyncio.TimeoutError:
                     pass
 
-            if frame.type == MessageType.FORWARD_ACTIVATION and self.engine:
+            if frame.type == MessageType.FORWARD_ACTIVATION:
+                if not self.engine:
+                    act_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                    await self._emit_inference_error(
+                        act_req,
+                        self.engine_error or f"Worker '{self.worker_id}' has no active pipeline engine loaded.",
+                    )
+                    return
                 act_frame = ForwardActivation.model_validate(frame.payload)
                 out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
                 if out_frame:
@@ -203,27 +211,47 @@ class WorkerDaemon:
             tot_ram, free_ram, cpu_name = get_system_ram_and_cpu()
             return f"{cpu_name} (CPU)", tot_ram, free_ram, "cpu", 0
 
+    async def _emit_inference_error(self, request_id: Optional[str], detail: str):
+        """Send an explicit ERROR frame back to the coordinator so inference never stalls silently."""
+        err_frame = ProtocolFrame(
+            type=MessageType.ERROR,
+            source=self.worker_id,
+            target="coordinator",
+            payload={"request_id": request_id, "error": detail},
+        )
+        if self.ws:
+            try:
+                await self.ws.send(err_frame.model_dump_json())
+            except Exception as send_err:
+                logger.debug(f"Failed sending ERROR frame to coordinator: {send_err}")
+
+    async def send_heartbeat_once(self):
+        """Send a single immediate telemetry heartbeat (e.g. right after loading model weights)."""
+        if not self.ws or not self.is_running:
+            return
+        gpu_name, total_b, free_b, dev_type, used_b = await asyncio.to_thread(self.query_gpu_info)
+        hb = Heartbeat(
+            worker_id=self.worker_id,
+            timestamp=time.time(),
+            free_vram_bytes=free_b,
+            used_vram_bytes=used_b,
+            gpu_name=gpu_name,
+            total_vram_bytes=total_b,
+            device_type=dev_type,
+            active_sessions=len(self.engine.session_kv_caches) if self.engine else 0,
+        )
+        frame = ProtocolFrame(
+            type=MessageType.HEARTBEAT,
+            source=self.worker_id,
+            target="coordinator",
+            payload=hb.model_dump(),
+        )
+        await self.ws.send(frame.model_dump_json())
+
     async def heartbeat_loop(self):
         while self.is_running and self.ws:
             try:
-                gpu_name, total_b, free_b, dev_type, used_b = await asyncio.to_thread(self.query_gpu_info)
-                hb = Heartbeat(
-                    worker_id=self.worker_id,
-                    timestamp=time.time(),
-                    free_vram_bytes=free_b,
-                    used_vram_bytes=used_b,
-                    gpu_name=gpu_name,
-                    total_vram_bytes=total_b,
-                    device_type=dev_type,
-                    active_sessions=len(self.engine.session_kv_caches) if self.engine else 0,
-                )
-                frame = ProtocolFrame(
-                    type=MessageType.HEARTBEAT,
-                    source=self.worker_id,
-                    target="coordinator",
-                    payload=hb.model_dump(),
-                )
-                await self.ws.send(frame.model_dump_json())
+                await self.send_heartbeat_once()
                 await asyncio.sleep(self.config.heartbeat_interval_s)
             except websockets.ConnectionClosed:
                 logger.debug("Heartbeat loop: connection closed")
@@ -315,29 +343,48 @@ class WorkerDaemon:
                             elif frame.type == MessageType.ASSIGN_LAYERS:
                                 try:
                                     self.engine_ready_event.clear()
+                                    self.engine_error = None
+                                    if self.engine is not None:
+                                        self.engine = None
+                                        import gc
+                                        gc.collect()
+                                        if HAS_TORCH and torch.cuda.is_available():
+                                            torch.cuda.empty_cache()
                                     assign = AssignLayers.model_validate(frame.payload)
                                     logger.info(
                                         f"Assigned layers [{assign.layer_start}..{assign.layer_end}) of {assign.model_name}. "
                                         f"First={assign.is_first_stage}, Last={assign.is_last_stage}"
                                     )
                                     from situs.coordinator.registry import resolve_model_metadata
-                                    from situs.worker.loader import is_architecture_supported, find_local_safetensors_files
+                                    from situs.worker.loader import is_architecture_supported, find_local_weight_files
                                     try:
                                         meta = resolve_model_metadata(assign.model_name)
                                         arch = meta.get("architecture") or meta.get("model_type")
                                     except Exception:
                                         arch = None
 
-                                    sfiles = find_local_safetensors_files(assign.model_name)
-                                    if not is_architecture_supported(arch) or (not sfiles and not assign.progressive):
+                                    wfiles = find_local_weight_files(assign.model_name)
+                                    if not is_architecture_supported(arch):
+                                        self.engine_error = (
+                                            f"Worker '{self.worker_id}': architecture '{arch}' for '{assign.model_name}' "
+                                            f"is not supported for multi-node PyTorch pipeline execution."
+                                        )
                                         logger.info(
-                                            f"Model '{assign.model_name}' (architecture '{arch}') executes via local engine/Ollama runtime. "
+                                            f"Model '{assign.model_name}' (architecture '{arch}') executes via single-node Ollama runtime. "
                                             f"Pipeline assignment [{assign.layer_start}..{assign.layer_end}) recorded for cluster topology."
                                         )
                                         self.engine = None
-                                        self.engine_ready_event.set()
                                         continue
-    
+
+                                    if not wfiles and not assign.progressive:
+                                        self.engine_error = (
+                                            f"Worker '{self.worker_id}' could not find local safetensors or Ollama GGUF weights "
+                                            f"for '{assign.model_name}' (stage [{assign.layer_start}..{assign.layer_end}))."
+                                        )
+                                        logger.warning(self.engine_error)
+                                        self.engine = None
+                                        continue
+
                                     stage_model = await asyncio.to_thread(
                                         load_hf_stage_model,
                                         model_name=assign.model_name,
@@ -361,8 +408,20 @@ class WorkerDaemon:
                                         compression_dtype=self.config.compression_dtype,
                                         tokenizer=tok,
                                     )
-                                    self.engine_ready_event.set()
-    
+
+                                    try:
+                                        await self.send_heartbeat_once()
+                                    except Exception:
+                                        pass
+
+                                    # Reset any stale P2P peer connection before opening channel to current neighbor
+                                    if self.p2p_node:
+                                        try:
+                                            await self.p2p_node.close()
+                                        except Exception:
+                                            pass
+                                        self.p2p_node = None
+
                                     # Initialize WebRTC direct P2P connection to partner worker
                                     target_id = assign.next_worker_id or assign.prev_worker_id
                                     if target_id:
@@ -378,7 +437,11 @@ class WorkerDaemon:
                                     if (not self.is_running) or ("cannot schedule new futures after shutdown" in str(e)):
                                         pass
                                     else:
+                                        self.engine = None
+                                        self.engine_error = f"Worker '{self.worker_id}' stage load failed: {e}"
                                         logger.error(f"Error handling ASSIGN_LAYERS: {e}", exc_info=True)
+                                finally:
+                                    self.engine_ready_event.set()
     
                             elif frame.type in (MessageType.ICE_OFFER, MessageType.ICE_ANSWER):
                                 if self.p2p_node:
@@ -386,29 +449,39 @@ class WorkerDaemon:
     
                             elif frame.type == MessageType.INFERENCE_START:
                                 try:
-                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=120.0)
                                 except asyncio.TimeoutError:
-                                    logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within 60s")
-                                if self.engine:
-                                    start_msg = InferenceStart.model_validate(frame.payload)
-                                    if self.engine.is_first_stage():
-                                        out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
-                                        if out_frame:
-                                            await self.send_frame_out(out_frame)
-                                    else:
-                                        self.engine.session_configs[start_msg.request_id] = start_msg
-                                        self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within 120s")
+                                start_msg = InferenceStart.model_validate(frame.payload)
+                                if not self.engine:
+                                    await self._emit_inference_error(
+                                        start_msg.request_id,
+                                        self.engine_error or f"Worker '{self.worker_id}' has no loaded model engine for '{start_msg.model_name}'.",
+                                    )
+                                    continue
+                                if self.engine.is_first_stage():
+                                    out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
+                                    if out_frame:
+                                        await self.send_frame_out(out_frame)
+                                else:
+                                    self.engine.session_configs[start_msg.request_id] = start_msg
+                                    self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
     
                             elif frame.type == MessageType.FORWARD_ACTIVATION:
                                 try:
-                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=120.0)
                                 except asyncio.TimeoutError:
-                                    logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within 60s")
-                                if self.engine:
-                                    act_frame = ForwardActivation.model_validate(frame.payload)
-                                    out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
-                                    if out_frame:
-                                        await self.send_frame_out(out_frame)
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within 120s")
+                                act_frame = ForwardActivation.model_validate(frame.payload)
+                                if not self.engine:
+                                    await self._emit_inference_error(
+                                        act_frame.request_id,
+                                        self.engine_error or f"Worker '{self.worker_id}' has no loaded pipeline stage to process activations.",
+                                    )
+                                    continue
+                                out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
+                                if out_frame:
+                                    await self.send_frame_out(out_frame)
     
                             elif frame.type == MessageType.SPECULATIVE_CANDIDATES:
                                 if self.engine:

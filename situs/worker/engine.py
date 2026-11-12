@@ -286,13 +286,14 @@ class StageExecutionEngine:
         try:
             comp_bytes = base64.b64decode(act_frame.payload_b64)
 
+            act_dtype = getattr(self.stage_model, "dtype", None) or torch.float32
             hidden_states = decompress_tensor(
                 comp_bytes,
                 scale=act_frame.scale,
                 shape=tuple(act_frame.shape),
                 method=act_frame.dtype,
                 device=self.stage_model.device,
-                dtype=torch.float32,
+                dtype=act_dtype,
             )
             past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
             out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
@@ -338,7 +339,12 @@ class StageExecutionEngine:
                 top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
                 seed = getattr(cfg, "seed", None)
                 max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
-                stop_token_ids = cfg.stop_token_ids if cfg else []
+                stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
+                tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
+                if tok_stops:
+                    for sid in tok_stops:
+                        if sid not in stop_token_ids:
+                            stop_token_ids.append(int(sid))
                 step_idx = act_frame.step_index
 
                 if HAS_TORCH and isinstance(out, torch.Tensor):
@@ -369,6 +375,8 @@ class StageExecutionEngine:
 
                 if not is_eos and token_text:
                     is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+                if is_eos and token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>"):
+                    token_text = ""
 
                 is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
                 finish_reason = "stop" if is_eos else ("length" if is_finished else None)
@@ -421,13 +429,14 @@ class StageExecutionEngine:
 
         comp_bytes = base64.b64decode(cand_frame.payload_b64)
 
+        act_dtype = getattr(self.stage_model, "dtype", None) or torch.float32
         hidden_states = decompress_tensor(
             comp_bytes,
             scale=cand_frame.scale,
             shape=tuple(cand_frame.shape),
             method=cand_frame.dtype,
             device=self.stage_model.device,
-            dtype=torch.float32,
+            dtype=act_dtype,
         )
         past_kvs = self.session_kv_caches.get(request_id)
         out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
@@ -469,7 +478,12 @@ class StageExecutionEngine:
 
         new_step_idx = cand_frame.step_index + len(accepted_tokens)
         eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
-        stop_token_ids = cfg.stop_token_ids if cfg else []
+        stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
+        tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
+        if tok_stops:
+            for sid in tok_stops:
+                if sid not in stop_token_ids:
+                    stop_token_ids.append(int(sid))
         is_eos = False
         if accepted_tokens:
             last_tok = accepted_tokens[-1]
@@ -482,7 +496,11 @@ class StageExecutionEngine:
                 if last_txt:
                     is_eos = last_txt.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 
-        accepted_texts = [self.sampler.decode_token(t) for t in accepted_tokens]
+        accepted_texts = [
+            "" if (is_eos and i == len(accepted_tokens) - 1 and self.sampler.decode_token(t).strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>"))
+            else self.sampler.decode_token(t)
+            for i, t in enumerate(accepted_tokens)
+        ]
         is_finished = is_eos or (new_step_idx >= max_tokens)
 
         if is_finished:

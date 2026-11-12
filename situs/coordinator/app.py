@@ -565,6 +565,21 @@ async def list_models(request: Request):
     }
 
 
+def _format_pipeline_prompt(messages: List[Any], tokenizer: Any) -> str:
+    """Format OpenAI-style chat messages using the verified tokenizer's chat template when available."""
+    raw_msgs = [{"role": m.role, "content": m.content} for m in messages]
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            templated = tokenizer.apply_chat_template(
+                raw_msgs, tokenize=False, add_generation_prompt=True
+            )
+            if isinstance(templated, str) and templated.strip():
+                return templated
+        except Exception:
+            pass
+    return "\n".join([f"{m.role}: {m.content}" for m in messages]) + "\nassistant:"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     verify_api_key(request)
@@ -683,7 +698,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     tokenizer = get_or_load_tokenizer(target_model)
                     if tokenizer is None:
                         raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
-                    input_ids = tokenizer.encode(prompt)
+                    pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer)
+                    input_ids = tokenizer.encode(pipeline_prompt)
                     if not input_ids:
                         raise ValueError("Tokenizer returned empty token list.")
                 except Exception as e:
@@ -759,16 +775,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 first_worker = pipeline[0]
                 last_worker = pipeline[-1]
 
-                # Dispatch genuine INFERENCE_START to first worker (without precomputed response)
+                stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
                 start_payload = InferenceStart(
                     request_id=request_id,
                     model_name=target_model,
                     input_ids=input_ids,
-                    prompt=prompt,
+                    prompt=pipeline_prompt,
                     real_response=None,
                     max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
                     temperature=req.temperature if req.temperature is not None else 0.7,
                     top_p=req.top_p if req.top_p is not None else 0.9,
+                    stop_token_ids=stop_ids,
                     seed=req.seed,
                 )
                 start_frame = ProtocolFrame(
@@ -925,7 +942,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             tokenizer = get_or_load_tokenizer(target_model)
             if tokenizer is None:
                 raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
-            input_ids = tokenizer.encode(prompt)
+            pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer)
+            input_ids = tokenizer.encode(pipeline_prompt)
             if not input_ids:
                 raise ValueError("Tokenizer returned empty token list.")
         except Exception as e:
@@ -975,15 +993,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         first_worker = pipeline[0]
         last_worker = pipeline[-1]
 
+        stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
         start_payload = InferenceStart(
             request_id=request_id,
             model_name=target_model,
             input_ids=input_ids,
-            prompt=prompt,
+            prompt=pipeline_prompt,
             real_response=None,
             max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
             temperature=req.temperature if req.temperature is not None else 0.7,
             top_p=req.top_p if req.top_p is not None else 0.9,
+            stop_token_ids=stop_ids,
             seed=req.seed,
         )
         start_frame = ProtocolFrame(
