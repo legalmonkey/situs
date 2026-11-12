@@ -682,6 +682,7 @@ def start_in_process_coordinator(host: str = "0.0.0.0", port: int = 8000) -> Tup
             log_config=None,
             access_log=False,
             log_level="warning",
+            ws_max_size=64 * 1024 * 1024,
         )
         _bg_coordinator_server = uvicorn.Server(cfg)
         _bg_coordinator_thread = threading.Thread(target=_bg_coordinator_server.run, daemon=True)
@@ -2011,7 +2012,7 @@ def execute_slash_command(
             if is_coordinator_online(coord_url):
                 try:
                     with httpx.Client(timeout=2.0) as client:
-                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={target_arg}&total_layers=32&codec=zstd")
+                        resp = client.post(f"{normalize_fast_url(coord_url)}/admin/partition?model_name={target_arg}&codec=zstd")
                         if resp.status_code == 200:
                             repartition_msg = "\n[bold green]✓ Coordinator pipeline automatically rebalanced across connected workers![/bold green]"
                 except Exception:

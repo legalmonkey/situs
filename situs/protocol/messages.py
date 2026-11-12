@@ -137,6 +137,7 @@ class SpeculativeVerified(BaseModel):
     step_index: int
     accepted_tokens: List[int]
     accepted_texts: List[str]
+    rejected_draft_count: int = 0
     is_finished: bool = False
     finish_reason: Optional[str] = None
     is_verified: bool = True

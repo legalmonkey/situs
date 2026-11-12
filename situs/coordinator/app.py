@@ -860,7 +860,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     if frame.type == MessageType.NEXT_TOKEN:
                         token_info = NextToken.model_validate(frame.payload)
                         tok_txt = token_info.token_text
-                        if (not tok_txt) and token_info.token_id is not None and tokenizer:
+                        if (
+                            not tok_txt
+                            and not (token_info.is_finished and token_info.finish_reason == "stop")
+                            and token_info.token_id is not None
+                            and tokenizer
+                        ):
                             try:
                                 tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=False)
                             except Exception:
@@ -1079,7 +1084,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 if frame.type == MessageType.NEXT_TOKEN:
                     token_info = NextToken.model_validate(frame.payload)
                     tok_txt = token_info.token_text
-                    if (not tok_txt) and token_info.token_id is not None and tokenizer:
+                    if (
+                        not tok_txt
+                        and not (token_info.is_finished and token_info.finish_reason == "stop")
+                        and token_info.token_id is not None
+                        and tokenizer
+                    ):
                         try:
                             tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=False)
                         except Exception:
@@ -1143,7 +1153,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
 def main():
     import uvicorn
-    uvicorn.run("situs.coordinator.app:app", host=config.host, port=config.port, reload=False)
+    uvicorn.run(
+        "situs.coordinator.app:app",
+        host=config.host,
+        port=config.port,
+        reload=False,
+        ws_max_size=64 * 1024 * 1024,
+    )
 
 
 if __name__ == "__main__":

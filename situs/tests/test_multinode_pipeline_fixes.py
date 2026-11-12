@@ -330,3 +330,270 @@ def test_live_socket_error_fast_fail_and_two_worker_pipeline(tmp_path, monkeypat
             assert any("[DONE]" in l for l in lines)
         for w_id in ("w-stage-1", "w-stage-2"):
             client.delete(f"/admin/workers/{w_id}")
+
+
+def test_speculative_rejection_rolls_back_stage_kv_caches_and_truncates_stop():
+    """Partial draft rejections must roll back KV caches on both stages; mid-sequence stop tokens must truncate."""
+    from situs.protocol.messages import SpeculativeCandidates, SpeculativeVerified
+
+    def _tiny_model(layer_start: int, layer_end: int, is_first: bool, is_last: bool) -> DistributedStageModel:
+        return DistributedStageModel(
+            layer_start=layer_start,
+            layer_end=layer_end,
+            total_layers=2,
+            is_first_stage=is_first,
+            is_last_stage=is_last,
+            hidden_dim=16,
+            vocab_size=128,
+            num_heads=2,
+            num_kv_heads=2,
+            intermediate_size=32,
+            head_dim=8,
+            architecture="llama",
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    class _StubTokenizer:
+        eos_token_id = 106
+        stop_token_ids = [106]
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join("<end_of_turn>" if i == 106 else f"t{i}" for i in ids)
+
+    assign_a = AssignLayers(
+        worker_id="w1",
+        model_name="tiny",
+        layer_start=0,
+        layer_end=1,
+        total_layers=2,
+        is_first_stage=True,
+        is_last_stage=False,
+        next_worker_id="w2",
+        first_worker_id="w1",
+        codec="none",
+    )
+    assign_b = AssignLayers(
+        worker_id="w2",
+        model_name="tiny",
+        layer_start=1,
+        layer_end=2,
+        total_layers=2,
+        is_first_stage=False,
+        is_last_stage=True,
+        prev_worker_id="w1",
+        first_worker_id="w1",
+        codec="none",
+    )
+    eng_a = StageExecutionEngine(_tiny_model(0, 1, True, False), assign_a, compression_dtype="none", tokenizer=_StubTokenizer())
+    eng_b = StageExecutionEngine(_tiny_model(1, 2, False, True), assign_b, compression_dtype="none", tokenizer=_StubTokenizer())
+
+    req_id = "req-spec-rollback"
+    start_cfg = InferenceStart(request_id=req_id, model_name="tiny", input_ids=[1, 2, 3], max_new_tokens=32, temperature=0.7, stop_token_ids=[106])
+    eng_a.session_configs[req_id] = start_cfg
+    eng_b.session_configs[req_id] = start_cfg
+    eng_a.session_token_histories[req_id] = [1, 2, 3]
+
+    # Seed both stages with 3 prompt tokens + 3 drafted candidate positions (seq_len == 6)
+    seed_kvs_a = [(torch.zeros(1, 2, 6, 8), torch.zeros(1, 2, 6, 8))]
+    eng_a.kv_cache_manager.set_all_kvs(req_id, seed_kvs_a)
+    eng_a.session_kv_caches[req_id] = seed_kvs_a
+
+    seed_kvs_b = [(torch.zeros(1, 2, 3, 8), torch.zeros(1, 2, 3, 8))]
+    eng_b.kv_cache_manager.set_all_kvs(req_id, seed_kvs_b)
+    eng_b.session_kv_caches[req_id] = seed_kvs_b
+
+    # Force Stage 2 verifier to accept only 1 of 3 drafts + 1 correction -> rejected_draft_count == 2
+    eng_b.verifier.verify_candidates = MagicMock(return_value=([10], 25))
+    hidden = torch.randn(1, 3, 16, dtype=torch.float32)
+    comp_bytes, scale, shape = compress_tensor(hidden, method="none")
+    import base64
+    cand_frame = SpeculativeCandidates(
+        request_id=req_id,
+        step_index=0,
+        candidate_tokens=[10, 11, 12],
+        shape=list(shape),
+        dtype="none",
+        scale=scale,
+        payload_b64=base64.b64encode(comp_bytes).decode("ascii"),
+    )
+    verified_proto = eng_b.process_speculative_candidates(cand_frame)
+    assert verified_proto is not None
+    verified = SpeculativeVerified(**verified_proto.payload)
+    assert verified.rejected_draft_count == 2
+    assert verified.accepted_tokens == [10, 25]
+    # Stage 2 forward added 3 tokens (3 -> 6) then trimmed 2 rejected drafts back to 4
+    assert eng_b.session_kv_caches[req_id][0][0].shape[-2] == 4
+    assert eng_b.kv_cache_manager.get_all_kvs(req_id)[0][0].shape[-2] == 4
+
+    # Stage 1 processes SpeculativeVerified: trims its 6-token cache by 2 (-> 4), then forwards 1 token (+1 -> 5)
+    next_proto = eng_a.process_speculative_verified(verified)
+    assert next_proto is not None
+    assert eng_a.session_kv_caches[req_id][0][0].shape[-2] == 5
+    assert eng_a.kv_cache_manager.get_all_kvs(req_id)[0][0].shape[-2] == 5
+
+    # Now verify mid-sequence stop token truncation & empty-string suppression in process_speculative_candidates
+    req_eos = "req-spec-eos"
+    eng_b.session_configs[req_eos] = InferenceStart(request_id=req_eos, model_name="tiny", input_ids=[1, 2], max_new_tokens=32, temperature=0.7, stop_token_ids=[106])
+    eng_b.kv_cache_manager.set_all_kvs(req_eos, [(torch.zeros(1, 2, 2, 8), torch.zeros(1, 2, 2, 8))])
+    eng_b.verifier.verify_candidates = MagicMock(return_value=([10, 106], 12))
+    cand_eos = SpeculativeCandidates(
+        request_id=req_eos,
+        step_index=0,
+        candidate_tokens=[10, 106, 11],
+        shape=list(shape),
+        dtype="none",
+        scale=scale,
+        payload_b64=base64.b64encode(comp_bytes).decode("ascii"),
+    )
+    eos_proto = eng_b.process_speculative_candidates(cand_eos)
+    eos_verified = SpeculativeVerified(**eos_proto.payload)
+    assert eos_verified.accepted_tokens == [10, 106]
+    assert eos_verified.accepted_texts == ["t10", ""]
+    assert eos_verified.is_finished is True
+    assert eos_verified.finish_reason == "stop"
+    assert req_eos in eng_b.finished_sessions
+
+
+def test_coordinator_sse_suppresses_redecoding_empty_stop_token_text(monkeypatch):
+    """Coordinator SSE stream must not re-decode a suppressed stop token when token_text is empty."""
+    import threading
+    import uvicorn
+    import situs.coordinator.app as app_mod
+    from situs.coordinator.registry import WorkerRegistry
+    from situs.coordinator.relay import RelayHub
+    from situs.protocol.messages import NextToken, ProtocolFrame
+
+    fresh_registry = WorkerRegistry()
+    fresh_relay = RelayHub()
+    fresh_relay.set_registry(fresh_registry)
+    monkeypatch.setattr(app_mod, "registry", fresh_registry)
+    monkeypatch.setattr(app_mod, "relay", fresh_relay)
+
+    class _MockStopTokenizer:
+        eos_token_id = 106
+        stop_token_ids = [106]
+
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join("<end_of_turn>" if i == 106 else "Hello" for i in ids)
+
+    monkeypatch.setattr("situs.tokenizer.get_or_load_tokenizer", lambda *a, **k: _MockStopTokenizer())
+    monkeypatch.setattr(app_mod, "get_or_load_tokenizer", lambda *a, **k: _MockStopTokenizer())
+    monkeypatch.setattr("situs.inference_backend.is_model_downloaded", lambda *a, **k: True)
+
+    from situs.protocol.messages import WorkerRegister
+    n1 = fresh_registry.register_worker(
+        WorkerRegister(
+            worker_id="w-sse-1",
+            gpu_name="Mock GPU 1",
+            total_vram_bytes=8 * 1024**3,
+            free_vram_bytes=7 * 1024**3,
+            used_vram_bytes=1 * 1024**3,
+            device_type="cuda",
+        )
+    )
+    n1.assigned_layer_start = 0
+    n1.assigned_layer_end = 17
+    n1.is_first_stage = True
+    n1.is_last_stage = False
+    n1.next_worker_id = "w-sse-2"
+    n1.first_worker_id = "w-sse-1"
+
+    n2 = fresh_registry.register_worker(
+        WorkerRegister(
+            worker_id="w-sse-2",
+            gpu_name="Mock GPU 2",
+            total_vram_bytes=8 * 1024**3,
+            free_vram_bytes=7 * 1024**3,
+            used_vram_bytes=1 * 1024**3,
+            device_type="cuda",
+        )
+    )
+    n2.assigned_layer_start = 17
+    n2.assigned_layer_end = 34
+    n2.is_first_stage = False
+    n2.is_last_stage = True
+    n2.prev_worker_id = "w-sse-1"
+    n2.first_worker_id = "w-sse-1"
+
+    fresh_registry.active_model = "gemma3:4b"
+    fresh_registry.total_layers = 34
+    fresh_relay.active_connections["w-sse-1"] = MagicMock()
+    fresh_relay.active_connections["w-sse-2"] = MagicMock()
+
+    async def _fake_send_to_worker(worker_id: str, frame: ProtocolFrame):
+        if frame.type == MessageType.INFERENCE_START:
+            req_id = frame.payload["request_id"]
+            q = fresh_relay.response_streams.get(req_id)
+            if q is not None:
+                await q.put(
+                    ProtocolFrame(
+                        type=MessageType.NEXT_TOKEN,
+                        source="w-sse-2",
+                        target="coordinator",
+                        payload=NextToken(request_id=req_id, step_index=0, token_id=5, token_text="Hello", is_finished=False).model_dump(),
+                    )
+                )
+                await q.put(
+                    ProtocolFrame(
+                        type=MessageType.NEXT_TOKEN,
+                        source="w-sse-2",
+                        target="coordinator",
+                        payload=NextToken(request_id=req_id, step_index=1, token_id=106, token_text="", is_finished=True, finish_reason="stop").model_dump(),
+                    )
+                )
+        return True
+
+    monkeypatch.setattr(fresh_relay, "send_to_worker", _fake_send_to_worker)
+
+    port = _find_free_port()
+    server = uvicorn.Server(uvicorn.Config(app_mod.app, host="127.0.0.1", port=port, log_level="error"))
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    try:
+        deadline = time.time() + 5.0
+        while not server.started and time.time() < deadline:
+            time.sleep(0.05)
+
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10.0) as client:
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "gemma3:4b", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "stream": True},
+            ) as resp:
+                assert resp.status_code == 200
+                body = "\n".join(resp.iter_lines())
+                assert "Hello" in body
+                assert "<end_of_turn>" not in body
+                assert '"finish_reason": "stop"' in body or '"finish_reason":"stop"' in body
+                assert "[DONE]" in body
+
+            non_stream = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemma3:4b", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "stream": False},
+            )
+            assert non_stream.status_code == 200
+            data = non_stream.json()
+            assert data["choices"][0]["message"]["content"] == "Hello"
+            assert data["choices"][0]["finish_reason"] == "stop"
+    finally:
+        server.should_exit = True
+        t.join(timeout=3.0)
+
+
+def test_ws_max_size_64mib_configured():
+    """Worker and coordinator entrypoints must raise WebSocket max frame size to 64 MiB for large prefill activations."""
+    import inspect
+    import situs.cli as cli_mod
+    import situs.coordinator.app as app_mod
+    import situs.tui as tui_mod
+    import situs.worker.client as client_mod
+
+    assert "64 * 1024 * 1024" in inspect.getsource(client_mod)
+    assert "64 * 1024 * 1024" in inspect.getsource(app_mod)
+    assert "64 * 1024 * 1024" in inspect.getsource(tui_mod)
+    assert "64 * 1024 * 1024" in inspect.getsource(cli_mod)
+

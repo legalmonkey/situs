@@ -417,6 +417,23 @@ class StageExecutionEngine:
                 payload={"request_id": request_id, "error": str(e)},
             )
 
+    def _trim_kv_caches(self, request_id: str, trim_tail_tokens: int) -> None:
+        """Discard rejected speculative draft positions from all layer KV caches."""
+        if trim_tail_tokens <= 0:
+            return
+        kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
+        if not kvs:
+            return
+        trimmed = []
+        for kv in kvs:
+            if isinstance(kv, (tuple, list)) and len(kv) == 2 and HAS_TORCH and isinstance(kv[0], torch.Tensor):
+                keep_len = max(0, kv[0].shape[-2] - trim_tail_tokens)
+                trimmed.append((kv[0][..., :keep_len, :], kv[1][..., :keep_len, :]))
+            else:
+                trimmed.append(kv)
+        self.kv_cache_manager.set_all_kvs(request_id, trimmed)
+        self.session_kv_caches[request_id] = trimmed
+
     def process_speculative_candidates(self, cand_frame: SpeculativeCandidates) -> Optional[ProtocolFrame]:
         """
         Invoked on Worker B to verify a drafted multi-token candidate batch in a single forward pass.
@@ -438,8 +455,9 @@ class StageExecutionEngine:
             device=self.stage_model.device,
             dtype=act_dtype,
         )
-        past_kvs = self.session_kv_caches.get(request_id)
+        past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
         out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+        self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
         self.session_kv_caches[request_id] = new_kvs
 
         if not self.is_last_stage():
@@ -463,12 +481,14 @@ class StageExecutionEngine:
         top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
         max_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
 
-        accepted_tokens, correction = self.verifier.verify_candidates(
+        accepted_drafts, correction = self.verifier.verify_candidates(
             cand_frame.candidate_tokens,
             logits,
             temperature=temp,
             top_p=top_p,
         )
+        rejected_draft_count = max(0, len(cand_frame.candidate_tokens) - len(accepted_drafts))
+        accepted_tokens = list(accepted_drafts)
         if correction is not None:
             accepted_tokens.append(correction)
         elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
@@ -476,7 +496,6 @@ class StageExecutionEngine:
             sampled_tok = self.sampler.sample_next_token(target_logits, temperature=temp, top_p=top_p)
             accepted_tokens.append(sampled_tok)
 
-        new_step_idx = cand_frame.step_index + len(accepted_tokens)
         eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
         stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
         tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
@@ -484,35 +503,37 @@ class StageExecutionEngine:
             for sid in tok_stops:
                 if sid not in stop_token_ids:
                     stop_token_ids.append(int(sid))
+        stop_strs = ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
         is_eos = False
-        if accepted_tokens:
-            last_tok = accepted_tokens[-1]
-            if stop_token_ids:
-                is_eos = last_tok in stop_token_ids
-            elif eos_id is not None:
-                is_eos = (last_tok == eos_id)
-            if not is_eos:
-                last_txt = self.sampler.decode_token(last_tok)
-                if last_txt:
-                    is_eos = last_txt.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+        for idx, tok in enumerate(accepted_tokens):
+            tok_txt = self.sampler.decode_token(tok)
+            if (stop_token_ids and tok in stop_token_ids) or (not stop_token_ids and eos_id is not None and tok == eos_id) or (tok_txt and tok_txt.strip() in stop_strs):
+                accepted_tokens = accepted_tokens[: idx + 1]
+                is_eos = True
+                break
 
+        new_step_idx = cand_frame.step_index + len(accepted_tokens)
         accepted_texts = [
-            "" if (is_eos and i == len(accepted_tokens) - 1 and self.sampler.decode_token(t).strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>"))
+            "" if (is_eos and i == len(accepted_tokens) - 1 and self.sampler.decode_token(t).strip() in stop_strs)
             else self.sampler.decode_token(t)
             for i, t in enumerate(accepted_tokens)
         ]
         is_finished = is_eos or (new_step_idx >= max_tokens)
 
         if is_finished:
+            self.kv_cache_manager.release_request(request_id)
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
             self.finished_sessions.add(request_id)
+        elif rejected_draft_count > 0:
+            self._trim_kv_caches(request_id, rejected_draft_count)
 
         verified = SpeculativeVerified(
             request_id=request_id,
             step_index=new_step_idx,
             accepted_tokens=accepted_tokens,
             accepted_texts=accepted_texts,
+            rejected_draft_count=rejected_draft_count,
             is_finished=is_finished,
             finish_reason="stop" if is_eos else ("length" if is_finished else None),
             is_verified=True,
@@ -548,11 +569,19 @@ class StageExecutionEngine:
             return None
 
         if verified_frame.is_finished:
+            self.kv_cache_manager.release_request(request_id)
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
             self.session_token_histories.pop(request_id, None)
             self.finished_sessions.add(request_id)
             return None
+
+        if not verified_frame.accepted_tokens:
+            return None
+
+        rej_cnt = getattr(verified_frame, "rejected_draft_count", 0) or 0
+        if rej_cnt > 0:
+            self._trim_kv_caches(request_id, rej_cnt)
 
         # Append accepted tokens to history
         if request_id in self.session_token_histories:
@@ -593,6 +622,7 @@ class StageExecutionEngine:
 
         if token_frame.is_finished:
             # Generation finished, clean up local KV cache
+            self.kv_cache_manager.release_request(request_id)
             self.session_kv_caches.pop(request_id, None)
             self.session_configs.pop(request_id, None)
             self.session_token_histories.pop(request_id, None)
@@ -609,8 +639,9 @@ class StageExecutionEngine:
             candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
             if candidates:
                 input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
-                past_kvs = self.session_kv_caches.get(request_id)
+                past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
                 h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+                self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
 
                 comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
@@ -627,6 +658,8 @@ class StageExecutionEngine:
                     is_verified=True,
                     is_experimental=False,
                 )
+                if self.is_last_stage():
+                    return self.process_speculative_candidates(spec_cand)
                 return ProtocolFrame(
                     type=MessageType.SPECULATIVE_CANDIDATES,
                     source=self.assignment.worker_id,
@@ -636,8 +669,9 @@ class StageExecutionEngine:
 
             # 2. Standard Single-Token Path
             input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
-            past_kvs = self.session_kv_caches.get(request_id)
+            past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
             h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
             self.session_kv_caches[request_id] = new_kvs
 
             comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)

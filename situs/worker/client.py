@@ -280,10 +280,12 @@ class WorkerDaemon:
         gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
         logger.info(f"Hardware: {gpu_name} (Used: {used_vram / (1024**3):.2f} GB | Free: {free_vram / (1024**3):.2f} GB | Total: {total_vram / (1024**3):.2f} GB VRAM)")
 
+        import inspect
+        sig_params = inspect.signature(websockets.connect).parameters
         connect_kwargs = {"ping_interval": 20, "ping_timeout": 120}
+        if "max_size" in sig_params:
+            connect_kwargs["max_size"] = 64 * 1024 * 1024
         if getattr(self.config, "auth_token", None):
-            import inspect
-            sig_params = inspect.signature(websockets.connect).parameters
             auth_headers = [
                 ("X-Worker-Token", self.config.auth_token),
                 ("Authorization", f"Bearer {self.config.auth_token}"),
@@ -445,7 +447,9 @@ class WorkerDaemon:
     
                             elif frame.type in (MessageType.ICE_OFFER, MessageType.ICE_ANSWER):
                                 if self.p2p_node:
-                                    await self.p2p_node.handle_signaling_message(frame.payload)
+                                    src_peer = frame.payload.get("source_worker") if isinstance(frame.payload, dict) else None
+                                    if src_peer is None or src_peer == self.p2p_node.target_worker_id:
+                                        await self.p2p_node.handle_signaling_message(frame.payload)
     
                             elif frame.type == MessageType.INFERENCE_START:
                                 try:
