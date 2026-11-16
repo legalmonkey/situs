@@ -694,6 +694,8 @@ def start_in_process_coordinator(host: str = "0.0.0.0", port: int = 8000) -> Tup
             access_log=False,
             log_level="warning",
             ws_max_size=64 * 1024 * 1024,
+            ws_ping_interval=None,
+            ws_ping_timeout=None,
         )
         _bg_coordinator_server = uvicorn.Server(cfg)
         _bg_coordinator_thread = threading.Thread(target=_bg_coordinator_server.run, daemon=True)

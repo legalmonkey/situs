@@ -474,7 +474,15 @@ def start_coordinator(
         raise typer.Exit(code=1)
     
     try:
-        uvicorn.run(fastapi_app, host=host, port=port, log_level="info", ws_max_size=64 * 1024 * 1024)
+        uvicorn.run(
+            fastapi_app,
+            host=host,
+            port=port,
+            log_level="info",
+            ws_max_size=64 * 1024 * 1024,
+            ws_ping_interval=None,
+            ws_ping_timeout=None,
+        )
     except KeyboardInterrupt:
         if console:
             console.print("\n[yellow]Coordinator stopped cleanly.[/yellow]")

@@ -223,8 +223,11 @@ class WorkerDaemon:
                 if HAS_TORCH and torch.cuda.is_available():
                     try:
                         free_b, total_b = torch.cuda.mem_get_info(dev_idx)
-                        alloc_b = max(torch.cuda.memory_allocated(dev_idx), max(0, total_b - free_b))
-                        return dev_name, total_b, free_b, "cuda", alloc_b
+                        alloc_b = torch.cuda.memory_allocated(dev_idx)
+                        res_b = torch.cuda.memory_reserved(dev_idx)
+                        effective_free_b = free_b + max(0, res_b - alloc_b)
+                        used_b = max(alloc_b, max(0, total_b - effective_free_b))
+                        return dev_name, total_b, effective_free_b, "cuda", used_b
                     except Exception:
                         pass
                 live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
@@ -440,10 +443,13 @@ class WorkerDaemon:
                                         assign.model_name,
                                         local_files_only=True,
                                     )
+                                    engine_comp_dtype = self.config.compression_dtype
+                                    if getattr(stage_model, "dtype", None) == torch.bfloat16 and engine_comp_dtype == "fp16":
+                                        engine_comp_dtype = "bf16"
                                     self.engine = StageExecutionEngine(
                                         stage_model=stage_model,
                                         assignment=assign,
-                                        compression_dtype=self.config.compression_dtype,
+                                        compression_dtype=engine_comp_dtype,
                                         tokenizer=tok,
                                         ngram_size=self.config.ngram_size,
                                         max_draft_tokens=self.config.max_draft_tokens,

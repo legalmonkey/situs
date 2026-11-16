@@ -1227,6 +1227,8 @@ def main():
         port=config.port,
         reload=False,
         ws_max_size=64 * 1024 * 1024,
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
     )
 
 

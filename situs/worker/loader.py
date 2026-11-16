@@ -495,6 +495,15 @@ class Int8WeightLinear(nn.Module if HAS_TORCH else object):
         return cls(weight_tensor.shape[1], weight_tensor.shape[0], q, scale, b)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        if self.out_features > 32768:
+            chunk_size = 16384
+            out_chunks = []
+            for start_idx in range(0, self.out_features, chunk_size):
+                end_idx = min(start_idx + chunk_size, self.out_features)
+                w_chunk = self.weight[start_idx:end_idx].to(dtype=x.dtype) * self.weight_scale[start_idx:end_idx].to(dtype=x.dtype)
+                b_chunk = self.bias[start_idx:end_idx].to(dtype=x.dtype) if self.bias is not None else None
+                out_chunks.append(F.linear(x, w_chunk, b_chunk))
+            return torch.cat(out_chunks, dim=-1)
         w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
         b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, w, b)
@@ -1622,9 +1631,18 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             logger.warning(f"CUDA device '{device}' requested but PyTorch CUDA runtime is not available. Safely falling back to CPU.")
             safe_device = "cpu"
         self.device = safe_device
-        self.dtype = dtype if dtype is not None else (
-            torch.float16 if (self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and "cuda" in str(self.device)) else (torch.float32 if HAS_TORCH else None)
-        )
+        if dtype is not None:
+            self.dtype = dtype
+        elif self.device != "cpu" and HAS_TORCH and torch.cuda.is_available() and "cuda" in str(self.device):
+            can_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+            if spec.get("embed_scale_sqrt") and can_bf16:
+                self.dtype = torch.bfloat16
+            elif spec.get("embed_scale_sqrt") and not can_bf16:
+                self.dtype = torch.float32
+            else:
+                self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32 if HAS_TORCH else None
         self.progressive = progressive
 
         # JIT Progressive layer readiness tracking
@@ -2168,7 +2186,14 @@ def load_hf_stage_model(
 
     if has_gguf_source and HAS_TORCH:
         if "cuda" in str(device) and torch.cuda.is_available():
-            stage_dtype = torch.float16
+            can_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+            is_gemma_family = any(g in str(arch).lower() for g in ("gemma", "gemma2", "gemma3")) or bool(spec.get("embed_scale_sqrt"))
+            if can_bf16 and (is_gemma_family or stage_dtype == torch.bfloat16):
+                stage_dtype = torch.bfloat16
+            elif is_gemma_family and not can_bf16:
+                stage_dtype = torch.float32
+            else:
+                stage_dtype = torch.float16
         else:
             stage_dtype = torch.float32
 
