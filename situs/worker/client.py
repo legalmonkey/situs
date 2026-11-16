@@ -11,7 +11,7 @@ import asyncio
 import threading
 import logging
 import argparse
-from typing import Optional
+from typing import Optional, Dict, List, Any
 import websockets
 
 from situs.config import WorkerConfig
@@ -49,7 +49,7 @@ class WorkerDaemon:
         self.engine: Optional[StageExecutionEngine] = None
         self.engine_ready_event = asyncio.Event()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.p2p_node: Optional[P2PDataChannelNode] = None
+        self.p2p_nodes: Dict[str, P2PDataChannelNode] = {}
         self.is_running = True
         self.is_connected = False
         self.is_registered = False
@@ -60,6 +60,19 @@ class WorkerDaemon:
         self._cached_hw = None
 
     @property
+    def p2p_node(self) -> Optional[P2PDataChannelNode]:
+        if not self.p2p_nodes:
+            return None
+        return next(iter(self.p2p_nodes.values()))
+
+    @p2p_node.setter
+    def p2p_node(self, val: Optional[P2PDataChannelNode]):
+        if val is None:
+            self.p2p_nodes.clear()
+        else:
+            self.p2p_nodes[val.target_worker_id] = val
+
+    @property
     def running(self) -> bool:
         return self.is_running
 
@@ -68,9 +81,16 @@ class WorkerDaemon:
         self.is_running = val
 
     def stop(self):
-        """Signals the daemon to shut down and disconnects WebSocket."""
+        """Signals the daemon to shut down and disconnects WebSocket and P2P direct channel."""
         self.is_running = False
         loop = getattr(self, "_loop", None)
+        if self.p2p_nodes and loop and loop.is_running():
+            for node in list(self.p2p_nodes.values()):
+                try:
+                    asyncio.run_coroutine_threadsafe(node.close(), loop)
+                except Exception:
+                    pass
+            self.p2p_nodes.clear()
         if self.ws and loop and loop.is_running():
             try:
                 asyncio.run_coroutine_threadsafe(self.ws.close(), loop)
@@ -102,7 +122,8 @@ class WorkerDaemon:
                 MessageType.SPECULATIVE_VERIFIED,
             ):
                 try:
-                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=60.0)
+                    eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
+                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=eng_timeout)
                 except asyncio.TimeoutError:
                     pass
 
@@ -142,6 +163,10 @@ class WorkerDaemon:
                 req_id = frame.payload.get("request_id")
                 if req_id:
                     self.engine.abort_inference(req_id)
+            elif frame.type == MessageType.INFERENCE_FINISH and self.engine:
+                req_id = frame.payload.get("request_id")
+                if req_id:
+                    self.engine.process_inference_finish(req_id)
         except Exception as e:
             logger.error(f"Error handling frame: {e}", exc_info=True)
 
@@ -149,8 +174,9 @@ class WorkerDaemon:
         """Sends frame via direct WebRTC UDP DataChannel if open, otherwise falls back to WebSocket relay."""
         frame_json = out_frame.model_dump_json()
         sent_p2p = False
-        if self.p2p_node and self.p2p_node.is_connected and out_frame.target == self.p2p_node.target_worker_id:
-            sent_p2p = self.p2p_node.send_frame(frame_json)
+        target_node = self.p2p_nodes.get(out_frame.target)
+        if target_node and target_node.is_connected:
+            sent_p2p = target_node.send_frame(frame_json)
 
         # Token emissions MUST reach Coordinator WebSocket for HTTP SSE streaming,
         # but if already delivered via direct P2P, mark target="coordinator" so the
@@ -162,14 +188,14 @@ class WorkerDaemon:
                 if self.ws:
                     try:
                         await self.ws.send(coord_frame.model_dump_json())
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to send coordinator frame: {e}")
         else:
             if self.ws:
                 try:
                     await self.ws.send(frame_json)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to send frame: {e}")
 
     def query_gpu_info(self):
         try:
@@ -194,14 +220,14 @@ class WorkerDaemon:
             dev_name, tot_b, free_b, dev_type, used_b = self._cached_hw
 
             if dev_type == "cuda":
-                live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
                 if HAS_TORCH and torch.cuda.is_available():
                     try:
+                        free_b, total_b = torch.cuda.mem_get_info(dev_idx)
                         alloc_b = torch.cuda.memory_allocated(dev_idx)
-                        if alloc_b > live_used:
-                            live_used = alloc_b
+                        return dev_name, total_b, free_b, "cuda", alloc_b
                     except Exception:
                         pass
+                live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
                 if live_tot > 0:
                     return dev_name, live_tot, live_free, "cuda", live_used
             return dev_name, tot_b, free_b, dev_type, used_b
@@ -282,7 +308,10 @@ class WorkerDaemon:
 
         import inspect
         sig_params = inspect.signature(websockets.connect).parameters
-        connect_kwargs = {"ping_interval": 20, "ping_timeout": 120}
+        # Disable low-level RFC 6455 transport pings because reverse proxies & Cloudflare tunnels
+        # drop or do not return WebSocket pong frames, causing false ping timeouts.
+        # Situs relies on high-frequency application-level HEARTBEAT/HEARTBEAT_ACK frames (1.0s interval).
+        connect_kwargs = {"ping_interval": None, "ping_timeout": None}
         if "max_size" in sig_params:
             connect_kwargs["max_size"] = 64 * 1024 * 1024
         if getattr(self.config, "auth_token", None):
@@ -296,13 +325,18 @@ class WorkerDaemon:
                 connect_kwargs["extra_headers"] = dict(auth_headers)
 
         retry_count = 0
-        max_connect_retries = 3
+        has_connected_once = False
         while self.is_running:
             try:
-                async for websocket in websockets.connect(ws_url, **connect_kwargs):
+                curr_ws_url = ws_url
+                if retry_count > 0 or has_connected_once:
+                    sep = "&" if "?" in curr_ws_url else "?"
+                    curr_ws_url = f"{curr_ws_url}{sep}reconnect=true"
+                async for websocket in websockets.connect(curr_ws_url, **connect_kwargs):
                     if not self.is_running:
                         break
                     retry_count = 0
+                    has_connected_once = True
                     self.ws = websocket
                     self.is_connected = True
                     try:
@@ -409,6 +443,14 @@ class WorkerDaemon:
                                         assignment=assign,
                                         compression_dtype=self.config.compression_dtype,
                                         tokenizer=tok,
+                                        ngram_size=self.config.ngram_size,
+                                        max_draft_tokens=self.config.max_draft_tokens,
+                                        replay_capacity=self.config.replay_buffer_capacity,
+                                        safety_headroom_fraction=self.config.safety_headroom_fraction,
+                                    )
+                                    logger.info(
+                                        f"Pipeline stage [{assign.layer_start}..{assign.layer_end}) of {assign.model_name} "
+                                        f"pre-warmed and allocated in GPU VRAM (instant zero-latency readiness)."
                                     )
 
                                     try:
@@ -416,25 +458,34 @@ class WorkerDaemon:
                                     except Exception:
                                         pass
 
-                                    # Reset any stale P2P peer connection before opening channel to current neighbor
-                                    if self.p2p_node:
+                                    # Reset any stale P2P peer connections before establishing new pipeline channels
+                                    for peer_id, node in list(self.p2p_nodes.items()):
                                         try:
-                                            await self.p2p_node.close()
+                                            await node.close()
                                         except Exception:
                                             pass
-                                        self.p2p_node = None
+                                    self.p2p_nodes.clear()
 
-                                    # Initialize WebRTC direct P2P connection to partner worker
-                                    target_id = assign.next_worker_id or assign.prev_worker_id
-                                    if target_id:
-                                        self.p2p_node = P2PDataChannelNode(
+                                    # Identify all partner workers in the pipeline topology
+                                    peers_to_connect = set()
+                                    if assign.next_worker_id and assign.next_worker_id != self.worker_id:
+                                        peers_to_connect.add(assign.next_worker_id)
+                                    if assign.prev_worker_id and assign.prev_worker_id != self.worker_id:
+                                        peers_to_connect.add(assign.prev_worker_id)
+                                    if getattr(assign, "first_worker_id", None) and assign.first_worker_id != self.worker_id:
+                                        peers_to_connect.add(assign.first_worker_id)
+
+                                    for peer_id in peers_to_connect:
+                                        p_node = P2PDataChannelNode(
                                             worker_id=self.worker_id,
-                                            target_worker_id=target_id,
+                                            target_worker_id=peer_id,
                                             signaling_send_fn=self.send_signaling_frame,
                                             on_message_fn=self.on_p2p_message,
                                         )
-                                        # First stage initiates the WebRTC offer
-                                        asyncio.create_task(self.p2p_node.initialize(is_initiator=assign.is_first_stage))
+                                        self.p2p_nodes[peer_id] = p_node
+                                        # Deterministic initiator: lower worker_id initiates WebRTC offer
+                                        is_initiator = self.worker_id < peer_id
+                                        asyncio.create_task(p_node.initialize(is_initiator=is_initiator))
                                 except Exception as e:
                                     if (not self.is_running) or ("cannot schedule new futures after shutdown" in str(e)):
                                         pass
@@ -446,16 +497,28 @@ class WorkerDaemon:
                                     self.engine_ready_event.set()
     
                             elif frame.type in (MessageType.ICE_OFFER, MessageType.ICE_ANSWER):
-                                if self.p2p_node:
-                                    src_peer = frame.payload.get("source_worker") if isinstance(frame.payload, dict) else None
-                                    if src_peer is None or src_peer == self.p2p_node.target_worker_id:
-                                        await self.p2p_node.handle_signaling_message(frame.payload)
+                                src_peer = frame.payload.get("source_worker") if isinstance(frame.payload, dict) else None
+                                if src_peer:
+                                    if src_peer not in self.p2p_nodes:
+                                        p_node = P2PDataChannelNode(
+                                            worker_id=self.worker_id,
+                                            target_worker_id=src_peer,
+                                            signaling_send_fn=self.send_signaling_frame,
+                                            on_message_fn=self.on_p2p_message,
+                                        )
+                                        self.p2p_nodes[src_peer] = p_node
+                                        asyncio.create_task(p_node.initialize(is_initiator=False))
+                                    await self.p2p_nodes[src_peer].handle_signaling_message(frame.payload)
+                                elif self.p2p_nodes:
+                                    first_node = next(iter(self.p2p_nodes.values()))
+                                    await first_node.handle_signaling_message(frame.payload)
     
                             elif frame.type == MessageType.INFERENCE_START:
+                                eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
                                 try:
-                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=120.0)
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=eng_timeout)
                                 except asyncio.TimeoutError:
-                                    logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within 120s")
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within {eng_timeout}s")
                                 start_msg = InferenceStart.model_validate(frame.payload)
                                 if not self.engine:
                                     await self._emit_inference_error(
@@ -472,10 +535,11 @@ class WorkerDaemon:
                                     self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
     
                             elif frame.type == MessageType.FORWARD_ACTIVATION:
+                                eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
                                 try:
-                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=120.0)
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=eng_timeout)
                                 except asyncio.TimeoutError:
-                                    logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within 120s")
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for FORWARD_ACTIVATION within {eng_timeout}s")
                                 act_frame = ForwardActivation.model_validate(frame.payload)
                                 if not self.engine:
                                     await self._emit_inference_error(
@@ -520,38 +584,58 @@ class WorkerDaemon:
                                     req_id = frame.payload.get("request_id")
                                     if req_id:
                                         self.engine.abort_inference(req_id)
+
+                            elif frame.type == MessageType.INFERENCE_FINISH:
+                                if self.engine:
+                                    req_id = frame.payload.get("request_id")
+                                    if req_id:
+                                        self.engine.process_inference_finish(req_id)
+
+                            elif frame.type == MessageType.WORKER_REMOVED:
+                                logger.info(f"Worker '{self.worker_id}' received WORKER_REMOVED from coordinator. Terminating daemon cleanly.")
+                                self.stop()
+                                break
     
                     except websockets.ConnectionClosed as e:
                         self.is_connected = False
-                        self.last_error = getattr(e, 'reason', str(e))
+                        reason_str = getattr(e, 'reason', str(e))
+                        self.last_error = reason_str
                         if getattr(e, "code", None) == 1008:
-                            logger.error(f"Registration rejected by coordinator policy (1008): {getattr(e, 'reason', e)}")
-                            await asyncio.sleep(5.0)
+                            logger.error(f"Registration rejected by coordinator policy (1008): {reason_str}")
+                            self.connection_error = f"Policy rejection (1008): {reason_str}"
+                            self.is_running = False
+                            break
                         else:
-                            logger.warning(f"Connection closed ({e}). Reconnecting in 3 seconds...")
-                            await asyncio.sleep(3.0)
+                            logger.warning(f"Connection closed ({e}). Reconnecting in 1.5 seconds...")
+                            await asyncio.sleep(1.5)
                     except Exception as e:
                         self.is_connected = False
                         self.last_error = str(e)
                         logger.error(f"Worker runtime exception: {e}", exc_info=True)
-                        await asyncio.sleep(3.0)
+                        await asyncio.sleep(2.0)
                     finally:
                         self.is_connected = False
                         if 'hb_task' in locals() and not hb_task.done():
                             hb_task.cancel()
-                    # If connection closed normally and self.is_running is False
-                    break
+                    if not self.is_running:
+                        break
             except Exception as conn_err:
                 self.connection_error = str(conn_err)
                 self.last_error = str(conn_err)
                 if not self.is_running:
                     break
                 retry_count += 1
-                if retry_count >= max_connect_retries:
-                    logger.warning(f"Could not connect to Coordinator at {ws_url} after {retry_count} attempts: {conn_err}")
-                    break
-                logger.info(f"Connection attempt {retry_count}/{max_connect_retries} to {ws_url} failed ({conn_err}). Retrying in 2.0s...")
-                await asyncio.sleep(2.0)
+                wait_time = min(5.0, 1.0 + (retry_count * 0.5))
+                logger.info(f"Connection attempt {retry_count} to {ws_url} failed ({conn_err}). Retrying in {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+        self.is_running = False
+        self.is_connected = False
+        for peer_id, node in list(self.p2p_nodes.items()):
+            try:
+                await node.close()
+            except Exception:
+                pass
+        self.p2p_nodes.clear()
 
 
 def main():
@@ -560,7 +644,7 @@ def main():
     parser.add_argument("--id", default=None, help="Worker ID (auto-generated if omitted)")
     parser.add_argument("--device", default="cuda:0" if HAS_TORCH and torch.cuda.is_available() else "cpu", help="PyTorch compute device")
     parser.add_argument("--model", default="gemma3:4b", help="Model identifier")
-    parser.add_argument("--compression", default="int8", choices=["none", "fp16", "int8"], help="Activation compression dtype")
+    parser.add_argument("--compression", default="fp16", choices=["none", "fp16", "bf16", "int8"], help="Activation compression dtype")
     parser.add_argument("--token", "--auth-token", default=os.getenv("SITUS_WORKER_AUTH_TOKEN"), help="Worker authentication token")
     args = parser.parse_args()
 

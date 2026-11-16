@@ -93,7 +93,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.application import Application
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign, FloatContainer, Float, ConditionalContainer, DynamicContainer
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.controls import FormattedTextControl, UIContent
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.dimension import D
@@ -112,6 +112,17 @@ class ScrollableHistoryControl(FormattedTextControl):
         super().__init__(*args, **kwargs)
         self.on_scroll_up: Optional[Callable[[], None]] = None
         self.on_scroll_down: Optional[Callable[[], None]] = None
+
+    def create_content(self, width: int, height: Optional[int]) -> UIContent:
+        content = super().create_content(width, height)
+        # Prevent prompt_toolkit "Exception list index out of range" crash when history updates
+        if content.line_count <= 0:
+            content.cursor_position = Point(0, 0)
+        elif content.cursor_position.y >= content.line_count:
+            content.cursor_position = Point(0, max(0, content.line_count - 1))
+        elif content.cursor_position.y < 0:
+            content.cursor_position = Point(0, 0)
+        return content
 
     def mouse_handler(self, mouse_event: MouseEvent) -> Any:
         res = super().mouse_handler(mouse_event)
@@ -215,7 +226,7 @@ def make_progress_bar(percent: float, width: int = 22) -> str:
     return f"[{'█' * filled_len}{'░' * empty_len}]"
 
 
-DEFAULT_MODEL = "gemma3:4b"
+DEFAULT_MODEL = os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
 
 # Curated 6GB to 16GB models - The optimal sweet spot for distributed multi-node inference.
 # Individual consumer GPUs cannot fit these models alone, but pooling 2+ nodes fits them with high performance.
@@ -700,6 +711,35 @@ def start_in_process_coordinator(host: str = "0.0.0.0", port: int = 8000) -> Tup
         return False, f"Failed to start Coordinator: {e}"
 
 
+def stop_in_process_coordinator():
+    """Signals the in-process coordinator uvicorn server to cleanly terminate."""
+    global _bg_coordinator_server, _bg_coordinator_thread
+    if _bg_coordinator_server is not None:
+        try:
+            _bg_coordinator_server.should_exit = True
+        except Exception:
+            pass
+        _bg_coordinator_server = None
+    if _bg_coordinator_thread is not None and _bg_coordinator_thread.is_alive():
+        try:
+            _bg_coordinator_thread.join(timeout=1.5)
+        except Exception:
+            pass
+        _bg_coordinator_thread = None
+
+
+def stop_all_in_process_workers():
+    """Stops all background in-process worker daemons and releases event loops and threads."""
+    global _bg_workers
+    for w in list(_bg_workers):
+        try:
+            if hasattr(w, "stop"):
+                w.stop()
+        except Exception:
+            pass
+    _bg_workers.clear()
+
+
 def detect_hardware_gpu(requested_device: Optional[str] = "auto") -> Tuple[str, int, int, str]:
     """Fast, memory-efficient physical GPU/CPU hardware detection for TUI status and telemetry."""
     from situs.hardware import query_nvidia_smi, query_windows_cim_gpus, detect_hardware
@@ -1068,7 +1108,7 @@ def start_in_process_worker(
             worker_id=w_id,
             device=dev,
             model_name=model,
-            compression_dtype="int8",
+            compression_dtype="fp16",
             enable_speculative=True,
             p2p_direct_enabled=True,
         )
@@ -1078,7 +1118,25 @@ def start_in_process_worker(
         def runner():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(daemon.run())
+            try:
+                loop.run_until_complete(daemon.run())
+            except Exception:
+                pass
+            finally:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    if hasattr(loop, "shutdown_default_executor"):
+                        loop.run_until_complete(loop.shutdown_default_executor())
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
 
         t = threading.Thread(target=runner, daemon=True)
         t.start()
@@ -1703,14 +1761,15 @@ def execute_slash_command(
 
     elif root_cmd in ("/partition", "partition"):
         coord_url = session_state.get("coordinator_url", coordinator_url)
-        layers = int(parts[1]) if len(parts) > 1 else 32
+        model_name = session_state.get("model", model)
+        layers_param = f"&total_layers={int(parts[1])}" if len(parts) > 1 else ""
         try:
             with httpx.Client(timeout=10.0) as client:
-                resp = client.post(f"{coord_url}/admin/partition?model_name={model}&total_layers={layers}&codec=zstd")
+                resp = client.post(f"{coord_url}/admin/partition?model_name={model_name}{layers_param}&codec=zstd")
                 if resp.status_code == 200:
                     data = resp.json()
                     partitions = data.get("partitions") or data.get("partition_plan") or []
-                    emit(f"[bold green]Successfully partitioned {model} across {len(partitions)} workers![/bold green]", "Partition")
+                    emit(f"[bold green]Successfully partitioned {model_name} across {len(partitions)} workers![/bold green]", "Partition")
                 else:
                     emit(f"[bold red]Partition error:[/bold red] {resp.text}", "Partition Error")
         except Exception as e:
@@ -1779,7 +1838,11 @@ def execute_slash_command(
 
     elif root_cmd in ("/network", "network", "/interfaces", "interfaces"):
         ifaces = get_all_interface_ips()
-        coord_status = "ONLINE (Port 8000)" if is_port_open("127.0.0.1", 8000) else "OFFLINE"
+        coord_url = session_state.get("coordinator_url", coordinator_url)
+        parsed_c = urlparse(coord_url if "://" in coord_url else f"http://{coord_url}")
+        target_port = parsed_c.port or 8000
+        target_host = parsed_c.hostname or "127.0.0.1"
+        coord_status = f"ONLINE (Port {target_port})" if is_port_open(target_host, target_port) else "OFFLINE"
         table = Table(title="Network Interfaces & Cluster Reachability", border_style="#ff2a85", title_style="bold #ff2a85")
         table.add_column("Interface", style="bold white", width=24)
         table.add_column("IPv4 Address", style="bold green", width=18)
@@ -2492,7 +2555,7 @@ def run_opencode_tui(
 
     def get_cursor_position():
         frags = get_history_fragments()
-        cur_ver = len(history_entries)
+        cur_ver = (len(history_entries), len(history_entries[-1][1]) if history_entries else 0)
         if cached_history_ver[0] != cur_ver:
             lines = list(split_lines(frags))
             cached_history_lines[0] = len(lines)
@@ -2514,7 +2577,7 @@ def run_opencode_tui(
         # Smooth upward scrolling: shifts top visible line up by scroll_offset[0]
         max_scroll = max(0, total_lines - win_h + 1)
         eff_scroll = min(scroll_offset[0], max_scroll)
-        target_top = max(0, total_lines - win_h - eff_scroll)
+        target_top = max(0, min(total_lines - win_h - eff_scroll, last_idx))
         return Point(0, target_top)
 
     def scroll_history_up(amount: int = 4):
@@ -3881,6 +3944,8 @@ def run_opencode_tui(
 
 def _restore_terminal_modes():
     restore_terminal_colors()
+    stop_in_process_coordinator()
+    stop_all_in_process_workers()
 
 
 import atexit

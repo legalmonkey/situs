@@ -10,6 +10,7 @@ immediately upon arrival while subsequent layers stream concurrently in the back
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import math
 import os
@@ -149,14 +150,14 @@ class ProgressiveJITStreamer:
 
     def __init__(
         self,
-        model_name: str = "llama-3.1:8b-instruct-q8_0",
+        model_name: Optional[str] = None,
         chunk_size: int = 64 * 1024,  # 64 KB per chunk
         cache_dir: Optional[pathlib.Path] = None,
         codec: str = "zstd",
         enable_wire_compression: bool = False,
         allow_synthetic: bool = False,
     ):
-        self.model_name = model_name
+        self.model_name = model_name or os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
         self.chunk_size = chunk_size
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.codec = codec

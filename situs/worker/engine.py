@@ -69,20 +69,30 @@ class ActivationReplayRingBuffer:
                 return p_bytes, meta
         return None
 
+    def clear(self, request_id: Optional[str] = None) -> None:
+        if request_id is None:
+            self.buffer.clear()
+        else:
+            self.buffer = [item for item in self.buffer if item[0] != request_id]
+
 
 class StageExecutionEngine:
     def __init__(
         self,
         stage_model: DistributedStageModel,
         assignment: AssignLayers,
-        compression_dtype: str = "int8",
+        compression_dtype: str = "fp16",
         tokenizer=None,
+        ngram_size: int = 2,
+        max_draft_tokens: int = 4,
+        replay_capacity: int = 4,
+        safety_headroom_fraction: float = 0.10,
     ):
         self.stage_model = stage_model
         self.assignment = assignment
         self.compression_dtype = compression_dtype
         self.sampler = TokenSampler(tokenizer=tokenizer)
-        self.prompt_drafter = PromptLookupDrafter(ngram_size=2, max_draft_tokens=4)
+        self.prompt_drafter = PromptLookupDrafter(ngram_size=ngram_size, max_draft_tokens=max_draft_tokens)
         self.verifier = SpeculativeVerifier(self.sampler)
         # Session KV cache store: request_id -> list of layer KV states
         self.session_kv_caches: Dict[str, List[Any]] = {}
@@ -97,10 +107,31 @@ class StageExecutionEngine:
 
         # State-of-the-art memory budgeting, cache isolation, and fault recovery
         dev = getattr(stage_model, "device", "cpu")
-        self.memory_manager = GPUMemoryManager(total_vram_bytes=16 * 1024**3, safety_headroom_fraction=0.10, device=dev)
+        try:
+            if str(dev).strip().lower() == "cpu":
+                from situs.hardware import get_system_ram_and_cpu
+                tot_ram, _, _ = get_system_ram_and_cpu()
+                total_vram_b = tot_ram if (tot_ram and tot_ram > 0) else (16 * 1024**3)
+            else:
+                from situs.hardware import get_live_gpu_vram
+                tot_vram, _, free_vram = get_live_gpu_vram()
+                total_vram_b = tot_vram if (tot_vram and tot_vram > 0) else (16 * 1024**3)
+        except Exception:
+            total_vram_b = 16 * 1024**3
+        self.memory_manager = GPUMemoryManager(
+            total_vram_bytes=total_vram_b,
+            safety_headroom_fraction=safety_headroom_fraction,
+            device=dev,
+        )
+        if stage_model is not None and hasattr(stage_model, "parameters"):
+            try:
+                weight_bytes = sum(p.numel() * p.element_size() for p in stage_model.parameters())
+                self.memory_manager.set_weights_footprint(weight_bytes)
+            except Exception:
+                pass
         self.kv_cache_manager = RequestScopedKVCache(memory_manager=self.memory_manager)
         self.cancellation_tokens = CancellationTokenRegistry()
-        self.replay_buffer = ActivationReplayRingBuffer(capacity=4)
+        self.replay_buffer = ActivationReplayRingBuffer(capacity=replay_capacity)
 
     def is_first_stage(self) -> bool:
         return self.assignment.is_first_stage
@@ -210,8 +241,13 @@ class StageExecutionEngine:
         self.session_token_histories[request_id] = list(start_msg.input_ids)
 
         try:
-            # Memory check & reservation
-            est_bytes = len(start_msg.input_ids) * 1024 * 8
+            # Memory check & reservation based on model KV architecture
+            n_layers = max(1, self.assignment.layer_end - self.assignment.layer_start)
+            n_kv_heads = getattr(self.stage_model, "num_kv_heads", getattr(self.stage_model, "n_local_kv_heads", 4))
+            h_dim = getattr(self.stage_model, "head_dim", 64)
+            max_new = (getattr(start_msg, "max_new_tokens", 2048) or 2048) if start_msg else 2048
+            expected_total_seq = len(start_msg.input_ids) + max_new
+            est_bytes = 2 * n_layers * n_kv_heads * h_dim * expected_total_seq * 2
             self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
 
             input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
@@ -295,6 +331,19 @@ class StageExecutionEngine:
                 device=self.stage_model.device,
                 dtype=act_dtype,
             )
+            if request_id not in self.session_kv_caches and request_id not in self.finished_sessions:
+                n_layers = max(1, self.assignment.layer_end - self.assignment.layer_start)
+                n_kv_heads = getattr(self.stage_model, "num_kv_heads", getattr(self.stage_model, "n_local_kv_heads", 4))
+                h_dim = getattr(self.stage_model, "head_dim", 64)
+                seq_len = act_frame.shape[1] if (len(act_frame.shape) > 1) else 1
+                cfg_session = self.session_configs.get(request_id)
+                max_new = (cfg_session.max_new_tokens if (cfg_session and cfg_session.max_new_tokens is not None) else 2048)
+                est_bytes = 2 * n_layers * n_kv_heads * h_dim * (seq_len + max_new) * 2
+                try:
+                    self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
+                except Exception as alloc_err:
+                    logger.debug(f"kv_cache_manager allocation note for {request_id}: {alloc_err}")
+
             past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
             out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
             self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
@@ -357,10 +406,12 @@ class StageExecutionEngine:
                 else:
                     last_logits = out
 
+                top_k = getattr(cfg, "top_k", 50) if cfg else 50
                 token_id = self.sampler.sample_next_token(
                     last_logits,
                     temperature=temperature,
                     top_p=top_p,
+                    top_k=top_k,
                     seed=seed,
                     step_index=step_idx,
                 )
@@ -382,11 +433,8 @@ class StageExecutionEngine:
                 finish_reason = "stop" if is_eos else ("length" if is_finished else None)
 
                 if is_finished:
-                    # Clean up session KV cache
-                    self.kv_cache_manager.release_request(request_id)
-                    self.session_kv_caches.pop(request_id, None)
-                    self.session_configs.pop(request_id, None)
-                    self.finished_sessions.add(request_id)
+                    # Clean up session KV cache and state
+                    self.process_inference_finish(request_id)
 
                 next_token = NextToken(
                     request_id=request_id,
@@ -493,7 +541,8 @@ class StageExecutionEngine:
             accepted_tokens.append(correction)
         elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
             target_logits = logits[0, -1, :] if logits.dim() == 3 else (logits[-1, :] if logits.dim() == 2 else logits)
-            sampled_tok = self.sampler.sample_next_token(target_logits, temperature=temp, top_p=top_p)
+            top_k = getattr(cfg, "top_k", 50) if cfg else 50
+            sampled_tok = self.sampler.sample_next_token(target_logits, temperature=temp, top_p=top_p, top_k=top_k)
             accepted_tokens.append(sampled_tok)
 
         eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
@@ -521,10 +570,7 @@ class StageExecutionEngine:
         is_finished = is_eos or (new_step_idx >= max_tokens)
 
         if is_finished:
-            self.kv_cache_manager.release_request(request_id)
-            self.session_kv_caches.pop(request_id, None)
-            self.session_configs.pop(request_id, None)
-            self.finished_sessions.add(request_id)
+            self.process_inference_finish(request_id)
         elif rejected_draft_count > 0:
             self._trim_kv_caches(request_id, rejected_draft_count)
 
@@ -540,52 +586,52 @@ class StageExecutionEngine:
             is_experimental=False,
         )
 
-        target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
+        # In a multi-worker pipeline, route verification upstream via prev_worker_id so all intermediate stages trim rejected tokens
+        target_upstream = self.assignment.prev_worker_id or getattr(self.assignment, "first_worker_id", None)
         return ProtocolFrame(
             type=MessageType.SPECULATIVE_VERIFIED,
             source=self.assignment.worker_id,
-            target=target_first,
+            target=target_upstream,
             payload=verified.model_dump(),
         )
 
     def process_speculative_verified(self, verified_frame: SpeculativeVerified) -> Optional[ProtocolFrame]:
         """
-        Invoked on Worker A when downstream stage accepts speculative tokens.
+        Invoked on Worker A (and intermediate stages) when downstream stage accepts speculative tokens.
         Appends verified tokens to history and triggers the next draft/decode step.
         """
-        if not self.is_first_stage():
-            first_target = getattr(self.assignment, "first_worker_id", None)
-            if first_target and first_target != self.assignment.worker_id:
-                return ProtocolFrame(
-                    type=MessageType.SPECULATIVE_VERIFIED,
-                    source=self.assignment.worker_id,
-                    target=first_target,
-                    payload=verified_frame.model_dump(),
-                )
-            return None
-
         request_id = verified_frame.request_id
         if request_id in self.finished_sessions:
             return None
 
+        # Discard rejected speculative draft tokens from all layer KV caches on this stage
+        rej_cnt = getattr(verified_frame, "rejected_draft_count", 0) or 0
+        if rej_cnt > 0:
+            self._trim_kv_caches(request_id, rej_cnt)
+
+        if not self.is_first_stage():
+            if verified_frame.is_finished:
+                self.process_inference_finish(request_id)
+            target_upstream = self.assignment.prev_worker_id or getattr(self.assignment, "first_worker_id", None)
+            if target_upstream and target_upstream != self.assignment.worker_id:
+                return ProtocolFrame(
+                    type=MessageType.SPECULATIVE_VERIFIED,
+                    source=self.assignment.worker_id,
+                    target=target_upstream,
+                    payload=verified_frame.model_dump(),
+                )
+            return None
+
         if verified_frame.is_finished:
-            self.kv_cache_manager.release_request(request_id)
-            self.session_kv_caches.pop(request_id, None)
-            self.session_configs.pop(request_id, None)
-            self.session_token_histories.pop(request_id, None)
-            self.finished_sessions.add(request_id)
+            self.process_inference_finish(request_id)
             return None
 
         if not verified_frame.accepted_tokens:
             return None
 
-        rej_cnt = getattr(verified_frame, "rejected_draft_count", 0) or 0
-        if rej_cnt > 0:
-            self._trim_kv_caches(request_id, rej_cnt)
-
-        # Append accepted tokens to history
+        # Append accepted prefix tokens to history (last accepted token will be appended by process_next_token)
         if request_id in self.session_token_histories:
-            self.session_token_histories[request_id].extend(verified_frame.accepted_tokens)
+            self.session_token_histories[request_id].extend(verified_frame.accepted_tokens[:-1])
 
         # Take last accepted token to continue decoding
         last_token = verified_frame.accepted_tokens[-1]
@@ -710,17 +756,23 @@ class StageExecutionEngine:
                 payload={"request_id": request_id, "error": str(e)},
             )
 
-    def abort_inference(self, request_id: str):
-        """Cancels an active session and cleans up session KV cache and history."""
-        self.cancellation_tokens.cancel(request_id)
+    def process_inference_finish(self, request_id: str) -> None:
+        """Frees KV cache and session state when an inference request completes or aborts."""
         self.kv_cache_manager.release_request(request_id)
         self.session_kv_caches.pop(request_id, None)
         self.session_configs.pop(request_id, None)
         self.session_token_histories.pop(request_id, None)
+        self.replay_buffer.clear(request_id)
         self.finished_sessions.add(request_id)
         if HAS_TORCH and torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+        logger.debug(f"Freed session {request_id} KV cache and state.")
+
+    def abort_inference(self, request_id: str):
+        """Cancels an active session and cleans up session KV cache and history."""
+        self.cancellation_tokens.cancel(request_id)
+        self.process_inference_finish(request_id)
         logger.info(f"Aborted session {request_id} and cleared session state.")

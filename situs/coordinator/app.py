@@ -174,10 +174,11 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = "gemma3:4b"
+    model: Optional[str] = None
     messages: List[ChatMessage] = Field(..., min_length=1)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: Optional[int] = Field(default=50, ge=0, le=1000)
     max_tokens: Optional[int] = Field(default=2048, ge=0, le=32768)
     seed: Optional[int] = None
     stream: Optional[bool] = False
@@ -192,23 +193,40 @@ async def rebalance_and_assign_layers(
     total_layers: Optional[int] = None,
     progressive: bool = False,
     codec: str = "zstd",
+    wait_for_in_flight: bool = True,
 ) -> List[AssignLayers]:
     """
     Rebalances and partitions the active model across all currently connected alive workers,
     and transmits verified ASSIGN_LAYERS protocol frames to each worker stage.
     """
+    if wait_for_in_flight and relay.response_streams:
+        logger.info(
+            f"rebalance_and_assign_layers deferred: {len(relay.response_streams)} active request stream(s) in flight. "
+            "Awaiting stream completion before repartitioning..."
+        )
+        wait_cycles = 0
+        while relay.response_streams and wait_cycles < 60:
+            await asyncio.sleep(0.1)
+            wait_cycles += 1
+
     alive = registry.get_alive_workers()
     if not alive:
         logger.info("rebalance_and_assign_layers called with no alive workers.")
         return []
 
-    target = model_name or registry.active_model or "gemma3:4b"
-    try:
-        meta = resolve_model_metadata(target)
-        resolved_layers = total_layers if (total_layers is not None and total_layers > 0) else meta.get("total_layers", 28)
-    except Exception as e:
-        logger.warning(f"Could not resolve metadata for '{target}': {e}. Using default 28 layers.")
-        resolved_layers = total_layers if (total_layers is not None and total_layers > 0) else 28
+    target = model_name or registry.active_model or config.default_model
+    if total_layers is not None and total_layers > 0:
+        resolved_layers = total_layers
+    else:
+        try:
+            meta = resolve_model_metadata(target)
+            resolved_layers = int(meta["total_layers"])
+        except Exception as e:
+            logger.error(f"Cannot resolve verified metadata for model '{target}': {e}")
+            raise ValueError(
+                f"Cannot partition model '{target}': total_layers could not be resolved from model metadata ({e}). "
+                "Silent fallback default layers have been removed to prevent pipeline stage corruption."
+            )
 
     assignments = registry.partition_model(
         target, total_layers=resolved_layers, progressive=progressive, codec=codec
@@ -263,10 +281,21 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
         return
 
     # 3. Prevent usurping an already-connected worker's identity
+    is_reconnect = websocket.query_params.get("reconnect") == "true" or websocket.headers.get("x-worker-reconnect") == "true"
     if relay.is_worker_connected(worker_id):
-        logger.warning(f"Rejected duplicate connection attempt for already connected worker_id: {worker_id}")
-        await websocket.close(code=1008, reason=f"Worker ID '{worker_id}' is already actively connected")
-        return
+        if is_reconnect:
+            logger.info(f"Worker '{worker_id}' reconnecting; replacing stale connection.")
+            old_ws = relay.active_connections.get(worker_id)
+            if old_ws:
+                try:
+                    await old_ws.close(code=1000, reason="Replaced by new connection")
+                except Exception:
+                    pass
+            relay.disconnect_worker(worker_id, emit_error=False)
+        else:
+            logger.warning(f"Rejected duplicate connection attempt for already connected worker_id: {worker_id}")
+            await websocket.close(code=1008, reason=f"Worker ID '{worker_id}' is already actively connected")
+            return
 
     await relay.connect_worker(worker_id, websocket)
     is_registered = False
@@ -302,7 +331,7 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
 
                 # Rebalance and assign pipeline stages across all alive workers immediately
                 try:
-                    target_model = registry.active_model or (reg.supported_models[0] if reg.supported_models else "gemma3:4b")
+                    target_model = registry.active_model or (reg.supported_models[0] if reg.supported_models else config.default_model)
                     await rebalance_and_assign_layers(target_model)
                     logger.info(f"Rebalanced pipeline across {len(registry.get_alive_workers())} worker(s) on registration of '{worker_id}'")
                 except Exception as e:
@@ -372,7 +401,7 @@ async def worker_websocket_alias(websocket: WebSocket):
 async def cluster_status():
     alive = registry.get_alive_workers()
     pipeline = registry.get_pipeline_order()
-    curr_model = registry.active_model or "gemma3:4b"
+    curr_model = registry.active_model or config.default_model
     total_vram_b = sum(w.total_vram_bytes for w in alive)
     free_vram_b = sum(w.free_vram_bytes for w in alive)
     used_vram_b = sum(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) for w in alive)
@@ -417,7 +446,7 @@ async def cluster_status():
 @app.post("/admin/partition")
 async def trigger_partition(
     request: Request,
-    model_name: str = "llama-3.2-1b",
+    model_name: Optional[str] = None,
     total_layers: Optional[int] = None,
     progressive: bool = False,
     codec: str = "zstd",
@@ -426,8 +455,9 @@ async def trigger_partition(
     if not registry.get_alive_workers():
         raise HTTPException(status_code=400, detail="Cannot partition cluster: no alive workers connected.")
     try:
+        target_model = model_name or registry.active_model or getattr(config, "default_model", "gemma3:4b")
         assignments = await rebalance_and_assign_layers(
-            model_name=model_name, total_layers=total_layers, progressive=progressive, codec=codec
+            model_name=target_model, total_layers=total_layers, progressive=progressive, codec=codec
         )
         return {"status": "success", "partitions": [a.model_dump() for a in assignments]}
     except Exception as e:
@@ -435,11 +465,12 @@ async def trigger_partition(
 
 
 @app.post("/admin/pull")
-async def trigger_pull(request: Request, model_name: str = "gemma3:4b"):
+async def trigger_pull(request: Request, model_name: Optional[str] = None):
     """Streams live model pull progress events from online server via SSE."""
     verify_admin_key(request)
+    target_pull_model = model_name or registry.active_model or config.default_model
     from situs.inference_backend import stream_pull_model, normalize_ollama_model
-    canonical = normalize_ollama_model(model_name)
+    canonical = normalize_ollama_model(target_pull_model)
 
     async def pull_events():
         yield ": connected\n\n"
@@ -596,7 +627,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     else:
         await sem.acquire()
 
-    target_model = req.model or registry.active_model or "gemma3:4b"
+    target_model = req.model or registry.active_model or config.default_model
 
     # Check worker cluster readiness
     pipeline = registry.get_pipeline_order()
@@ -615,6 +646,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         normalize_ollama_model,
         ensure_ollama_model,
         ensure_ollama_running,
+        get_ollama_endpoints,
     )
     model_is_local = is_model_downloaded(target_model)
 
@@ -709,30 +741,32 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     yield "data: [DONE]\n\n"
                     return
 
-                # Single-node GPU acceleration path: when 1 worker or local node is active,
-                # or when model architecture requires local engine (e.g. Gemma3), use direct CUDA streaming via Ollama.
+                # Fallback for unsupported architectures: attempt direct streaming via Ollama.
+                # When architecture is supported, execution proceeds through the distributed worker pipeline.
                 from situs.worker.loader import is_architecture_supported
                 meta = resolve_model_metadata(target_model)
                 arch = meta.get("architecture") or meta.get("model_type")
                 arch_supported = is_architecture_supported(arch)
 
-                if len(pipeline) <= 1 or not arch_supported:
+                if not arch_supported:
                     canonical = normalize_ollama_model(target_model)
                     ensure_ollama_running()
+                    direct_success = False
                     try:
                         async with httpx.AsyncClient(timeout=180.0) as client:
                             gen_payload = {
                                 "model": canonical,
-                                "prompt": prompt,
+                                "prompt": pipeline_prompt,
                                 "stream": True,
                                 "options": {
-                                    "num_predict": req.max_tokens if req.max_tokens is not None else 512,
+                                    "num_predict": req.max_tokens if req.max_tokens is not None else 2048,
                                     "temperature": req.temperature if req.temperature is not None else 0.7,
                                     "top_p": req.top_p if req.top_p is not None else 0.9,
                                 },
                             }
-                            from situs.inference_backend import OLLAMA_ENDPOINTS
-                            for ep in OLLAMA_ENDPOINTS:
+                            from situs.inference_backend import get_ollama_endpoints
+                            endpoints = get_ollama_endpoints()
+                            for ep in endpoints:
                                 try:
                                     async with client.stream("POST", f"{ep}/api/generate", json=gen_payload) as gen_resp:
                                         if gen_resp.status_code == 200:
@@ -766,11 +800,18 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                                         break
                                                 except Exception:
                                                     pass
+                                            direct_success = True
                                             return
                                 except Exception:
                                     continue
                     except Exception as e:
-                        logger.warning(f"Single-node direct GPU inference failed, falling back to pipeline: {e}")
+                        logger.warning(f"Direct Ollama inference for unsupported architecture '{arch}' failed: {e}")
+
+                    if not direct_success:
+                        err_chunk = {"error": f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback failed."}
+                        yield f"data: {json.dumps(err_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
 
                 first_worker = pipeline[0]
                 last_worker = pipeline[-1]
@@ -785,6 +826,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
                     temperature=req.temperature if req.temperature is not None else 0.7,
                     top_p=req.top_p if req.top_p is not None else 0.9,
+                    top_k=getattr(req, "top_k", 50),
                     stop_token_ids=stop_ids,
                     seed=req.seed,
                 )
@@ -808,7 +850,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         target=last_worker.worker_id,
                         payload=start_payload.model_dump(),
                     )
-                    await relay.send_to_worker(last_worker.worker_id, cfg_frame)
+                    sent_last = await relay.send_to_worker(last_worker.worker_id, cfg_frame)
+                    if not sent_last:
+                        err_chunk = {"error": f"Failed to dispatch inference to last pipeline stage on worker '{last_worker.worker_id}'."}
+                        yield f"data: {json.dumps(err_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
 
                 # Stream token frames from workers to client with cancellation handling
                 deadline = time.time() + config.request_timeout_s
@@ -924,6 +971,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         )
                         await relay.route_frame(abort_frame)
                         yield f"data: {json.dumps({'error': err_msg})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        done_yielded = True
                         break
 
                     elif frame.type == MessageType.INFERENCE_FINISH:
@@ -942,7 +991,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     else:
         # Non-streaming request flow
         if not model_is_local:
-            ensure_ollama_model("http://127.0.0.1:11434", target_model)
+            ollama_ep = get_ollama_endpoints()[0] if get_ollama_endpoints() else "http://127.0.0.1:11434"
+            ensure_ollama_model(ollama_ep, target_model)
         try:
             tokenizer = get_or_load_tokenizer(target_model)
             if tokenizer is None:
@@ -956,15 +1006,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             sem.release()
             raise HTTPException(status_code=400, detail=f"Prompt tokenization failed: {e}")
 
-        # Single-node GPU acceleration path: direct execution via local Ollama daemon
+        # Fallback for unsupported architectures: direct execution via local Ollama daemon
         from situs.worker.loader import is_architecture_supported
         meta = resolve_model_metadata(target_model)
         arch = meta.get("architecture") or meta.get("model_type")
         arch_supported = is_architecture_supported(arch)
 
-        if len(pipeline) <= 1 or not arch_supported:
+        if not arch_supported:
             from situs.inference_backend import query_ollama
-            direct_ans = await asyncio.to_thread(query_ollama, prompt, target_model)
+            direct_ans = await asyncio.to_thread(query_ollama, pipeline_prompt, target_model)
             if direct_ans:
                 relay.cleanup_response_stream(request_id)
                 sem.release()
@@ -986,6 +1036,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         "total_tokens": len(input_ids) + len(direct_ans.split()),
                     },
                 }
+            relay.cleanup_response_stream(request_id)
+            sem.release()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback was unavailable.",
+            )
 
         if len(pipeline) < 1:
             relay.cleanup_response_stream(request_id)
@@ -1008,6 +1064,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
             temperature=req.temperature if req.temperature is not None else 0.7,
             top_p=req.top_p if req.top_p is not None else 0.9,
+            top_k=getattr(req, "top_k", 50),
             stop_token_ids=stop_ids,
             seed=req.seed,
         )
@@ -1132,7 +1189,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "id": request_id,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": req.model,
+            "model": target_model or req.model,
             "choices": [
                 {
                     "index": 0,

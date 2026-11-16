@@ -43,6 +43,7 @@ class GPUMemoryManager:
     ):
         self.total_vram_bytes = max(100 * 1024**2, int(total_vram_bytes))
         self.safety_fraction = max(0.05, float(safety_headroom_fraction))
+        self.safety_headroom_fraction = self.safety_fraction
         self.headroom_bytes = int(self.total_vram_bytes * self.safety_fraction)
         self.usable_vram_bytes = self.total_vram_bytes - self.headroom_bytes
         self.device = device

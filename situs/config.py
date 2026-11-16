@@ -100,7 +100,9 @@ class CoordinatorConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     heartbeat_timeout_s: float = 45.0
-    default_model: str = "gemma3:4b"
+    default_model: str = field(
+        default_factory=lambda: os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
+    )
     relay_buffer_size: int = 64 * 1024 * 1024  # 64 MB
     enable_cors: bool = True
     worker_auth_token: Optional[str] = field(
@@ -180,14 +182,23 @@ class WorkerConfig:
     coordinator_url: str = "ws://localhost:8000/ws/worker"
     worker_id: Optional[str] = None
     device: str = "cuda:0"  # or 'cpu'
-    model_name: str = "gemma3:4b"
+    model_name: str = field(
+        default_factory=lambda: os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
+    )
     vram_budget_gb: Optional[float] = None
     assigned_layer_start: Optional[int] = None
     assigned_layer_end: Optional[int] = None
-    compression_dtype: str = "int8"  # 'none', 'fp8', 'int8'
+    compression_dtype: str = "fp16"  # 'fp16', 'bf16', 'none', 'int8'
     heartbeat_interval_s: float = 1.0
     enable_speculative: bool = True
+    ngram_size: int = 2
+    max_draft_tokens: int = 4
+    replay_buffer_capacity: int = 4
+    safety_headroom_fraction: float = 0.10
     p2p_direct_enabled: bool = True
+    engine_ready_timeout_s: float = field(
+        default_factory=lambda: float(os.getenv("SITUS_ENGINE_READY_TIMEOUT_S", "120.0"))
+    )
     auth_token: Optional[str] = field(
         default_factory=lambda: os.getenv("SITUS_WORKER_AUTH_TOKEN", None)
     )

@@ -11,10 +11,10 @@
 - **Wire Quantization Decoupling & Zstandard Binary Framing (Strategy 4)**: Compresses network layer distribution with streaming Zstandard compression and BitNet 1.6 bpw packing, framed over raw 22-byte binary packets (`b"SITC"` header), eliminating Base64 wire overhead and shrinking weight transfer sizes by over 75%.
 - **Zero KV-Cache Network Transfer**: Each worker stores KV caches strictly for its own assigned layers. KV caches *never* cross the network.
 - **Asymmetric Ring Token Loop**:
-  - Worker A $\to$ Worker B: Compressed intermediate hidden state (~4 KB in INT8).
+  - Worker A $\to$ Worker B: Dense unquantized intermediate hidden state (FP16 / BF16).
   - Worker B $\to$ Worker A: Sampled `token_id` (4 bytes).
 - **Zero Port Forwarding**: Workers initiate outbound reverse connections over TLS/WebSockets to the Coordinator Relay. Works through residential NATs, CGNAT, and firewalls with no router configuration.
-- **Dynamic Activation Quantization & Temporal Deltas**: Quantizes boundary activations to INT8 dynamically and applies DisTrO-style temporal delta sparsification, reducing token transfers from 4.1 KB down to < 500 bytes.
+- **Dense Lossless Boundary Activations**: Transmits full-fidelity dense FP16 / BF16 boundary activations with zero coordinate pruning, completely eliminating lossy temporal delta drift and INT8 quantization noise.
 - **Drafterless Speculative Decoding**: Uses prompt and history n-gram lookup on Worker A to draft multi-token candidate bursts, verified in a single forward pass on Worker B ($2.0\times - 3.2\times$ effective speedup).
 - **Direct P2P WebRTC DataChannels**: Performs STUN UDP hole-punching via Google STUN servers to bypass the Coordinator relay, cutting latency by $50\%$ ($1 \times \text{RTT}$ vs $2 \times \text{RTT}$) with automatic WebSocket fallback.
 - **OpenAI Standard Gateway**: Drop-in compatible with `openai` SDK, Cursor, Continue.dev, LangChain, LiteLLM, Open WebUI, and standard OpenAI clients.
@@ -42,7 +42,7 @@
 +------------------------------------+    Activation Transfer       +------------------------------------+
 |       WORKER A (Home GPU 1)        | ---------------------------> |       WORKER B (Home GPU 2)        |
 | - Tokenizer & embed_tokens         |   Shape: [1, 1, hidden_dim]  | - transformer_layers [16..31]      |
-| - transformer_layers [0..15]       |   Dynamic INT8 Quantization  | - LayerNorm & lm_head              |
+| - transformer_layers [0..15]       |   Dense FP16/BF16 Precision  | - LayerNorm & lm_head              |
 | - Local KV-Cache (Layers 0..15)    |   Outbound WebSocket Stream  | - Local KV-Cache (Layers 16..31)   |
 | - Partial Weight Loader            |                              | - Token Sampler (top-p / temp)     |
 +------------------------------------+                              +------------------------------------+

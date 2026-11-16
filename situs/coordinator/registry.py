@@ -340,64 +340,70 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.debug(f"AutoConfig metadata resolution failed for '{model_name}': {e}")
 
-    # 5. Check local Ollama daemon /api/show
+    # 5. Check Ollama daemon /api/show
     try:
         import httpx
+        from situs.inference_backend import get_ollama_endpoints
+        endpoints = get_ollama_endpoints()
         with httpx.Client(timeout=1.0) as client:
-            resp = client.post("http://127.0.0.1:11434/api/show", json={"name": model_name})
-            if resp.status_code == 200:
-                data = resp.json()
-                model_info = data.get("model_info", {})
-                block_count = None
-                hidden_dim = None
-                vocab_size = None
-                intermediate = None
-                heads = None
-                kv_heads = None
-                head_dim = None
-                context_length = None
-                torch_dtype = None
-                for k, v in model_info.items():
-                    if k.endswith(".block_count") and isinstance(v, int):
-                        block_count = v
-                    elif (k.endswith(".embedding_length") or k.endswith(".hidden_size")) and isinstance(v, int):
-                        hidden_dim = v
-                    elif k.endswith(".vocab_size") and isinstance(v, int):
-                        vocab_size = v
-                    elif k.endswith(".feed_forward_length") and isinstance(v, int):
-                        intermediate = v
-                    elif k.endswith(".head_count") and not k.endswith("_kv") and isinstance(v, int):
-                        heads = v
-                    elif k.endswith(".head_count_kv") and isinstance(v, int):
-                        kv_heads = v
-                    elif (k.endswith(".key_length") or k.endswith(".head_dim")) and isinstance(v, int):
-                        head_dim = v
-                    elif (k.endswith(".context_length") or k.endswith(".max_position_embeddings")) and isinstance(v, int):
-                        context_length = v
-                    elif k.endswith(".file_type") or k.endswith(".precision"):
-                        torch_dtype = str(v)
-                arch = model_info.get("general.architecture")
-                if head_dim is None and hidden_dim and heads:
-                    head_dim = max(1, hidden_dim // max(1, heads))
+            for ep in endpoints:
+                try:
+                    resp = client.post(f"{ep.rstrip('/')}/api/show", json={"name": model_name})
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        model_info = data.get("model_info", {})
+                        block_count = None
+                        hidden_dim = None
+                        vocab_size = None
+                        intermediate = None
+                        heads = None
+                        kv_heads = None
+                        head_dim = None
+                        context_length = None
+                        torch_dtype = None
+                        for k, v in model_info.items():
+                            if k.endswith(".block_count") and isinstance(v, int):
+                                block_count = v
+                            elif (k.endswith(".embedding_length") or k.endswith(".hidden_size")) and isinstance(v, int):
+                                hidden_dim = v
+                            elif k.endswith(".vocab_size") and isinstance(v, int):
+                                vocab_size = v
+                            elif k.endswith(".feed_forward_length") and isinstance(v, int):
+                                intermediate = v
+                            elif k.endswith(".head_count") and not k.endswith("_kv") and isinstance(v, int):
+                                heads = v
+                            elif k.endswith(".head_count_kv") and isinstance(v, int):
+                                kv_heads = v
+                            elif (k.endswith(".key_length") or k.endswith(".head_dim")) and isinstance(v, int):
+                                head_dim = v
+                            elif (k.endswith(".context_length") or k.endswith(".max_position_embeddings")) and isinstance(v, int):
+                                context_length = v
+                            elif k.endswith(".file_type") or k.endswith(".precision"):
+                                torch_dtype = str(v)
+                        arch = model_info.get("general.architecture")
+                        if head_dim is None and hidden_dim and heads:
+                            head_dim = max(1, hidden_dim // max(1, heads))
 
-                if block_count and hidden_dim and vocab_size and intermediate and heads:
-                    return _apply_inferred_precision({
-                        "total_layers": block_count,
-                        "hidden_dim": hidden_dim,
-                        "intermediate_size": intermediate,
-                        "vocab_size": vocab_size,
-                        "num_heads": heads,
-                        "num_kv_heads": kv_heads if kv_heads else heads,
-                        "head_dim": head_dim,
-                        "architecture": arch,
-                        "context_length": context_length,
-                        "max_position_embeddings": context_length,
-                        "torch_dtype": torch_dtype,
-                    })
-                else:
-                    logger.warning(
-                        f"Ollama returned incomplete model_info for '{model_name}'; rejecting due to missing attributes."
-                    )
+                        if block_count and hidden_dim and vocab_size and intermediate and heads:
+                            return _apply_inferred_precision({
+                                "total_layers": block_count,
+                                "hidden_dim": hidden_dim,
+                                "intermediate_size": intermediate,
+                                "vocab_size": vocab_size,
+                                "num_heads": heads,
+                                "num_kv_heads": kv_heads if kv_heads else heads,
+                                "head_dim": head_dim,
+                                "architecture": arch,
+                                "context_length": context_length,
+                                "max_position_embeddings": context_length,
+                                "torch_dtype": torch_dtype,
+                            })
+                        else:
+                            logger.warning(
+                                f"Ollama returned incomplete model_info for '{model_name}'; rejecting due to missing attributes."
+                            )
+                except Exception:
+                    continue
     except Exception as e:
         logger.debug(f"Ollama metadata query failed: {e}")
 
@@ -588,14 +594,25 @@ def optimal_heterogeneous_partition(
         speeds.append(speed)
 
         # 3. Memory telemetry: available capacity for Situs layers
-        # Usable capacity accounts for free VRAM plus currently used process VRAM (which holds existing layers to be replaced)
-        # and dedicated GPU physical limits (minus ~500 MB Windows OS desktop reserve).
+        # Usable capacity strictly accounts for verified free VRAM (with 10% safety margin).
+        # We do NOT reclaim external OS used VRAM from other processes.
+        # If the worker already holds active Situs layers from a prior partition,
+        # only the known footprint of those existing Situs layers is reclaimable upon re-assignment.
+        reclaimable_situs_vram = 0
+        existing_end = getattr(w, "assigned_layer_end", 0) or 0
+        existing_start = getattr(w, "assigned_layer_start", 0) or 0
+        existing_layers = max(0, existing_end - existing_start)
+        if existing_layers > 0 and getattr(w, "is_alive", True):
+            reclaimable_situs_vram = existing_layers * bytes_per_layer
+            if getattr(w, "is_first_stage", False):
+                reclaimable_situs_vram += first_overhead
+            if getattr(w, "is_last_stage", False):
+                reclaimable_situs_vram += last_overhead
+
+        avail_vram = max(0, int((w.free_vram_bytes + reclaimable_situs_vram) * 0.90))
         if getattr(w, "device_type", "cuda") == "cuda" and w.total_vram_bytes > 0:
-            eff_avail = max(0, w.free_vram_bytes) + max(0, getattr(w, "used_vram_bytes", 0))
-            dedicated_margin = max(0, w.total_vram_bytes - int(500 * 1024**2))
-            avail_vram = int(min(eff_avail, dedicated_margin) * 0.90)
-        else:
-            avail_vram = max(0, int(w.free_vram_bytes * 0.90))
+            dedicated_margin = max(0, int((w.total_vram_bytes - int(500 * 1024**2)) * 0.90))
+            avail_vram = min(avail_vram, dedicated_margin)
 
         stage_overhead = (first_overhead if idx == 0 else 0) + (last_overhead if idx == (K - 1) else 0)
         usable_for_layers = avail_vram - stage_overhead
@@ -681,12 +698,13 @@ class WorkerRegistry:
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self.workers: Dict[str, WorkerNode] = {}
         self.active_model: Optional[str] = None
-        self.total_layers: int = 32
+        self.total_layers: int = 0
 
     def clear(self):
         """Clears all registered workers and resets state."""
         self.workers.clear()
         self.active_model = None
+        self.total_layers = 0
 
     def register_worker(self, reg: WorkerRegister) -> WorkerNode:
         used_b = getattr(reg, "used_vram_bytes", None)

@@ -77,6 +77,12 @@ def test_speculative_verifier_acceptance():
 
         # Both candidate tokens should be verified and accepted in 1 pass!
         assert accepted == [5, 8]
+
+        # Lossless verification: mismatched candidate at temp=0.0 MUST be rejected and replaced
+        mismatched_candidates = [5, 99]
+        accepted_mismatch, correction = verifier.verify_candidates(mismatched_candidates, logits, temperature=0.0)
+        assert accepted_mismatch == [5]
+        assert correction == 8  # Target model's true argmax at position 1 is 8, not 99!
     except ImportError:
         pytest.skip("PyTorch not installed")
 

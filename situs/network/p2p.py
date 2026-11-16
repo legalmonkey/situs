@@ -19,9 +19,10 @@ DEFAULT_STUN_SERVERS = [
     "stun:stun1.l.google.com:19302",
 ]
 
-# Conservative SCTP message limit so prefill tensors fall back to WebSocket relay
-# instead of overflowing aiortc DataChannel maxMessageSize (~64-256 KB).
-SAFE_SCTP_MAX_BYTES = 48 * 1024
+# Conservative SCTP message limit for direct DataChannel transfer.
+# Sized at 128 KB so dense FP16 speculative candidate bursts (~55 KB) transmit
+# directly over P2P UDP, while large multi-megabyte prefill tensors fall back to WebSocket relay.
+SAFE_SCTP_MAX_BYTES = 128 * 1024
 
 
 class P2PDataChannelNode:
@@ -67,6 +68,11 @@ class P2PDataChannelNode:
 
                 offer = await self.pc.createOffer()
                 await self.pc.setLocalDescription(offer)
+                # Allow STUN queries to complete so public NAT candidates are embedded in SDP
+                for _ in range(16):
+                    if getattr(self.pc, "iceGatheringState", None) == "complete":
+                        break
+                    await asyncio.sleep(0.05)
                 # Send offer through Coordinator WebSocket signaling
                 await self.signaling_send_fn({
                     "type": "ice_offer",
@@ -113,6 +119,11 @@ class P2PDataChannelNode:
             await self.pc.setRemoteDescription(desc)
             answer = await self.pc.createAnswer()
             await self.pc.setLocalDescription(answer)
+            # Allow STUN queries to complete so public NAT candidates are embedded in SDP
+            for _ in range(16):
+                if getattr(self.pc, "iceGatheringState", None) == "complete":
+                    break
+                await asyncio.sleep(0.05)
             await self.signaling_send_fn({
                 "type": "ice_answer",
                 "source_worker": self.worker_id,

@@ -66,6 +66,7 @@ SITUS_LOGO_RAW = r"""
 
 TAGLINE_TEXT = "D I S T R I B U T E D   A I   C O M P U T E   F O R   E V E R Y O N E"
 VERSION_STR = "0.1.0"
+DEFAULT_MODEL = os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
 
 
 def print_banner(compact: bool = False):
@@ -185,7 +186,7 @@ def main_callback(
         None, "--version", "-v", callback=version_callback, is_eager=True, help="Show the Situs version and exit."
     ),
     coordinator: str = typer.Option("http://127.0.0.1:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Target model identifier"),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Target model identifier"),
 ):
     """Situs: Distributed GPU Pooling Across the Internet."""
     if ctx.invoked_subcommand is None:
@@ -496,10 +497,10 @@ def join_cluster(
     ),
     worker_id: Optional[str] = typer.Option(None, "--worker-id", "--id", "-i", help="Unique custom ID for this worker (e.g. worker-2)"),
     device: str = typer.Option("auto", "--device", "-d", help="Execution device ('cuda:0', 'cpu', or 'auto')"),
-    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Target model identifier"),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Target model identifier"),
     speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
-    compression: str = typer.Option("int8", "--compression", "-c", help="Activation compression ('int8', 'fp16', 'none')"),
+    compression: str = typer.Option("fp16", "--compression", "-c", help="Activation format ('fp16', 'bf16', 'none', 'int8')"),
     token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),
 ):
     """Join a Situs cluster as a GPU/CPU inference worker daemon."""
@@ -633,8 +634,8 @@ def connect_cluster(
     ),
     worker_id: Optional[str] = typer.Option(None, "--worker-id", "--id", "-w", help="Custom worker ID"),
     device: str = typer.Option("auto", "--device", "-d", help="Compute device ('cuda', 'cuda:0', 'cpu', or 'auto')"),
-    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Target model identifier"),
-    compression: str = typer.Option("int8", "--compression", "-c", help="Activation compression ('int8', 'fp16', 'none')"),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Target model identifier"),
+    compression: str = typer.Option("fp16", "--compression", "-c", help="Activation format ('fp16', 'bf16', 'none', 'int8')"),
     speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
     token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),
@@ -827,7 +828,7 @@ def cluster_status(
 @app.command("partition")
 def partition_model(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Model name"),
     layers: Optional[int] = typer.Option(None, "--layers", "-l", help="Total transformer layers (auto-detected if omitted)"),
     admin_key: Optional[str] = typer.Option(None, "--admin-key", envvar="SITUS_ADMIN_KEY", help="Administrator authorization key"),
     json_output: bool = typer.Option(False, "--json", help="Output partition layout as JSON"),
@@ -902,7 +903,8 @@ def remove_device(
     admin_key: Optional[str] = typer.Option(None, "--admin-key", help="Admin key if coordinator is protected"),
 ):
     """Remove a worker device from the cluster and automatically rebalance remaining GPUs."""
-    base_url = normalize_coordinator_address(coordinator)
+    import httpx
+    base_url = normalize_http_url(coordinator)
     headers = {"x-admin-key": admin_key} if admin_key else {}
     try:
         with httpx.Client(timeout=5.0) as client:
@@ -922,7 +924,7 @@ def remove_device(
 @app.command("chat")
 def interactive_chat(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Model name"),
     temperature: float = typer.Option(0.7, "--temp", "-t", help="Sampling temperature"),
     system: str = typer.Option("You are a helpful AI assistant running on a distributed GPU cluster.", "--system", "-s", help="System prompt"),
 ):
@@ -944,7 +946,7 @@ def interactive_chat(
 def one_shot_run(
     prompt: str = typer.Argument(..., help="Prompt to execute across the cluster"),
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
-    model: str = typer.Option("gemma3:4b", "--model", "-m", help="Model name"),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Model name"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="SITUS_API_KEY", help="Developer API key"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress status notices and only stream token content"),
 ):

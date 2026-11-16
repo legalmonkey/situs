@@ -274,9 +274,9 @@ def query_nvidia_smi(force_refresh: bool = False, dev_idx: int = 0) -> Optional[
             line = lines[dev_idx] if dev_idx < len(lines) else lines[0]
             parts = [p.strip() for p in line.split(",")]
             gpu_name = parts[0]
-            total_mb = float(parts[1]) if len(parts) > 1 else 6144.0
-            free_mb = float(parts[2]) if len(parts) > 2 else total_mb
-            used_mb = float(parts[3]) if len(parts) > 3 else max(0.0, total_mb - free_mb)
+            total_mb = float(parts[1]) if (len(parts) > 1 and parts[1]) else 0.0
+            free_mb = float(parts[2]) if (len(parts) > 2 and parts[2]) else total_mb
+            used_mb = float(parts[3]) if (len(parts) > 3 and parts[3]) else max(0.0, total_mb - free_mb)
             total_b = int(total_mb * 1024 * 1024)
             free_b = int(free_mb * 1024 * 1024)
             used_b = int(used_mb * 1024 * 1024)
@@ -372,16 +372,29 @@ def query_windows_cim_gpus() -> Optional[Tuple[str, int, int, int]]:
                 gpu_name = dedicated.get("Name", "Dedicated GPU").strip()
                 n_up = gpu_name.upper()
                 # Determine accurate VRAM based on model or AdapterRAM
-                est_gb = 6.0
-                if "4090" in n_up: est_gb = 16.0
-                elif "4080" in n_up: est_gb = 12.0
-                elif "4070" in n_up or "3080" in n_up: est_gb = 12.0
-                elif "4060" in n_up or "3070" in n_up: est_gb = 8.0
-                elif "4050" in n_up or "3050" in n_up or "3060" in n_up: est_gb = 6.0
-                elif "6GB" in n_up: est_gb = 6.0
-                elif "8GB" in n_up: est_gb = 8.0
-                elif "12GB" in n_up: est_gb = 12.0
+                is_mobile = "LAPTOP" in n_up or "MOBILE" in n_up or "MAX-Q" in n_up
+                est_gb = 8.0
+                if "3090" in n_up or "4090" in n_up:
+                    est_gb = 16.0 if is_mobile else 24.0
+                elif "4080" in n_up:
+                    est_gb = 12.0 if is_mobile else 16.0
+                elif "3080" in n_up:
+                    est_gb = 8.0 if is_mobile else 10.0
+                elif "4070" in n_up:
+                    est_gb = 8.0 if is_mobile else 12.0
+                elif "3070" in n_up:
+                    est_gb = 8.0
+                elif "4060" in n_up:
+                    est_gb = 8.0
+                elif "3060" in n_up:
+                    est_gb = 6.0 if is_mobile else 12.0
+                elif "4050" in n_up or "3050" in n_up:
+                    est_gb = 6.0
+                elif "24GB" in n_up: est_gb = 24.0
                 elif "16GB" in n_up: est_gb = 16.0
+                elif "12GB" in n_up: est_gb = 12.0
+                elif "8GB" in n_up: est_gb = 8.0
+                elif "6GB" in n_up: est_gb = 6.0
                 else:
                     adapter_ram = int(dedicated.get("AdapterRAM", 0) or 0)
                     if adapter_ram > 3 * 1024**3:
@@ -491,24 +504,43 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
     if smi_info is not None:
         gpu_name, total_vram, free_vram, used_vram = smi_info
         is_cuda_usable = cuda_works and (req != "cpu")
-        info = HardwareInfo(
-            gpu_available=is_cuda_usable,
-            device="cuda:0" if is_cuda_usable else "cpu",
-            device_type="cuda" if is_cuda_usable else "cpu",
-            device_name=gpu_name,
-            total_memory_bytes=total_vram,
-            free_memory_bytes=free_vram,
-            used_memory_bytes=used_vram,
-            memory_type="VRAM",
-            status_message=(
-                f"NVIDIA GPU detected: {gpu_name} ({total_vram / (1024**3):.1f} GB VRAM). Proceeding with CUDA acceleration."
-                if is_cuda_usable
-                else f"NVIDIA GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode."
-            ),
-            physical_gpu_detected=True,
-            physical_gpu_name=gpu_name,
-            cuda_runtime_working=cuda_works,
-        )
+        if is_cuda_usable:
+            info = HardwareInfo(
+                gpu_available=True,
+                device="cuda:0",
+                device_type="cuda",
+                device_name=gpu_name,
+                total_memory_bytes=total_vram,
+                free_memory_bytes=free_vram,
+                used_memory_bytes=used_vram,
+                memory_type="VRAM",
+                status_message=f"NVIDIA GPU detected: {gpu_name} ({total_vram / (1024**3):.1f} GB VRAM). Proceeding with CUDA acceleration.",
+                physical_gpu_detected=True,
+                physical_gpu_name=gpu_name,
+                cuda_runtime_working=True,
+            )
+        else:
+            tot_ram, free_ram, cpu_name = get_system_ram_and_cpu()
+            used_ram = 0
+            try:
+                import psutil
+                used_ram = psutil.Process().memory_info().rss
+            except Exception:
+                used_ram = max(0, tot_ram - free_ram)
+            info = HardwareInfo(
+                gpu_available=False,
+                device="cpu",
+                device_type="cpu",
+                device_name=f"{cpu_name} (CPU)",
+                total_memory_bytes=tot_ram,
+                free_memory_bytes=free_ram,
+                used_memory_bytes=used_ram,
+                memory_type="RAM",
+                status_message=f"NVIDIA GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode using System RAM ({tot_ram / (1024**3):.1f} GB).",
+                physical_gpu_detected=True,
+                physical_gpu_name=gpu_name,
+                cuda_runtime_working=False,
+            )
         if requested_device in ("auto", None):
             _cached_hardware_info = info
         return info
@@ -518,24 +550,43 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
     if cim_info is not None:
         gpu_name, total_vram, free_vram, used_vram = cim_info
         is_cuda_usable = cuda_works and (req != "cpu")
-        info = HardwareInfo(
-            gpu_available=is_cuda_usable,
-            device="cuda:0" if is_cuda_usable else "cpu",
-            device_type="cuda" if is_cuda_usable else "cpu",
-            device_name=gpu_name,
-            total_memory_bytes=total_vram,
-            free_memory_bytes=free_vram,
-            used_memory_bytes=used_vram,
-            memory_type="VRAM",
-            status_message=(
-                f"Physical GPU detected: {gpu_name} ({total_vram / (1024**3):.1f} GB VRAM). Proceeding with GPU pooling."
-                if is_cuda_usable
-                else f"Physical GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode."
-            ),
-            physical_gpu_detected=True,
-            physical_gpu_name=gpu_name,
-            cuda_runtime_working=cuda_works,
-        )
+        if is_cuda_usable:
+            info = HardwareInfo(
+                gpu_available=True,
+                device="cuda:0",
+                device_type="cuda",
+                device_name=gpu_name,
+                total_memory_bytes=total_vram,
+                free_memory_bytes=free_vram,
+                used_memory_bytes=used_vram,
+                memory_type="VRAM",
+                status_message=f"Physical GPU detected: {gpu_name} ({total_vram / (1024**3):.1f} GB VRAM). Proceeding with GPU pooling.",
+                physical_gpu_detected=True,
+                physical_gpu_name=gpu_name,
+                cuda_runtime_working=True,
+            )
+        else:
+            tot_ram, free_ram, cpu_name = get_system_ram_and_cpu()
+            used_ram = 0
+            try:
+                import psutil
+                used_ram = psutil.Process().memory_info().rss
+            except Exception:
+                used_ram = max(0, tot_ram - free_ram)
+            info = HardwareInfo(
+                gpu_available=False,
+                device="cpu",
+                device_type="cpu",
+                device_name=f"{cpu_name} (CPU)",
+                total_memory_bytes=tot_ram,
+                free_memory_bytes=free_ram,
+                used_memory_bytes=used_ram,
+                memory_type="RAM",
+                status_message=f"Physical GPU detected ({gpu_name}), but PyTorch CUDA runtime is unavailable. Proceeding in CPU mode using System RAM ({tot_ram / (1024**3):.1f} GB).",
+                physical_gpu_detected=True,
+                physical_gpu_name=gpu_name,
+                cuda_runtime_working=False,
+            )
         if requested_device in ("auto", None):
             _cached_hardware_info = info
         return info

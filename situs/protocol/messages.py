@@ -91,6 +91,7 @@ class InferenceStart(BaseModel):
     max_new_tokens: int = 2048
     temperature: float = 0.7
     top_p: float = 0.9
+    top_k: Optional[int] = 50
     seed: Optional[int] = None
     stop_token_ids: List[int] = Field(default_factory=list)
 
@@ -182,7 +183,7 @@ class StageLayerAck(BaseModel):
     layer_index: int
     status: str = "ready"  # 'ready', 'loading', 'error'
     ready_layer_count: int = 1
-    total_assigned: int = 16
+    total_assigned: int = 0
 
 
 class InferenceAbort(BaseModel):

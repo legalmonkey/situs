@@ -26,21 +26,24 @@ class RelayHub:
         self.active_connections[worker_id] = websocket
         logger.info(f"Worker connected to relay: {worker_id}")
 
-    def disconnect_worker(self, worker_id: str):
+    def disconnect_worker(self, worker_id: str, emit_error: bool = True):
         if worker_id in self.active_connections:
             del self.active_connections[worker_id]
             logger.info(f"Worker disconnected from relay: {worker_id}")
-            # Propagate error immediately to any in-flight response streams so requests don't hang
-            err_frame = ProtocolFrame(
-                type=MessageType.ERROR,
-                source="coordinator",
-                payload={"error": f"Worker node '{worker_id}' disconnected during inference."},
-            )
-            for q in list(self.response_streams.values()):
-                try:
-                    q.put_nowait(err_frame)
-                except Exception:
-                    pass
+            if self.registry:
+                self.registry.remove_worker(worker_id)
+            if emit_error:
+                # Propagate error immediately to any in-flight response streams so requests don't hang
+                err_frame = ProtocolFrame(
+                    type=MessageType.ERROR,
+                    source="coordinator",
+                    payload={"error": f"Worker node '{worker_id}' disconnected during inference."},
+                )
+                for q in list(self.response_streams.values()):
+                    try:
+                        q.put_nowait(err_frame)
+                    except Exception:
+                        pass
 
     def is_worker_connected(self, worker_id: str) -> bool:
         return worker_id in self.active_connections
@@ -71,6 +74,20 @@ class RelayHub:
         if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED, MessageType.INFERENCE_FINISH, MessageType.ERROR):
             if request_id and request_id in self.response_streams:
                 await self.response_streams[request_id].put(frame)
+
+        # Broadcast INFERENCE_FINISH to all active workers when a request completes or finishes
+        is_finished = frame.payload.get("is_finished", False) if isinstance(frame.payload, dict) else False
+        if is_finished or frame.type == MessageType.INFERENCE_FINISH:
+            if request_id:
+                finish_broadcast = ProtocolFrame(
+                    type=MessageType.INFERENCE_FINISH,
+                    source="coordinator",
+                    target="all",
+                    payload={"request_id": request_id},
+                )
+                for w_id in list(self.active_connections.keys()):
+                    if w_id != frame.source:
+                        await self.send_to_worker(w_id, finish_broadcast)
 
         # For tokens/speculative verification, route to worker ONLY if not already delivered via direct P2P
         if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED):

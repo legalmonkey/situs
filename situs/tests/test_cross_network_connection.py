@@ -177,18 +177,27 @@ def test_jit_streamer_rejects_synthetic_weights_for_production_models(tmp_path):
 def test_live_socket_handshake_end_to_end():
     """Verify Rule 3: live in-process coordinator and worker complete verified socket handshake."""
     import time
-    from situs.tui import start_in_process_coordinator, start_in_process_worker
-
-    ok_c, msg_c = start_in_process_coordinator(port=8000)
-    assert ok_c is True, f"Coordinator failed: {msg_c}"
-
-    time.sleep(0.1)
-    ok_w, msg_w = start_in_process_worker(
-        coordinator_addr="127.0.0.1:8000",
-        worker_id="test-live-worker",
-        device="cpu",
+    from situs.tui import (
+        start_in_process_coordinator,
+        start_in_process_worker,
+        stop_in_process_coordinator,
+        stop_all_in_process_workers,
     )
-    assert ok_w is True, f"Worker registration failed: {msg_w}"
-    assert "connected" in msg_w.lower() or "worker" in msg_w.lower()
+
+    try:
+        ok_c, msg_c = start_in_process_coordinator(port=8000)
+        assert ok_c is True, f"Coordinator failed: {msg_c}"
+
+        time.sleep(0.1)
+        ok_w, msg_w = start_in_process_worker(
+            coordinator_addr="127.0.0.1:8000",
+            worker_id="test-live-worker",
+            device="cpu",
+        )
+        assert ok_w is True, f"Worker registration failed: {msg_w}"
+        assert "connected" in msg_w.lower() or "worker" in msg_w.lower()
+    finally:
+        stop_all_in_process_workers()
+        stop_in_process_coordinator()
 
 

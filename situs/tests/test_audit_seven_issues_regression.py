@@ -438,10 +438,14 @@ def test_issue7_sampler_detects_mixed_nan_and_inf_torch():
     token = sampler.sample_next_token(logits_with_pos_inf)
     assert token == eos_id, "Must return eos_token_id when any logit is positive Inf"
 
-    # 3. Mixed negative Inf and finite values
-    logits_with_neg_inf = torch.tensor([1.0, float("-inf"), 3.0, 2.0])
-    token = sampler.sample_next_token(logits_with_neg_inf)
-    assert token == eos_id, "Must return eos_token_id when any logit is negative Inf"
+    # 3. All negative Inf values returns EOS, while masked -inf permits valid token sampling
+    logits_all_neg_inf = torch.tensor([float("-inf"), float("-inf"), float("-inf"), float("-inf")])
+    token = sampler.sample_next_token(logits_all_neg_inf)
+    assert token == eos_id, "Must return eos_token_id when all logits are negative Inf"
+
+    logits_masked_neg_inf = torch.tensor([1.0, float("-inf"), 3.0, 2.0])
+    token_masked = sampler.sample_next_token(logits_masked_neg_inf, temperature=0.001)
+    assert token_masked == 2, "Must not return EOS on masked -inf, should sample highest unmasked logit"
 
     # 4. Valid finite logits sample properly
     logits_valid = torch.tensor([0.1, 0.2, 5.0, 0.1])

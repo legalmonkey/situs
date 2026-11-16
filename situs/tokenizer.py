@@ -219,7 +219,6 @@ def get_or_load_tokenizer(
             qwen_cands.extend([
                 "Qwen/Qwen2.5-7B-Instruct",
                 "Qwen/Qwen2.5-3B-Instruct",
-                os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"),
                 "Qwen/Qwen3-4B-Instruct-2507",
             ])
             candidates.extend(qwen_cands)
@@ -232,7 +231,6 @@ def get_or_load_tokenizer(
                 "google/gemma-2-2b-it",
                 "google/gemma-7b",
                 "google/gemma-2b",
-                "fxmarty/tiny-random-GemmaForCausalLM",
             ])
             candidates.extend(gemma_cands)
         elif "llama" in prefix:
@@ -276,10 +274,7 @@ def get_or_load_tokenizer(
             candidates.append(model_name)
     else:
         # Default or gpt2
-        candidates.extend([
-            os.path.expanduser("~/.cache/huggingface/hub/models--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e"),
-            "gpt2",
-        ])
+        candidates.append("gpt2")
 
     # 1. Check local directories and snapshots first
     for cand in candidates:

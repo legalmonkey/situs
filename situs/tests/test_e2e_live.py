@@ -87,6 +87,11 @@ async def test_live_websocket_cluster_e2e():
 
     finally:
         # Cleanup
+        try:
+            daemon_a.stop()
+            daemon_b.stop()
+        except Exception:
+            pass
         for t in worker_tasks:
             t.cancel()
         server.should_exit = True

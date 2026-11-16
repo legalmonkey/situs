@@ -19,11 +19,31 @@ logger = logging.getLogger("situs.inference_backend")
 
 # Ollama local daemon endpoints
 OLLAMA_ENDPOINTS = ["http://127.0.0.1:11434", "http://localhost:11434"]
+_init_env_host = os.getenv("OLLAMA_HOST")
+if _init_env_host:
+    _norm = _init_env_host.strip()
+    if not _norm.startswith(("http://", "https://")):
+        _norm = f"http://{_norm}"
+    if _norm not in OLLAMA_ENDPOINTS:
+        OLLAMA_ENDPOINTS.insert(0, _norm)
+
+
+def get_ollama_endpoints() -> List[str]:
+    """Returns the list of Ollama endpoints, prioritizing OLLAMA_HOST if set in environment."""
+    endpoints = list(OLLAMA_ENDPOINTS)
+    env_host = os.getenv("OLLAMA_HOST")
+    if env_host:
+        norm = env_host.strip()
+        if not norm.startswith(("http://", "https://")):
+            norm = f"http://{norm}"
+        if norm not in endpoints:
+            endpoints.insert(0, norm)
+    return endpoints
 
 
 def ensure_ollama_running() -> bool:
     """Verifies Ollama daemon is reachable. If not, attempts to spawn 'ollama serve' in background."""
-    for ep in OLLAMA_ENDPOINTS:
+    for ep in get_ollama_endpoints():
         try:
             with httpx.Client(timeout=1.0) as client:
                 r = client.get(f"{ep}/api/tags")
@@ -50,7 +70,7 @@ def ensure_ollama_running() -> bool:
         subprocess.Popen([ollama_bin, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
         for _ in range(50):
             time.sleep(0.3)
-            for ep in OLLAMA_ENDPOINTS:
+            for ep in get_ollama_endpoints():
                 try:
                     with httpx.Client(timeout=1.5) as client:
                         r = client.get(f"{ep}/api/tags")
@@ -76,7 +96,7 @@ def is_model_downloaded(model_name: str) -> bool:
 
     ensure_ollama_running()
     canonical = normalize_ollama_model(model_name)
-    for ep in OLLAMA_ENDPOINTS:
+    for ep in get_ollama_endpoints():
         try:
             installed = get_installed_ollama_models(ep)
             if not installed:
@@ -142,7 +162,7 @@ CANONICAL_MODEL_TAGS: Dict[str, str] = {
 def normalize_ollama_model(model_name: str) -> str:
     """Resolves arbitrary model name or UI ID into a canonical Ollama model tag."""
     if not model_name:
-        return "gemma3:4b"
+        return os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
     raw = model_name.strip()
     if raw in CANONICAL_MODEL_TAGS:
         return CANONICAL_MODEL_TAGS[raw]
@@ -204,13 +224,14 @@ def format_stage_name(status: str) -> str:
 
 async def stream_pull_model(
     model_name: str,
-    base_url: str = "http://127.0.0.1:11434",
+    base_url: Optional[str] = None,
 ):
     """
     Asynchronously streams online model pulling progress from Ollama API.
     Yields structured progress dictionaries for live progress bars.
     """
     ensure_ollama_running()
+    resolved_base = base_url or (get_ollama_endpoints()[0] if get_ollama_endpoints() else "http://127.0.0.1:11434")
     canonical_model = normalize_ollama_model(model_name)
     start_t = time.time()
     last_comp = 0
@@ -221,7 +242,7 @@ async def stream_pull_model(
     async with httpx.AsyncClient(timeout=1800.0) as client:
         try:
             payload = {"name": canonical_model, "stream": True}
-            async with client.stream("POST", f"{base_url}/api/pull", json=payload) as resp:
+            async with client.stream("POST", f"{resolved_base.rstrip('/')}/api/pull", json=payload) as resp:
                 if resp.status_code != 200:
                     err_bytes = await resp.aread()
                     yield {
@@ -407,7 +428,7 @@ def query_ollama(prompt: str, model_name: str = "") -> Optional[str]:
     canonical_model = normalize_ollama_model(model_name)
     last_error = None
 
-    for base_url in OLLAMA_ENDPOINTS:
+    for base_url in get_ollama_endpoints():
         try:
             with httpx.Client(timeout=2.0) as client:
                 health = client.get(f"{base_url}/api/tags")
@@ -482,8 +503,9 @@ def generate_llm_answer(prompt_text: str, model_name: str = "") -> str:
 
     # If Ollama daemon is not responding or crashed, report the exact failure honestly
     target = normalize_ollama_model(model_name)
+    ep = get_ollama_endpoints()[0] if get_ollama_endpoints() else "http://127.0.0.1:11434"
     return (
         f"[Situs Cluster Inference Error] Unable to generate neural response using model '{target}'.\n"
-        f"Please ensure Ollama is running ('ollama serve') and accessible at http://127.0.0.1:11434.\n"
+        f"Please ensure Ollama is running ('ollama serve') and accessible at {ep}.\n"
         f"Verify that model '{target}' is installed ('ollama list' / 'ollama pull {target}')."
     )

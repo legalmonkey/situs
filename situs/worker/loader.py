@@ -2158,7 +2158,7 @@ def load_hf_stage_model(
                                 fast_gguf_files[sf] = probe_reader
                                 for pt in probe_reader.tensors:
                                     if pt.name in ("token_embd.weight", "model.embed_tokens.weight") and len(pt.shape) == 2:
-                                        vocab_size = int(pt.shape[1])
+                                        vocab_size = max(int(pt.shape[0]), int(pt.shape[1]))
                                         break
                             except Exception:
                                 pass

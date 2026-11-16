@@ -20,103 +20,124 @@ except ImportError:
 
 def compress_tensor(
     tensor: Union["torch.Tensor", np.ndarray],
-    method: str = "int8"
+    method: str = "fp16"
 ) -> Tuple[bytes, float, Tuple[int, ...]]:
     """
-    Dynamically quantizes an activation tensor to reduce transmission size across WAN.
+    Serializes an activation tensor for transmission across WAN.
+    Defaults to unquantized dense FP16 / BF16 representation.
     
     Returns:
         (compressed_bytes, scale_factor, original_shape)
     """
+    norm = method.lower()
     if HAS_TORCH and isinstance(tensor, torch.Tensor):
         shape = tuple(tensor.shape)
         tensor = tensor.detach()
-        if method == "int8":
+        if norm in ("fp16", "float16"):
+            return tensor.to(torch.float16).contiguous().cpu().numpy().tobytes(), 1.0, shape
+        elif norm in ("bf16", "bfloat16"):
+            return tensor.to(torch.bfloat16).contiguous().cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
+        elif norm in ("none", "fp32", "float32"):
+            return tensor.to(torch.float32).contiguous().cpu().numpy().tobytes(), 1.0, shape
+        elif norm in ("int8", "q8_0"):
             max_val = float(tensor.abs().max())
             scale = 1.0 if max_val == 0.0 else (max_val / 127.0)
             quantized = (tensor / scale).round().clamp(-128, 127).to(torch.int8)
             return quantized.cpu().numpy().tobytes(), scale, shape
-        elif method == "fp16":
-            return tensor.to(torch.float16).cpu().numpy().tobytes(), 1.0, shape
-        elif method == "none":
-            return tensor.to(torch.float32).cpu().numpy().tobytes(), 1.0, shape
         else:
             raise ValueError(f"Unsupported compression method: {method}")
 
-    arr = np.asarray(tensor, dtype=np.float32)
+    arr = np.asarray(tensor)
     shape = arr.shape
 
-    if method == "int8":
+    if norm in ("fp16", "float16"):
+        return arr.astype(np.float16).tobytes(), 1.0, shape
+    elif norm in ("bf16", "bfloat16"):
+        if HAS_TORCH:
+            t = torch.from_numpy(arr.astype(np.float32)).to(torch.bfloat16).contiguous()
+            return t.cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
+        return arr.astype(np.float16).tobytes(), 1.0, shape
+    elif norm in ("none", "fp32", "float32"):
+        return arr.astype(np.float32).tobytes(), 1.0, shape
+    elif norm in ("int8", "q8_0"):
         max_val = float(np.max(np.abs(arr)))
-        if max_val == 0.0:
-            scale = 1.0
-        else:
-            scale = max_val / 127.0
+        scale = 1.0 if max_val == 0.0 else (max_val / 127.0)
         quantized = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
         return quantized.tobytes(), scale, shape
-
-    elif method == "fp16":
-        return arr.astype(np.float16).tobytes(), 1.0, shape
-
-    elif method == "none":
-        return arr.astype(np.float32).tobytes(), 1.0, shape
-
     else:
         raise ValueError(f"Unsupported compression method: {method}")
 
 
 def decompress_tensor(
     data: bytes,
-    scale: float,
-    shape: Tuple[int, ...],
-    method: str = "int8",
+    scale: float = 1.0,
+    shape: Tuple[int, ...] = (),
+    method: str = "fp16",
     device: Optional[Union[str, "torch.device"]] = None,
     dtype: Optional[Any] = None
 ) -> Union["torch.Tensor", np.ndarray]:
     """
-    Dequantizes received compressed bytes back into an activation tensor.
+    Dequantizes/deserializes received compressed bytes back into an activation tensor.
+    Defaults to unquantized dense FP16 / BF16 representation.
     """
-    if method == "int8":
-        arr = np.frombuffer(data, dtype=np.int8).reshape(shape).astype(np.float32) * scale
-    elif method == "fp16":
-        arr = np.frombuffer(data, dtype=np.float16).reshape(shape).astype(np.float32)
-    elif method == "none":
+    norm = method.lower()
+    target_device = device or ("cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu")
+
+    if norm in ("fp16", "float16"):
+        arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
+        if HAS_TORCH:
+            target_dtype = dtype or torch.float16
+            return torch.from_numpy(arr.copy()).to(device=target_device, dtype=target_dtype)
+        return arr.astype(np.float32)
+
+    elif norm in ("bf16", "bfloat16"):
+        if HAS_TORCH:
+            target_dtype = dtype or torch.bfloat16
+            raw_int16 = np.frombuffer(data, dtype=np.int16).copy()
+            return torch.from_numpy(raw_int16).view(torch.bfloat16).reshape(shape).to(device=target_device, dtype=target_dtype)
+        return np.frombuffer(data, dtype=np.float16).reshape(shape).astype(np.float32)
+
+    elif norm in ("none", "fp32", "float32"):
         arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
+        if HAS_TORCH:
+            target_dtype = dtype or torch.float32
+            return torch.from_numpy(arr.copy()).to(device=target_device, dtype=target_dtype)
+        return arr
+
+    elif norm in ("int8", "q8_0"):
+        arr = np.frombuffer(data, dtype=np.int8).reshape(shape).astype(np.float32) * scale
+        if HAS_TORCH:
+            target_dtype = dtype or torch.float32
+            return torch.from_numpy(arr).to(device=target_device, dtype=target_dtype)
+        return arr
+
     else:
         raise ValueError(f"Unsupported compression method: {method}")
-
-    if HAS_TORCH:
-        target_dtype = dtype or torch.float32
-        target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        tensor = torch.from_numpy(arr).to(device=target_device, dtype=target_dtype)
-        return tensor
-    else:
-        return arr
 
 
 def compress_temporal_delta(
     current_arr: np.ndarray,
     last_arr: Optional[np.ndarray] = None,
-    sparsify_ratio: float = 0.15,
+    sparsify_ratio: float = 1.0,
 ) -> Tuple[bytes, float, Tuple[int, ...], Optional[bytes]]:
     """
-    DisTrO/D2C-style temporal delta compression:
-    Computes delta = current - last, keeps Top-K largest changes, quantizes to INT8.
-    Reduces payload size to < 500 bytes per token.
+    Dense activation transfer replacing lossy temporal delta sparsification.
+    Defaults to 100% dense unsparsified FP16 activations (sparsify_ratio=1.0).
+    When sparsify_ratio < 1.0 is explicitly passed, provides backward-compatible Top-K sparsification.
     """
     arr = np.asarray(current_arr, dtype=np.float32)
     shape = arr.shape
-    flat = arr.flatten()
 
-    if last_arr is None:
-        # First step: standard quantization
-        comp_bytes, scale, _ = compress_tensor(arr, method="int8")
+    # Dense unsparsified path (default): preserves all coordinates without pruning
+    if sparsify_ratio >= 1.0 or last_arr is None:
+        comp_bytes, scale, _ = compress_tensor(arr, method="fp16")
         return comp_bytes, scale, shape, None
 
+    # Backward-compatible Top-K sparsification (if explicitly requested with sparsify_ratio < 1.0)
+    flat = arr.flatten()
     last_flat = np.asarray(last_arr, dtype=np.float32).flatten()
     delta = flat - last_flat
 
-    # Top-K sparsification
     k = max(1, int(len(delta) * sparsify_ratio))
     top_k_indices = np.argpartition(np.abs(delta), -k)[-k:].astype(np.int32)
     top_k_values = delta[top_k_indices]
@@ -138,8 +159,13 @@ def decompress_temporal_delta(
     indices_bytes: Optional[bytes] = None,
     last_arr: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Dequantizes temporal delta and reconstructs tensor."""
+    """Dequantizes temporal delta or unpacks dense activation tensor."""
     if indices_bytes is None or last_arr is None:
+        expected_elems = int(np.prod(shape))
+        if len(values_bytes) == expected_elems * 2:
+            return np.frombuffer(values_bytes, dtype=np.float16).reshape(shape).astype(np.float32)
+        elif len(values_bytes) == expected_elems * 4:
+            return np.frombuffer(values_bytes, dtype=np.float32).reshape(shape)
         return np.frombuffer(values_bytes, dtype=np.int8).reshape(shape).astype(np.float32) * scale
 
     flat_last = np.asarray(last_arr, dtype=np.float32).flatten().copy()

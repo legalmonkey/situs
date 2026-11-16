@@ -119,6 +119,9 @@ class SpeculativeVerifier:
             # No valid torch logits available: safely reject candidates to prevent runaway loops
             return [], None
 
+        if logits_sequence.dim() == 2:
+            logits_sequence = logits_sequence.unsqueeze(0)
+
         # logits_sequence shape: [1, num_candidates, vocab_size]
         for idx in range(num_candidates):
             cand_token = candidate_tokens[idx]
@@ -127,7 +130,7 @@ class SpeculativeVerifier:
             # Sample true token from target model
             target_token = self.sampler.sample_next_token(token_logits, temperature=temperature, top_p=top_p)
 
-            if cand_token == target_token or temperature < 0.1:
+            if cand_token == target_token:
                 accepted.append(cand_token)
             else:
                 # Rejection: accept tokens up to this point and append the target model's correction

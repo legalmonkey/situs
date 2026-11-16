@@ -203,7 +203,12 @@ def test_sidebar_nodes_and_stages_fragment_generation():
 
 def test_live_socket_handshake_and_removal():
     """Real end-to-end socket handshake and worker removal on live coordinator."""
-    from situs.tui import start_in_process_coordinator, start_in_process_worker
+    from situs.tui import (
+        start_in_process_coordinator,
+        start_in_process_worker,
+        stop_in_process_coordinator,
+        stop_all_in_process_workers,
+    )
     import httpx
 
     # 1. Start live coordinator
@@ -249,4 +254,7 @@ def test_live_socket_handshake_and_removal():
         status_resp = client.get("http://127.0.0.1:8000/status")
         workers_after = status_resp.json().get("workers", [])
         assert not any(w.get("worker_id") == w_id or w.get("id") == w_id for w in workers_after)
+
+    stop_all_in_process_workers()
+    stop_in_process_coordinator()
 

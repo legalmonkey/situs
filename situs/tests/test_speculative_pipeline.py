@@ -110,12 +110,22 @@ def test_speculative_pipeline_burst_acceleration():
     cand_payload = SpeculativeCandidates.model_validate(frame_a2.payload)
     assert cand_payload.candidate_tokens == [30, 40, 99, 10]
 
+    # Align mock model logits to simulate true target model prediction of candidate tokens
+    orig_forward = engine_b.stage_model.forward_intermediate_stage
+    def mock_matching_forward(hidden_states, past_kvs=None):
+        out, new_kvs = orig_forward(hidden_states, past_kvs=past_kvs)
+        for i, tok in enumerate([30, 40, 99, 10]):
+            if i < out.shape[1]:
+                out[0, i, tok] = 1000.0
+        return out, new_kvs
+    engine_b.stage_model.forward_intermediate_stage = mock_matching_forward
+
     # 4. Worker B receives the multi-token candidates and verifies them in 1 pass!
     frame_b2 = engine_b.process_speculative_candidates(cand_payload)
     assert frame_b2.type == MessageType.SPECULATIVE_VERIFIED
 
     verified_payload = SpeculativeVerified.model_validate(frame_b2.payload)
-    # At temperature=0, verification accepts tokens in 1 pass!
+    # At temperature=0, verification accepts verified tokens in 1 pass!
     assert len(verified_payload.accepted_tokens) >= 3
     assert 30 in verified_payload.accepted_tokens
     assert 40 in verified_payload.accepted_tokens

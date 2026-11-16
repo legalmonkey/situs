@@ -281,7 +281,7 @@ def start_public_tunnel(
         if not exe:
             return False, None, (
                 "cloudflared binary not available on this system and automatic download failed.\n"
-                "Install cloudflared or use Tailscale (/join 100.x.y.z:8000) for cross-Wi-Fi clustering."
+                f"Install cloudflared or use Tailscale (/join 100.x.y.z:{port}) for cross-Wi-Fi clustering."
             )
 
         tunnel = PublicTunnelManager(port=port, cloudflared_path=exe)

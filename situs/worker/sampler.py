@@ -35,11 +35,12 @@ class TokenSampler:
             elif logits.dim() == 2:
                 logits = logits[-1, :]
 
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
+            # Any NaN or positive Inf indicates gradient explosion / numerical divergence -> return EOS
+            if torch.isnan(logits).any() or torch.isposinf(logits).any():
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
-            # Prevent uniform random sampling across 256k vocab if weights are uninitialized (all zeros)
-            if torch.all(logits == 0):
+            # If all logits are negative Inf (all masked) or all are zero (uninitialized weights) -> return EOS
+            if torch.isneginf(logits).all() or torch.all(logits == 0):
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
             if temperature <= 0.01:
@@ -64,6 +65,11 @@ class TokenSampler:
                 logits[indices_to_remove] = -float("Inf")
 
             probs = F.softmax(logits, dim=-1)
+            # Guard against NaN/Inf or all-zero probabilities resulting from aggressive masking/underflow
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs <= 0).all():
+                valid_logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
+                return int(torch.argmax(valid_logits).item())
+
             gen = None
             if seed is not None:
                 device_str = logits.device.type if (hasattr(logits, "device") and logits.device.type in ("cpu", "cuda")) else "cpu"
@@ -79,10 +85,12 @@ class TokenSampler:
             elif arr.ndim == 2:
                 arr = arr[-1, :]
 
-            if np.isnan(arr).any() or np.isinf(arr).any():
+            # Any NaN or positive Inf indicates divergence -> return EOS
+            if np.isnan(arr).any() or np.isposinf(arr).any():
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
-            if np.all(arr == 0):
+            # All masked (-inf) or uninitialized zeros -> return EOS
+            if np.all(np.isneginf(arr)) or np.all(arr == 0):
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
             if temperature <= 0.01:
@@ -92,7 +100,10 @@ class TokenSampler:
             # Subtract max for numerical stability
             arr = arr - np.max(arr)
             exp_logits = np.exp(arr)
-            probs = exp_logits / np.sum(exp_logits)
+            sum_exp = np.sum(exp_logits)
+            if sum_exp <= 0 or np.isnan(sum_exp) or np.isinf(sum_exp):
+                return int(np.argmax(arr))
+            probs = exp_logits / sum_exp
             rng = np.random.RandomState(int(seed) + int(step_index)) if seed is not None else np.random
             return int(rng.choice(len(probs), p=probs))
 

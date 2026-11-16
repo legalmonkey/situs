@@ -78,7 +78,7 @@ def pack_tensor_frame(
     batch_size: int,
     seq_length: int,
     hidden_dim: int,
-    dtype: str = "int8",
+    dtype: str = "fp16",
     scale: float = 1.0,
     offset: float = 0.0,
     microbatch_id: int = 0,
@@ -88,7 +88,14 @@ def pack_tensor_frame(
     if not isinstance(payload_bytes, (bytes, bytearray)):
         raise TensorContractError("Payload must be contiguous bytes or bytearray")
 
-    dtype_enum = DTYPE_TO_ENUM.get(dtype.lower(), 3)
+    d_norm = dtype.lower()
+    if d_norm == "fp16":
+        d_norm = "float16"
+    elif d_norm == "bf16":
+        d_norm = "bfloat16"
+    elif d_norm in ("fp32", "none"):
+        d_norm = "float32"
+    dtype_enum = DTYPE_TO_ENUM.get(d_norm, 1)  # Default to 1 (float16)
     req_bytes = _uuid_to_16bytes(request_id)
     payload_len = len(payload_bytes)
     checksum = zlib.crc32(payload_bytes) & 0xFFFFFFFF
@@ -165,7 +172,7 @@ def unpack_tensor_frame(data: bytes) -> Tuple[Dict[str, Any], bytes]:
         "seq_length": seq_length,
         "hidden_dim": hidden_dim,
         "shape": [batch_size, seq_length, hidden_dim],
-        "dtype": ENUM_TO_DTYPE.get(dtype_enum, "int8"),
+        "dtype": ENUM_TO_DTYPE.get(dtype_enum, "float16"),
         "scale": scale,
         "offset": offset,
         "msg_type": msg_type,
