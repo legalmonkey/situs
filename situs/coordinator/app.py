@@ -655,7 +655,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         or len(pipeline) != len(alive)
         or any(w.assigned_layer_start is None for w in alive)
         or (registry.active_model is not None and registry.active_model != target_model)
-        or (len(pipeline) > 0 and (pipeline[0].assigned_layer_start != 0 or pipeline[-1].assigned_layer_end < getattr(registry, "total_layers", 1)))
+        or (len(pipeline) > 0 and (pipeline[0].assigned_layer_start != 0 or pipeline[-1].assigned_layer_end != getattr(registry, "total_layers", 1)))
     )
 
     if model_is_local and needs_partition:
@@ -704,7 +704,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     or len(pipeline) != len(current_alive)
                     or any(w.assigned_layer_start is None for w in current_alive)
                     or (registry.active_model is not None and registry.active_model != target_model)
-                    or (len(pipeline) > 0 and (pipeline[0].assigned_layer_start != 0 or pipeline[-1].assigned_layer_end < getattr(registry, "total_layers", 1)))
+                    or (len(pipeline) > 0 and (pipeline[0].assigned_layer_start != 0 or pipeline[-1].assigned_layer_end != getattr(registry, "total_layers", 1)))
                 )
                 if needs_partition_stream:
                     if len(current_alive) >= 1:
@@ -990,112 +990,102 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     else:
         # Non-streaming request flow
-        if not model_is_local:
-            ollama_ep = get_ollama_endpoints()[0] if get_ollama_endpoints() else "http://127.0.0.1:11434"
-            ensure_ollama_model(ollama_ep, target_model)
         try:
-            tokenizer = get_or_load_tokenizer(target_model)
-            if tokenizer is None:
-                raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
-            pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer)
-            input_ids = tokenizer.encode(pipeline_prompt)
-            if not input_ids:
-                raise ValueError("Tokenizer returned empty token list.")
-        except Exception as e:
-            relay.cleanup_response_stream(request_id)
-            sem.release()
-            raise HTTPException(status_code=400, detail=f"Prompt tokenization failed: {e}")
+            if not model_is_local:
+                ollama_ep = get_ollama_endpoints()[0] if get_ollama_endpoints() else "http://127.0.0.1:11434"
+                ensure_ollama_model(ollama_ep, target_model)
+            try:
+                tokenizer = get_or_load_tokenizer(target_model)
+                if tokenizer is None:
+                    raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
+                pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer)
+                input_ids = tokenizer.encode(pipeline_prompt)
+                if not input_ids:
+                    raise ValueError("Tokenizer returned empty token list.")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Prompt tokenization failed: {e}")
 
-        # Fallback for unsupported architectures: direct execution via local Ollama daemon
-        from situs.worker.loader import is_architecture_supported
-        meta = resolve_model_metadata(target_model)
-        arch = meta.get("architecture") or meta.get("model_type")
-        arch_supported = is_architecture_supported(arch)
+            # Fallback for unsupported architectures: direct execution via local Ollama daemon
+            from situs.worker.loader import is_architecture_supported
+            meta = resolve_model_metadata(target_model)
+            arch = meta.get("architecture") or meta.get("model_type")
+            arch_supported = is_architecture_supported(arch)
 
-        if not arch_supported:
-            from situs.inference_backend import query_ollama
-            direct_ans = await asyncio.to_thread(query_ollama, pipeline_prompt, target_model)
-            if direct_ans:
-                relay.cleanup_response_stream(request_id)
-                sem.release()
-                return {
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": target_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": direct_ans},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": len(input_ids),
-                        "completion_tokens": len(direct_ans.split()),
-                        "total_tokens": len(input_ids) + len(direct_ans.split()),
-                    },
-                }
-            relay.cleanup_response_stream(request_id)
-            sem.release()
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback was unavailable.",
+            if not arch_supported:
+                from situs.inference_backend import query_ollama
+                direct_ans = await asyncio.to_thread(query_ollama, pipeline_prompt, target_model)
+                if direct_ans:
+                    return {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": target_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": direct_ans},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(input_ids),
+                            "completion_tokens": len(direct_ans.split()),
+                            "total_tokens": len(input_ids) + len(direct_ans.split()),
+                        },
+                    }
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback was unavailable.",
+                )
+
+            if len(pipeline) < 1:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned).",
+                )
+
+            first_worker = pipeline[0]
+            last_worker = pipeline[-1]
+
+            stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
+            start_payload = InferenceStart(
+                request_id=request_id,
+                model_name=target_model,
+                input_ids=input_ids,
+                prompt=pipeline_prompt,
+                real_response=None,
+                max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
+                temperature=req.temperature if req.temperature is not None else 0.7,
+                top_p=req.top_p if req.top_p is not None else 0.9,
+                top_k=getattr(req, "top_k", 50),
+                stop_token_ids=stop_ids,
+                seed=req.seed,
             )
-
-        if len(pipeline) < 1:
-            relay.cleanup_response_stream(request_id)
-            sem.release()
-            raise HTTPException(
-                status_code=503,
-                detail=f"Distributed cluster not ready. Require at least 1 worker (currently {len(pipeline)} assigned).",
-            )
-
-        first_worker = pipeline[0]
-        last_worker = pipeline[-1]
-
-        stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
-        start_payload = InferenceStart(
-            request_id=request_id,
-            model_name=target_model,
-            input_ids=input_ids,
-            prompt=pipeline_prompt,
-            real_response=None,
-            max_new_tokens=req.max_tokens if req.max_tokens is not None else 2048,
-            temperature=req.temperature if req.temperature is not None else 0.7,
-            top_p=req.top_p if req.top_p is not None else 0.9,
-            top_k=getattr(req, "top_k", 50),
-            stop_token_ids=stop_ids,
-            seed=req.seed,
-        )
-        start_frame = ProtocolFrame(
-            type=MessageType.INFERENCE_START,
-            source="coordinator",
-            target=first_worker.worker_id,
-            payload=start_payload.model_dump(),
-        )
-        sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
-        if not sent:
-            relay.cleanup_response_stream(request_id)
-            sem.release()
-            raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
-
-        if last_worker.worker_id != first_worker.worker_id:
-            cfg_frame = ProtocolFrame(
+            start_frame = ProtocolFrame(
                 type=MessageType.INFERENCE_START,
                 source="coordinator",
-                target=last_worker.worker_id,
+                target=first_worker.worker_id,
                 payload=start_payload.model_dump(),
             )
-            await relay.send_to_worker(last_worker.worker_id, cfg_frame)
+            sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
+            if not sent:
+                raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
 
-        # Enforce bounded deadline for completion to prevent hanging indefinite waits
-        deadline = time.time() + config.request_timeout_s
-        generated_text = ""
-        finish_reason = "stop"
-        has_unverified_draft = False
+            if last_worker.worker_id != first_worker.worker_id:
+                cfg_frame = ProtocolFrame(
+                    type=MessageType.INFERENCE_START,
+                    source="coordinator",
+                    target=last_worker.worker_id,
+                    payload=start_payload.model_dump(),
+                )
+                await relay.send_to_worker(last_worker.worker_id, cfg_frame)
 
-        try:
+            # Enforce bounded deadline for completion to prevent hanging indefinite waits
+            deadline = time.time() + config.request_timeout_s
+            generated_text = ""
+            finish_reason = "stop"
+            has_unverified_draft = False
+
             while True:
                 # Circuit breaker: detect worker drops mid-generation (Item 4)
                 broken_worker = next((pw for pw in pipeline if not relay.is_worker_connected(pw.worker_id)), None)
@@ -1181,6 +1171,27 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 elif frame.type == MessageType.INFERENCE_FINISH:
                     break
 
+            resp_dict = {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": target_model or req.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": generated_text},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": len(input_ids),
+                    "completion_tokens": len(generated_text.split()),
+                    "total_tokens": len(input_ids) + len(generated_text.split()),
+                },
+                "is_verified": not has_unverified_draft,
+                "unverified_draft": has_unverified_draft,
+            }
+            return resp_dict
         finally:
             relay.cleanup_response_stream(request_id)
             sem.release()

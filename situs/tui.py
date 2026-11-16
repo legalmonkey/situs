@@ -1956,12 +1956,28 @@ def execute_slash_command(
                     border_style="#ff2a85"
                 )
             else:
+                layers_disp = session_state.get("total_layers")
+                hidden_disp = None
+                arch_disp = "Decoder-only Causal LM with Pipeline Parallelism"
+                prec_disp = "FP16/INT8"
+                try:
+                    from situs.coordinator.registry import resolve_model_metadata
+                    meta = resolve_model_metadata(curr_model)
+                    if layers_disp is None or layers_disp <= 0:
+                        layers_disp = meta.get("total_layers")
+                    hidden_disp = meta.get("hidden_dim")
+                    arch_disp = meta.get("architecture") or arch_disp
+                    prec_disp = (meta.get("precision") or meta.get("torch_dtype") or prec_disp).upper()
+                except Exception:
+                    pass
+                layers_str = f"{layers_disp} Transformer Blocks" if layers_disp else "Auto-detected Transformer Blocks"
+                hidden_str = f"{hidden_disp}" if hidden_disp else "Auto-detected"
                 model_panel = Panel(
                     f"[bold white]Active Model:[/bold white] {curr_model}\n"
-                    f"[bold #ff70a6]• Quantization:[/bold #ff70a6] Q8_0 (~4.0 GB weight VRAM)\n"
-                    f"[bold #ff70a6]• Layers:[/bold #ff70a6] 32 Transformer Blocks\n"
-                    f"[bold #ff70a6]• Hidden Size:[/bold #ff70a6] 2048\n"
-                    f"[bold #ff70a6]• Architecture:[/bold #ff70a6] Decoder-only Causal LM with Pipeline Parallelism\n\n"
+                    f"[bold #ff70a6]• Precision:[/bold #ff70a6] {prec_disp}\n"
+                    f"[bold #ff70a6]• Layers:[/bold #ff70a6] {layers_str}\n"
+                    f"[bold #ff70a6]• Hidden Size:[/bold #ff70a6] {hidden_str}\n"
+                    f"[bold #ff70a6]• Architecture:[/bold #ff70a6] {arch_disp}\n\n"
                     f"{hint_line}",
                     title="Active Model Status",
                     border_style="#ff2a85"
@@ -2858,8 +2874,20 @@ def run_opencode_tui(
                 frags.append(("bold #ff70a6", f"{disp_title}\n", on_sidebar_model_click))
             else:
                 frags.append(("bold #ff70a6", f"{disp_title}\n"))
+            layers_disp = session_state.get("total_layers")
+            prec_disp = "FP16/INT8"
+            try:
+                from situs.coordinator.registry import resolve_model_metadata
+                meta = resolve_model_metadata(curr_m)
+                if layers_disp is None or layers_disp <= 0:
+                    layers_disp = meta.get("total_layers")
+                if meta.get("precision"):
+                    prec_disp = meta.get("precision").upper()
+            except Exception:
+                pass
+            layers_str = f"{layers_disp} Layers" if layers_disp else "Auto Layers"
             frags.append(("#94a3b8", "Configuration: "))
-            frags.append(("#e2e8f0", "32 Layers · FP16/INT8\n"))
+            frags.append(("#e2e8f0", f"{layers_str} · {prec_disp}\n"))
 
         if session_state.get("is_pulling"):
             pull_pct = session_state.get("pull_percent", 0.0)
@@ -3343,7 +3371,15 @@ def run_opencode_tui(
             curr_m = session_state.get("model", model)
             m_info = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == curr_m.lower() or m["name"].lower() == curr_m.lower()), None)
             disp_m = m_info["name"] if m_info else curr_m
-            disp_layers = m_info["layers"] if m_info else 32
+            disp_layers = m_info["layers"] if m_info else session_state.get("total_layers")
+            if not disp_layers:
+                try:
+                    from situs.coordinator.registry import resolve_model_metadata
+                    meta = resolve_model_metadata(curr_m)
+                    disp_layers = meta.get("total_layers")
+                except Exception:
+                    pass
+            disp_layers = disp_layers or 32
             stages_txt = f"Pipeline Stage 1 & {w_cnt}" if w_cnt > 1 else ("Pipeline Stage 1" if w_cnt == 1 else "Standalone Local Stage")
             hdr_line = f"← {stages_txt} · {disp_m} ({disp_layers} Layers)"
             history_entries.append(("stage", hdr_line, disp_m))

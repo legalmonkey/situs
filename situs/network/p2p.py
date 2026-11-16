@@ -3,7 +3,7 @@
 import json
 import logging
 import asyncio
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Union
 
 try:
     from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
@@ -140,11 +140,12 @@ class P2PDataChannelNode:
             else:
                 logger.debug(f"Ignoring ice_answer in signaling state {self.pc.signalingState}")
 
-    def send_frame(self, data_str: str) -> bool:
+    def send_frame(self, data_str: Union[str, bytes]) -> bool:
         """Sends data over direct P2P UDP DataChannel if open and within safe SCTP bounds."""
         if not (self.is_connected and self.channel and self.channel.readyState == "open"):
             return False
-        if len(data_str.encode("utf-8")) > SAFE_SCTP_MAX_BYTES:
+        byte_len = len(data_str) if isinstance(data_str, bytes) else len(data_str.encode("utf-8"))
+        if byte_len > SAFE_SCTP_MAX_BYTES:
             return False
         try:
             self.channel.send(data_str)

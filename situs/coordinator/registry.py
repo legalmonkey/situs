@@ -674,7 +674,7 @@ def optimal_heterogeneous_partition(
     # Ensure every worker has at least 1 layer if total_layers >= K
     if total_layers >= K:
         for idx in range(K):
-            if alloc[idx] == 0:
+            if alloc[idx] == 0 and capacities_layers[idx] > 0:
                 max_idx = max(range(K), key=lambda x: alloc[x])
                 if alloc[max_idx] > 1:
                     alloc[max_idx] -= 1

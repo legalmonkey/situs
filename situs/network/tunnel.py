@@ -183,7 +183,7 @@ class PublicTunnelManager:
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 startupinfo=startupinfo,
@@ -220,11 +220,26 @@ class PublicTunnelManager:
 
     def _read_output_loop(self):
         """Reads output stream in real time until the trycloudflare.com URL is found."""
-        if not self.process or not self.process.stderr:
+        if not self.process:
+            return
+
+        import io
+        stdout_obj = getattr(self.process, "stdout", None)
+        stderr_obj = getattr(self.process, "stderr", None)
+
+        # Prefer real I/O stream (TextIOWrapper from subprocess or StringIO in test fixtures)
+        if isinstance(stdout_obj, io.IOBase):
+            stream = stdout_obj
+        elif isinstance(stderr_obj, io.IOBase):
+            stream = stderr_obj
+        else:
+            stream = stdout_obj or stderr_obj
+
+        if not stream:
             return
 
         try:
-            for line in iter(self.process.stderr.readline, ""):
+            for line in iter(stream.readline, ""):
                 if self._stop_event.is_set():
                     break
                 line_str = line.strip()
