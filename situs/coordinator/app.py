@@ -749,6 +749,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 arch_supported = is_architecture_supported(arch)
 
                 if not arch_supported:
+                    if os.environ.get("SITUS_STRICT_DISTRIBUTED") == "1":
+                        yield f"data: {json.dumps({'error': f'Model architecture {arch} is not supported by Situs distributed engine (SITUS_STRICT_DISTRIBUTED=1).'})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    logger.warning(
+                        f"Model architecture '{arch}' is not supported by Situs distributed engine. "
+                        f"Streaming via Coordinator local Ollama daemon for request {request_id}."
+                    )
                     canonical = normalize_ollama_model(target_model)
                     ensure_ollama_running()
                     direct_success = False
@@ -1012,10 +1020,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             arch_supported = is_architecture_supported(arch)
 
             if not arch_supported:
+                if os.environ.get("SITUS_STRICT_DISTRIBUTED") == "1":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Model architecture '{arch}' is not supported by Situs distributed engine (SITUS_STRICT_DISTRIBUTED=1).",
+                    )
+                logger.warning(
+                    f"Model architecture '{arch}' is not supported by Situs distributed engine. "
+                    f"Falling back to Coordinator local Ollama daemon for request {request_id}."
+                )
                 from situs.inference_backend import query_ollama
                 direct_ans = await asyncio.to_thread(query_ollama, pipeline_prompt, target_model)
                 if direct_ans:
-                    return {
+                    from fastapi.responses import JSONResponse
+                    resp_dict = {
                         "id": request_id,
                         "object": "chat.completion",
                         "created": int(time.time()),
@@ -1033,6 +1051,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "total_tokens": len(input_ids) + len(direct_ans.split()),
                         },
                     }
+                    return JSONResponse(
+                        content=resp_dict,
+                        headers={"X-Situs-Execution": "local-ollama-fallback"},
+                    )
                 raise HTTPException(
                     status_code=400,
                     detail=f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback was unavailable.",
@@ -1112,21 +1134,24 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     await relay.route_frame(abort_frame)
                     raise HTTPException(status_code=499, detail="Client Closed Request")
 
-                remaining = max(0.1, deadline - time.time())
+                remaining = max(0.01, deadline - time.time())
+                wait_slice = min(remaining, 2.0)
                 try:
-                    frame: ProtocolFrame = await asyncio.wait_for(stream_queue.get(), timeout=remaining)
+                    frame: ProtocolFrame = await asyncio.wait_for(stream_queue.get(), timeout=wait_slice)
                 except asyncio.TimeoutError:
-                    logger.error(f"Request {request_id} timed out after {config.request_timeout_s}s")
-                    abort_frame = ProtocolFrame(
-                        type=MessageType.INFERENCE_ABORT,
-                        source="coordinator",
-                        payload={"request_id": request_id},
-                    )
-                    await relay.route_frame(abort_frame)
-                    raise HTTPException(
-                        status_code=504,
-                        detail=f"Inference request timed out after {config.request_timeout_s} seconds.",
-                    )
+                    if time.time() >= deadline:
+                        logger.error(f"Request {request_id} timed out after {config.request_timeout_s}s")
+                        abort_frame = ProtocolFrame(
+                            type=MessageType.INFERENCE_ABORT,
+                            source="coordinator",
+                            payload={"request_id": request_id},
+                        )
+                        await relay.route_frame(abort_frame)
+                        raise HTTPException(
+                            status_code=504,
+                            detail=f"Inference request timed out after {config.request_timeout_s} seconds.",
+                        )
+                    continue
 
                 if frame.type == MessageType.NEXT_TOKEN:
                     token_info = NextToken.model_validate(frame.payload)

@@ -240,6 +240,7 @@ def _query_nvml(dev_idx: int = 0, force_refresh: bool = False) -> Optional[Tuple
 _last_smi_query_time: float = 0.0
 _last_smi_result: Optional[Tuple[str, int, int, int]] = None
 _SMI_CACHE_TTL: float = 2.0
+_smi_lock = threading.Lock()
 
 
 def query_nvidia_smi(force_refresh: bool = False, dev_idx: int = 0) -> Optional[Tuple[str, int, int, int]]:
@@ -247,45 +248,46 @@ def query_nvidia_smi(force_refresh: bool = False, dev_idx: int = 0) -> Optional[
     Uses fast in-process NVML when available, falling back to nvidia-smi subprocess.
     """
     global _last_smi_query_time, _last_smi_result
-    nvml_res = _query_nvml(dev_idx=dev_idx, force_refresh=force_refresh)
-    if nvml_res is not None:
-        _last_smi_result = nvml_res
-        _last_smi_query_time = time.time()
-        return nvml_res
+    with _smi_lock:
+        nvml_res = _query_nvml(dev_idx=dev_idx, force_refresh=force_refresh)
+        if nvml_res is not None:
+            _last_smi_result = nvml_res
+            _last_smi_query_time = time.time()
+            return nvml_res
 
-    now = time.time()
-    if not force_refresh and _last_smi_result is not None and (now - _last_smi_query_time) < _SMI_CACHE_TTL:
-        return _last_smi_result
-
-    smi_bin = find_nvidia_smi()
-    if not smi_bin:
-        return None
-    try:
-        res = subprocess.run(
-            [smi_bin, "--query-gpu=name,memory.total,memory.free,memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=6.0,
-            check=True,
-        )
-        output = res.stdout.strip()
-        if output:
-            lines = output.splitlines()
-            line = lines[dev_idx] if dev_idx < len(lines) else lines[0]
-            parts = [p.strip() for p in line.split(",")]
-            gpu_name = parts[0]
-            total_mb = float(parts[1]) if (len(parts) > 1 and parts[1]) else 0.0
-            free_mb = float(parts[2]) if (len(parts) > 2 and parts[2]) else total_mb
-            used_mb = float(parts[3]) if (len(parts) > 3 and parts[3]) else max(0.0, total_mb - free_mb)
-            total_b = int(total_mb * 1024 * 1024)
-            free_b = int(free_mb * 1024 * 1024)
-            used_b = int(used_mb * 1024 * 1024)
-            _last_smi_result = (gpu_name, total_b, free_b, used_b)
-            _last_smi_query_time = now
+        now = time.time()
+        if not force_refresh and _last_smi_result is not None and (now - _last_smi_query_time) < _SMI_CACHE_TTL:
             return _last_smi_result
-    except Exception:
-        pass
-    return _last_smi_result
+
+        smi_bin = find_nvidia_smi()
+        if not smi_bin:
+            return None
+        try:
+            res = subprocess.run(
+                [smi_bin, "--query-gpu=name,memory.total,memory.free,memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=6.0,
+                check=True,
+            )
+            output = res.stdout.strip()
+            if output:
+                lines = output.splitlines()
+                line = lines[dev_idx] if dev_idx < len(lines) else lines[0]
+                parts = [p.strip() for p in line.split(",")]
+                gpu_name = parts[0]
+                total_mb = float(parts[1]) if (len(parts) > 1 and parts[1]) else 0.0
+                free_mb = float(parts[2]) if (len(parts) > 2 and parts[2]) else total_mb
+                used_mb = float(parts[3]) if (len(parts) > 3 and parts[3]) else max(0.0, total_mb - free_mb)
+                total_b = int(total_mb * 1024 * 1024)
+                free_b = int(free_mb * 1024 * 1024)
+                used_b = int(used_mb * 1024 * 1024)
+                _last_smi_result = (gpu_name, total_b, free_b, used_b)
+                _last_smi_query_time = now
+                return _last_smi_result
+        except Exception:
+            pass
+        return _last_smi_result
 
 
 _vram_lock = threading.Lock()

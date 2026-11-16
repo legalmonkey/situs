@@ -60,6 +60,14 @@ class WorkerDaemon:
         self._cached_hw = None
 
     @property
+    def running(self) -> bool:
+        return self.is_running
+
+    @running.setter
+    def running(self, val: bool):
+        self.is_running = val
+
+    @property
     def p2p_node(self) -> Optional[P2PDataChannelNode]:
         if not self.p2p_nodes:
             return None
@@ -71,6 +79,14 @@ class WorkerDaemon:
             self.p2p_nodes.clear()
         else:
             self.p2p_nodes[val.target_worker_id] = val
+
+    @property
+    def running(self) -> bool:
+        return self.is_running
+
+    @running.setter
+    def running(self, val: bool):
+        self.is_running = val
 
     @property
     def running(self) -> bool:
@@ -286,7 +302,7 @@ class WorkerDaemon:
                 logger.debug("Heartbeat loop: connection closed")
                 break
             except Exception as e:
-                if (not self.running) or ("cannot schedule new futures after shutdown" in str(e)):
+                if (not self.is_running) or ("cannot schedule new futures after shutdown" in str(e)):
                     break
                 logger.warning(f"Heartbeat transient error: {e}")
                 await asyncio.sleep(2.0)

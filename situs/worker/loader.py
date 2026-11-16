@@ -2187,7 +2187,8 @@ def load_hf_stage_model(
     if has_gguf_source and HAS_TORCH:
         if "cuda" in str(device) and torch.cuda.is_available():
             can_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
-            is_gemma_family = any(g in str(arch).lower() for g in ("gemma", "gemma2", "gemma3")) or bool(spec.get("embed_scale_sqrt"))
+            arch_spec = _get_arch_spec(arch)
+            is_gemma_family = any(g in str(arch).lower() for g in ("gemma", "gemma2", "gemma3")) or bool(arch_spec.get("embed_scale_sqrt"))
             if can_bf16 and (is_gemma_family or stage_dtype == torch.bfloat16):
                 stage_dtype = torch.bfloat16
             elif is_gemma_family and not can_bf16:

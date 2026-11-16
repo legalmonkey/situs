@@ -1,5 +1,6 @@
 """Direct Peer-to-Peer WebRTC DataChannel transport with STUN NAT hole-punching."""
 
+import os
 import json
 import logging
 import asyncio
@@ -20,8 +21,14 @@ DEFAULT_STUN_SERVERS = [
 ]
 
 # Conservative SCTP message limit for direct DataChannel transfer.
-# Sized at 128 KB so dense FP16 speculative candidate bursts (~55 KB) transmit
-# directly over P2P UDP, while large multi-megabyte prefill tensors fall back to WebSocket relay.
+# Sized at 128 KB by default so dense speculative candidate bursts (~55 KB) transmit
+# directly over P2P UDP, configurable via SITUS_P2P_MAX_BYTES for higher bandwidth environments.
+def get_safe_sctp_max_bytes() -> int:
+    try:
+        return int(os.environ.get("SITUS_P2P_MAX_BYTES", 128 * 1024))
+    except (ValueError, TypeError):
+        return 128 * 1024
+
 SAFE_SCTP_MAX_BYTES = 128 * 1024
 
 
@@ -145,7 +152,8 @@ class P2PDataChannelNode:
         if not (self.is_connected and self.channel and self.channel.readyState == "open"):
             return False
         byte_len = len(data_str) if isinstance(data_str, bytes) else len(data_str.encode("utf-8"))
-        if byte_len > SAFE_SCTP_MAX_BYTES:
+        max_allowed = get_safe_sctp_max_bytes()
+        if byte_len > max_allowed:
             return False
         try:
             self.channel.send(data_str)

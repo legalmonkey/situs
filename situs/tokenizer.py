@@ -7,6 +7,7 @@ Guarantees consistent token encoding and decoding, preventing gibberish Unicode 
 import os
 import sys
 import logging
+import threading
 from typing import Optional, List, Any, Dict
 
 # Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
@@ -167,6 +168,7 @@ class GGUFTokenizerAdapter:
 
 
 _tokenizers_cache: Dict[str, Any] = {}
+_tokenizer_lock = threading.Lock()
 
 
 def get_or_load_tokenizer(
@@ -181,8 +183,9 @@ def get_or_load_tokenizer(
     """
     clean_name = (model_name or "default").lower().strip()
     cache_key = clean_name
-    if cache_key in _tokenizers_cache:
-        return _tokenizers_cache[cache_key]
+    with _tokenizer_lock:
+        if cache_key in _tokenizers_cache:
+            return _tokenizers_cache[cache_key]
 
     # Prefer embedded GGUF tokenizer whenever running from a local GGUF / Ollama model without local HF safetensors
     if model_name and model_name not in ("default", "gpt2"):
@@ -192,7 +195,8 @@ def get_or_load_tokenizer(
                 gguf_path = model_name if (os.path.isfile(model_name) and model_name.lower().endswith(".gguf")) else find_local_ollama_gguf_file(model_name)
                 if gguf_path:
                     tok = GGUFTokenizerAdapter(gguf_path)
-                    _tokenizers_cache[cache_key] = tok
+                    with _tokenizer_lock:
+                        _tokenizers_cache[cache_key] = tok
                     logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {gguf_path}")
                     return tok
         except Exception as e:
@@ -282,7 +286,8 @@ def get_or_load_tokenizer(
             try:
                 tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                 if tok is not None:
-                    _tokenizers_cache[cache_key] = tok
+                    with _tokenizer_lock:
+                        _tokenizers_cache[cache_key] = tok
                     logger.info(f"Loaded verified tokenizer for '{model_name}' from {cand}")
                     return tok
             except Exception as e:
@@ -301,7 +306,8 @@ def get_or_load_tokenizer(
                             try:
                                 tok = AutoTokenizer.from_pretrained(s, local_files_only=True)
                                 if tok is not None:
-                                    _tokenizers_cache[cache_key] = tok
+                                    with _tokenizer_lock:
+                                        _tokenizers_cache[cache_key] = tok
                                     logger.info(f"Loaded cached snapshot tokenizer for '{model_name}' from {s}")
                                     return tok
                             except Exception:
@@ -309,7 +315,8 @@ def get_or_load_tokenizer(
                 try:
                     tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                     if tok is not None:
-                        _tokenizers_cache[cache_key] = tok
+                        with _tokenizer_lock:
+                            _tokenizers_cache[cache_key] = tok
                         logger.info(f"Loaded cached tokenizer for '{model_name}' from {cand}")
                         return tok
                 except Exception:
@@ -322,7 +329,8 @@ def get_or_load_tokenizer(
                 try:
                     tok = AutoTokenizer.from_pretrained(cand)
                     if tok is not None:
-                        _tokenizers_cache[cache_key] = tok
+                        with _tokenizer_lock:
+                            _tokenizers_cache[cache_key] = tok
                         logger.info(f"Downloaded and loaded tokenizer for '{model_name}' from {cand}")
                         return tok
                 except Exception:

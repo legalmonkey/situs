@@ -2047,23 +2047,21 @@ def execute_slash_command(
                                                     session_state["pull_stage"] = stage
                                                     session_state["pull_speed"] = f"{spd:.1f} MB/s" if spd > 0 else ""
 
-                                                    if history_entries and history_entries[-1][0] == "loading":
-                                                        history_entries[-1] = ("loading", p_text, m_id)
-                                                    else:
-                                                        history_entries.append(("loading", p_text, m_id))
-
-                                                    if app_instance[0]:
-                                                        app_instance[0].invalidate()
+                                                    if log_output_fn:
+                                                        try:
+                                                            log_output_fn(p_text, "Model Pull")
+                                                        except Exception:
+                                                            pass
                                                 elif p_type == "model_ready":
                                                     session_state["is_pulling"] = False
                                                     r_stage = p_chunk.get("stage", "Model Ready in Memory")
                                                     r_text = f"[✓ Online Model Download Complete]\n{r_stage}"
-                                                    if history_entries and history_entries[-1][0] == "loading":
-                                                        history_entries[-1] = ("system", r_text, "Model Ready")
-                                                    else:
-                                                        history_entries.append(("system", r_text, "Model Ready"))
-                                                    if app_instance[0]:
-                                                        app_instance[0].invalidate()
+                                                    session_state["pull_stage"] = r_stage
+                                                    if log_output_fn:
+                                                        try:
+                                                            log_output_fn(r_text, "Model Ready")
+                                                        except Exception:
+                                                            pass
                                                     break
                                             except Exception:
                                                 pass
