@@ -2,6 +2,8 @@
 
 import base64
 import logging
+import threading
+from collections import OrderedDict
 from typing import Optional, Dict, List, Any, Tuple
 from situs.protocol.compression import compress_tensor, decompress_tensor, decompress_layer_bytes
 from situs.protocol.messages import (
@@ -37,10 +39,45 @@ class StageOrderingError(ValueError):
     pass
 
 
+class BoundedSet:
+    """Thread-safe bounded set keeping at most max_size most recent elements (FIFO eviction)."""
+    def __init__(self, max_size: int = 10000):
+        self.max_size = max_size
+        self._items: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def add(self, item: str) -> None:
+        with self._lock:
+            self._items[item] = None
+            self._items.move_to_end(item)
+            if len(self._items) > self.max_size:
+                self._items.popitem(last=False)
+
+    def discard(self, item: str) -> None:
+        with self._lock:
+            self._items.pop(item, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def __contains__(self, item: str) -> bool:
+        with self._lock:
+            return item in self._items
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(list(self._items.keys()))
+
+
 class CancellationTokenRegistry:
     """Out-of-band cancellation registry for cooperative request abortion."""
-    def __init__(self):
-        self._cancelled: set = set()
+    def __init__(self, max_size: int = 10000):
+        self._cancelled = BoundedSet(max_size=max_size)
 
     def cancel(self, request_id: str) -> None:
         self._cancelled.add(request_id)
@@ -102,8 +139,8 @@ class StageExecutionEngine:
         self.session_token_histories: Dict[str, List[int]] = {}
         # Buffer for incoming progressive JIT layer chunks: layer_index -> {chunk_index: b64_payload}
         self.layer_chunk_buffers: Dict[int, Dict[int, str]] = {}
-        # Completed sessions to prevent stale in-flight duplicate frames from reviving finished generations
-        self.finished_sessions: set = set()
+        # Completed sessions to prevent stale in-flight duplicate frames from reviving finished generations (bounded to prevent unbounded growth)
+        self.finished_sessions = BoundedSet(max_size=10000)
 
         # State-of-the-art memory budgeting, cache isolation, and fault recovery
         dev = getattr(stage_model, "device", "cpu")

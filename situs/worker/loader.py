@@ -2,6 +2,7 @@
 
 import io
 import os
+import time
 import math
 import logging
 import threading
@@ -503,10 +504,33 @@ class Int8WeightLinear(nn.Module if HAS_TORCH else object):
                 w_chunk = self.weight[start_idx:end_idx].to(dtype=x.dtype) * self.weight_scale[start_idx:end_idx].to(dtype=x.dtype)
                 b_chunk = self.bias[start_idx:end_idx].to(dtype=x.dtype) if self.bias is not None else None
                 out_chunks.append(F.linear(x, w_chunk, b_chunk))
+                del w_chunk
             return torch.cat(out_chunks, dim=-1)
-        w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
+        elif self.out_features >= 2048 and (self.weight.numel() > 1024 * 1024 or self.out_features > 4096):
+            chunk_size = 2048
+            out_chunks = []
+            for start_idx in range(0, self.out_features, chunk_size):
+                end_idx = min(start_idx + chunk_size, self.out_features)
+                try:
+                    w_chunk = self.weight[start_idx:end_idx].to(dtype=x.dtype) * self.weight_scale[start_idx:end_idx].to(dtype=x.dtype)
+                except torch.OutOfMemoryError:
+                    if HAS_TORCH and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    w_chunk = self.weight[start_idx:end_idx].to(dtype=x.dtype) * self.weight_scale[start_idx:end_idx].to(dtype=x.dtype)
+                b_chunk = self.bias[start_idx:end_idx].to(dtype=x.dtype) if self.bias is not None else None
+                out_chunks.append(F.linear(x, w_chunk, b_chunk))
+                del w_chunk
+            return torch.cat(out_chunks, dim=-1)
+        try:
+            w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
+        except torch.OutOfMemoryError:
+            if HAS_TORCH and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
         b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-        return F.linear(x, w, b)
+        res = F.linear(x, w, b)
+        del w
+        return res
 
 
 class Int8WeightEmbedding(nn.Module if HAS_TORCH else object):
@@ -2439,6 +2463,8 @@ def load_hf_stage_model(
                             if l_idx in stage._layer_events:
                                 stage._layer_events[l_idx].set()
                             loaded_cached += 1
+                            # Cooperatively yield GIL to allow asyncio loop to process heartbeats and signaling
+                            time.sleep(0.005)
 
                         if stage.device != "cpu" and torch.cuda.is_available():
                             torch.cuda.empty_cache()

@@ -349,7 +349,8 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
                 gpu_name = frame.payload.get("gpu_name")
                 total_vram = frame.payload.get("total_vram_bytes")
                 dev_type = frame.payload.get("device_type")
-                registry.update_heartbeat(worker_id, free_vram, gpu_name, total_vram, dev_type, used_vram)
+                p2p_v = frame.payload.get("p2p_verified", False)
+                registry.update_heartbeat(worker_id, free_vram, gpu_name, total_vram, dev_type, used_vram, p2p_verified=p2p_v)
                 ack = ProtocolFrame(
                     type=MessageType.HEARTBEAT_ACK,
                     source="coordinator",
@@ -429,6 +430,7 @@ async def cluster_status():
                 "free_gb": round(w.free_vram_bytes / (1024**3), 2),
                 "vram_available_mb": round(w.free_vram_bytes / (1024**2), 1),
                 "usage_pct": round((getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / max(1, w.total_vram_bytes)) * 100, 1),
+                "p2p_verified": getattr(w, "p2p_verified", False),
                 "vram_exclusive": True,
                 "layer_range": f"{w.assigned_layer_start}..{w.assigned_layer_end}" if w.assigned_layer_start is not None else "unassigned",
                 "assigned_layers": list(range(w.assigned_layer_start, w.assigned_layer_end)) if w.assigned_layer_start is not None else [],
@@ -749,14 +751,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 arch_supported = is_architecture_supported(arch)
 
                 if not arch_supported:
-                    if os.environ.get("SITUS_STRICT_DISTRIBUTED") == "1":
-                        yield f"data: {json.dumps({'error': f'Model architecture {arch} is not supported by Situs distributed engine (SITUS_STRICT_DISTRIBUTED=1).'})}\n\n"
+                    allow_local_fallback = os.environ.get("SITUS_STRICT_DISTRIBUTED") == "0"
+                    if not allow_local_fallback:
+                        yield f"data: {json.dumps({'error': f'Model architecture {arch} is not supported by Situs distributed engine. To bypass cluster and execute locally via Ollama, set SITUS_STRICT_DISTRIBUTED=0.'})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     logger.warning(
                         f"Model architecture '{arch}' is not supported by Situs distributed engine. "
                         f"Streaming via Coordinator local Ollama daemon for request {request_id}."
                     )
+                    yield f"data: {json.dumps({'type': 'execution_notice', 'notice': f'Model architecture {arch} is not supported by distributed cluster; executing locally via Ollama fallback.'})}\n\n"
                     canonical = normalize_ollama_model(target_model)
                     ensure_ollama_running()
                     direct_success = False
@@ -1020,10 +1024,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             arch_supported = is_architecture_supported(arch)
 
             if not arch_supported:
-                if os.environ.get("SITUS_STRICT_DISTRIBUTED") == "1":
+                allow_local_fallback = os.environ.get("SITUS_STRICT_DISTRIBUTED") == "0"
+                if not allow_local_fallback:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Model architecture '{arch}' is not supported by Situs distributed engine (SITUS_STRICT_DISTRIBUTED=1).",
+                        detail=f"Model architecture '{arch}' is not supported by Situs distributed engine. To bypass cluster and execute locally via Ollama, set SITUS_STRICT_DISTRIBUTED=0.",
                     )
                 logger.warning(
                     f"Model architecture '{arch}' is not supported by Situs distributed engine. "

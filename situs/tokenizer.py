@@ -171,22 +171,12 @@ _tokenizers_cache: Dict[str, Any] = {}
 _tokenizer_lock = threading.Lock()
 
 
-def get_or_load_tokenizer(
-    model_name: Optional[str] = None,
-    allow_fallback: bool = False,
+def _resolve_and_load_tokenizer(
+    model_name: Optional[str],
+    clean_name: str,
     local_files_only: bool = False,
 ) -> Any:
-    """
-    Retrieves or initializes a verified HuggingFace or GGUF tokenizer with caching per model.
-    Checks local weights/GGUF/snapshots first for exact alignment and instant offline loading.
-    Raises RuntimeError if a matching tokenizer cannot be found or loaded.
-    """
-    clean_name = (model_name or "default").lower().strip()
-    cache_key = clean_name
-    with _tokenizer_lock:
-        if cache_key in _tokenizers_cache:
-            return _tokenizers_cache[cache_key]
-
+    """Internal disk and network resolution for tokenizers."""
     # Prefer embedded GGUF tokenizer whenever running from a local GGUF / Ollama model without local HF safetensors
     if model_name and model_name not in ("default", "gpt2"):
         try:
@@ -195,8 +185,6 @@ def get_or_load_tokenizer(
                 gguf_path = model_name if (os.path.isfile(model_name) and model_name.lower().endswith(".gguf")) else find_local_ollama_gguf_file(model_name)
                 if gguf_path:
                     tok = GGUFTokenizerAdapter(gguf_path)
-                    with _tokenizer_lock:
-                        _tokenizers_cache[cache_key] = tok
                     logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {gguf_path}")
                     return tok
         except Exception as e:
@@ -286,8 +274,6 @@ def get_or_load_tokenizer(
             try:
                 tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                 if tok is not None:
-                    with _tokenizer_lock:
-                        _tokenizers_cache[cache_key] = tok
                     logger.info(f"Loaded verified tokenizer for '{model_name}' from {cand}")
                     return tok
             except Exception as e:
@@ -306,8 +292,6 @@ def get_or_load_tokenizer(
                             try:
                                 tok = AutoTokenizer.from_pretrained(s, local_files_only=True)
                                 if tok is not None:
-                                    with _tokenizer_lock:
-                                        _tokenizers_cache[cache_key] = tok
                                     logger.info(f"Loaded cached snapshot tokenizer for '{model_name}' from {s}")
                                     return tok
                             except Exception:
@@ -315,8 +299,6 @@ def get_or_load_tokenizer(
                 try:
                     tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                     if tok is not None:
-                        with _tokenizer_lock:
-                            _tokenizers_cache[cache_key] = tok
                         logger.info(f"Loaded cached tokenizer for '{model_name}' from {cand}")
                         return tok
                 except Exception:
@@ -329,12 +311,43 @@ def get_or_load_tokenizer(
                 try:
                     tok = AutoTokenizer.from_pretrained(cand)
                     if tok is not None:
-                        with _tokenizer_lock:
-                            _tokenizers_cache[cache_key] = tok
                         logger.info(f"Downloaded and loaded tokenizer for '{model_name}' from {cand}")
                         return tok
                 except Exception:
                     pass
+
+    return None
+
+
+def get_or_load_tokenizer(
+    model_name: Optional[str] = None,
+    allow_fallback: bool = False,
+    local_files_only: bool = False,
+) -> Any:
+    """
+    Retrieves or initializes a verified HuggingFace or GGUF tokenizer with caching per model.
+    Checks local weights/GGUF/snapshots first for exact alignment and instant offline loading.
+    Thread-safe with double-checked locking to avoid redundant disk I/O on concurrent requests.
+    Raises RuntimeError if a matching tokenizer cannot be found or loaded.
+    """
+    clean_name = (model_name or "default").lower().strip()
+    cache_key = clean_name
+
+    # 1. Fast path: check cache under lock
+    with _tokenizer_lock:
+        if cache_key in _tokenizers_cache:
+            return _tokenizers_cache[cache_key]
+
+    # 2. Synchronized load: ensure only one thread performs heavy disk resolution
+    with _tokenizer_lock:
+        # Double-check inside lock
+        if cache_key in _tokenizers_cache:
+            return _tokenizers_cache[cache_key]
+
+        tok = _resolve_and_load_tokenizer(model_name, clean_name, local_files_only=local_files_only)
+        if tok is not None:
+            _tokenizers_cache[cache_key] = tok
+            return tok
 
     if local_files_only:
         return None

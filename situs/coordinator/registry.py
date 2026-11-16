@@ -32,6 +32,7 @@ class WorkerNode(BaseModel):
     network_latency_ms: Optional[float] = None
     compute_speed_status: str = "unknown"
     network_latency_status: str = "unknown"
+    p2p_verified: bool = False
 
     @model_validator(mode="after")
     def _validate_telemetry_status(self):
@@ -535,7 +536,7 @@ def optimal_heterogeneous_partition(
         tot = (total_layers * b_layer) + f_ov + l_ov
         return tot, b_layer, f_ov, l_ov
 
-    total_usable_cluster_vram = sum(max(50 * 1024**2, int(w.free_vram_bytes * 0.9)) for w in workers)
+    total_usable_cluster_vram = sum(max(50 * 1024**2, int(w.free_vram_bytes * 0.85)) for w in workers)
     total_model_memory, bytes_per_layer, first_overhead, last_overhead = _calc_memory_footprint(bytes_per_param)
 
     # Auto-fallback to quantized precision (INT8=1.0B, INT4=0.5B) if uncompressed float exceeds cluster VRAM
@@ -609,9 +610,13 @@ def optimal_heterogeneous_partition(
             if getattr(w, "is_last_stage", False):
                 reclaimable_situs_vram += last_overhead
 
-        avail_vram = max(0, int((w.free_vram_bytes + reclaimable_situs_vram) * 0.90))
+        avail_vram = max(0, int((w.free_vram_bytes + reclaimable_situs_vram) * 0.85))
         if getattr(w, "device_type", "cuda") == "cuda" and w.total_vram_bytes > 0:
-            dedicated_margin = max(0, int((w.total_vram_bytes - int(500 * 1024**2)) * 0.90))
+            # Floor dedicated GPU headroom to guarantee Windows OS, display driver (DWM),
+            # PyTorch CUDA context (~500 MB), and activation scratchpads have at least 1.2 GB
+            # or 20% of total VRAM headroom to strictly prevent CUDA Out-Of-Memory.
+            safety_floor = max(int(1200 * 1024**2), int(w.total_vram_bytes * 0.20))
+            dedicated_margin = max(0, int(w.total_vram_bytes - safety_floor))
             avail_vram = min(avail_vram, dedicated_margin)
 
         stage_overhead = (first_overhead if idx == 0 else 0) + (last_overhead if idx == (K - 1) else 0)
@@ -742,6 +747,7 @@ class WorkerRegistry:
         total_vram: Optional[int] = None,
         device_type: Optional[str] = None,
         used_vram: Optional[int] = None,
+        p2p_verified: Optional[bool] = None,
     ) -> bool:
         if worker_id in self.workers:
             w = self.workers[worker_id]
@@ -758,6 +764,8 @@ class WorkerRegistry:
                 w.total_vram_bytes = total_vram
             if device_type:
                 w.device_type = device_type
+            if p2p_verified is not None:
+                w.p2p_verified = bool(p2p_verified)
             return True
         return False
 

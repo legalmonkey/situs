@@ -80,22 +80,6 @@ class WorkerDaemon:
         else:
             self.p2p_nodes[val.target_worker_id] = val
 
-    @property
-    def running(self) -> bool:
-        return self.is_running
-
-    @running.setter
-    def running(self, val: bool):
-        self.is_running = val
-
-    @property
-    def running(self) -> bool:
-        return self.is_running
-
-    @running.setter
-    def running(self, val: bool):
-        self.is_running = val
-
     def stop(self):
         """Signals the daemon to shut down and disconnects WebSocket and P2P direct channel."""
         self.is_running = False
@@ -275,6 +259,7 @@ class WorkerDaemon:
         if not self.ws or not self.is_running:
             return
         gpu_name, total_b, free_b, dev_type, used_b = await asyncio.to_thread(self.query_gpu_info)
+        p2p_v = bool(any(n.is_connected and getattr(n, "is_verified", False) for n in self.p2p_nodes.values()))
         hb = Heartbeat(
             worker_id=self.worker_id,
             timestamp=time.time(),
@@ -284,6 +269,7 @@ class WorkerDaemon:
             total_vram_bytes=total_b,
             device_type=dev_type,
             active_sessions=len(self.engine.session_kv_caches) if self.engine else 0,
+            p2p_verified=p2p_v,
         )
         frame = ProtocolFrame(
             type=MessageType.HEARTBEAT,
@@ -361,7 +347,8 @@ class WorkerDaemon:
                     self.is_registered = False
                     self.registered_event.clear()
                     try:
-                        # 1. Register with Coordinator
+                        # 1. Register with Coordinator (query live hardware state)
+                        gpu_name, total_vram, free_vram, dev_type, used_vram = self.query_gpu_info()
                         reg = WorkerRegister(
                             worker_id=self.worker_id,
                             gpu_name=gpu_name,

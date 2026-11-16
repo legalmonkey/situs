@@ -831,6 +831,11 @@ def _sync_live_vram_state(session_state: Dict[str, Any], meta: Optional[Dict[str
             session_state["cluster_workers"] = curr_workers
             changed = True
 
+        p2p_all_verified = bool(curr_workers and all(w.get("p2p_verified", False) for w in curr_workers))
+        if session_state.get("p2p_verified") != p2p_all_verified:
+            session_state["p2p_verified"] = p2p_all_verified
+            changed = True
+
     return changed
 
 
@@ -880,7 +885,8 @@ def render_workers_table(workers: List[Dict[str, Any]], title: str = "Connected 
         else:
             status_str = "[bold green]ACTIVE (GPU)[/bold green]"
 
-        transport = "WebRTC P2P Direct" if w.get("p2p_direct_enabled", True) else "Relay WS"
+        p2p_ok = w.get("p2p_verified", False) and w.get("p2p_direct_enabled", True)
+        transport = "WebRTC P2P Direct" if p2p_ok else "WebSocket Relay"
         residency = "GPU VRAM Only"
         table.add_row(w_id, stage_str, gpu_desc, vram_str, residency, transport, status_str)
     return table
@@ -2654,7 +2660,8 @@ def run_opencode_tui(
         vram_badge = f" ({used_v:.1f}/{tot_v:.1f} GB)" if tot_v > 0 else ""
 
         cols = _get_active_columns()
-        trans_lbl = "WebRTC P2P" if session_state.get("p2p", True) else "Relay WS"
+        p2p_active = session_state.get("p2p", True) and session_state.get("p2p_verified", False)
+        trans_lbl = "WebRTC P2P" if p2p_active else "Relay WS"
 
         badge_text = "Cluster"
         badge_style = "bold #ff2a85"
@@ -2833,7 +2840,14 @@ def run_opencode_tui(
             else:
                 vram_str = session_state.get("vram_desc", "0.0 GB")
                 frags.append(("#94a3b8", f"Local VRAM: {vram_str}\n"))
-        trans_name = "WebRTC P2P Direct (UDP)" if session_state.get("p2p", True) else "WebSocket Relay Tunnel"
+        p2p_active = session_state.get("p2p", True) and session_state.get("p2p_verified", False)
+        w_cnt = session_state.get("workers_count", 0)
+        if w_cnt <= 1:
+            trans_name = "Local CUDA Direct" if loc_tot > 0 else "Local Process"
+        elif p2p_active:
+            trans_name = "WebRTC P2P Direct (UDP)"
+        else:
+            trans_name = "WebSocket Relay Tunnel"
         frags.append(("#94a3b8", "Interconnect: "))
         frags.append(("#e2e8f0", f"{trans_name}\n"))
         frags.append(("#27272a", "────────────────────────────────────\n\n"))
@@ -3157,7 +3171,8 @@ def run_opencode_tui(
             tot_v = session_state.get("local_total_vram_gb", 0.0)
             pct_v = session_state.get("local_vram_pct", 0.0)
         vram_str = f"{used_v:.1f}/{tot_v:.1f} GB ({pct_v:.0f}%)" if tot_v > 0 else "0.0 GB"
-        trans = "WebRTC P2P" if session_state.get("p2p", True) else "Relay WS"
+        p2p_active = session_state.get("p2p", True) and session_state.get("p2p_verified", False)
+        trans = "WebRTC P2P" if p2p_active else "Relay WS"
 
         if session_state.get("is_generating", False):
             if interrupt_armed[0]:
@@ -3416,6 +3431,12 @@ def run_opencode_tui(
                                             app_instance[0].invalidate()
                                         continue
                                     c_type = chunk.get("type")
+                                    if c_type == "execution_notice":
+                                        notice_txt = chunk.get("notice", "Notice: Executing locally")
+                                        history_entries.append(("system", f"[Local Fallback] {notice_txt}", "Notice"))
+                                        if app_instance[0]:
+                                            app_instance[0].invalidate()
+                                        continue
                                     if c_type == "model_loading":
                                         m_name = chunk.get("model", "")
                                         stage = chunk.get("stage", "Streaming Model Layers...")
@@ -3479,9 +3500,8 @@ def run_opencode_tui(
                                             last_render_t = now
                                             if app_instance[0]:
                                                 app_instance[0].invalidate()
-                                except Exception:
-                                    pass
-
+                                except Exception as parse_err:
+                                    logger.debug(f"Error handling SSE stream chunk: {parse_err}")
                         if app_instance[0]:
                             app_instance[0].invalidate()
 
@@ -3508,7 +3528,8 @@ def run_opencode_tui(
                     if len(p_stages) <= 1:
                         t_mode = "Single-Node CUDA Direct"
                     else:
-                        t_mode = "WebRTC P2P Direct" if session_state.get("p2p", True) else "WebSocket Relay"
+                        p2p_all_ok = session_state.get("p2p", True) and session_state.get("p2p_verified", False)
+                        t_mode = "WebRTC P2P Direct" if p2p_all_ok else "WebSocket Relay"
                     limit_hint = " [dim yellow](hit max_tokens limit)[/dim yellow]" if tok_cnt >= max_tokens_val else ""
                     badge = f"Generated {tok_cnt} tokens in {elapsed:.2f}s | {tps:.1f} tokens/sec | {w_cnt} GPUs{v_str} | {t_mode}{limit_hint}"
                     history_entries.append(("metric", badge, ""))

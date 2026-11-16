@@ -80,6 +80,7 @@ class Heartbeat(BaseModel):
     total_vram_bytes: Optional[int] = None
     device_type: Optional[str] = None
     active_sessions: int = 0
+    p2p_verified: bool = False
 
 
 class InferenceStart(BaseModel):

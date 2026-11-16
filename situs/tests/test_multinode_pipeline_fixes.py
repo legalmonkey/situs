@@ -40,6 +40,7 @@ def test_p2p_send_frame_guards_oversized_sctp_and_exceptions():
     """Prefill frames exceeding safe SCTP limits or failing DataChannel send must return False for WS fallback."""
     node = P2PDataChannelNode("w1", "w2", MagicMock(), MagicMock())
     node.is_connected = True
+    node.is_verified = True
     node.channel = MagicMock()
     node.channel.readyState = "open"
 

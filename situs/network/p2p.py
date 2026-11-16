@@ -51,6 +51,7 @@ class P2PDataChannelNode:
         self.pc: Optional[RTCPeerConnection] = None
         self.channel = None
         self.is_connected = False
+        self.is_verified = False
 
     async def initialize(self, is_initiator: bool = True):
         if not HAS_AIORTC:
@@ -66,6 +67,7 @@ class P2PDataChannelNode:
                 state = getattr(self.pc, "iceConnectionState", "")
                 if state in ("failed", "closed", "disconnected"):
                     self.is_connected = False
+                    self.is_verified = False
                     logger.warning(f"P2P ICE state changed to '{state}' for {self.target_worker_id}; falling back to WebSocket relay.")
 
             if is_initiator:
@@ -101,17 +103,41 @@ class P2PDataChannelNode:
     def _setup_channel(self, channel):
         @channel.on("open")
         def on_open():
-            logger.info(f"Direct P2P WebRTC DataChannel OPEN between {self.worker_id} and {self.target_worker_id}! (Direct UDP mode active)")
+            logger.info(f"Direct P2P WebRTC DataChannel OPEN between {self.worker_id} and {self.target_worker_id}! Probing bidirectional link...")
             self.is_connected = True
+            # Send initial probe to verify bidirectional packet delivery over UDP
+            try:
+                channel.send(json.dumps({"__situs_probe__": "ping", "src": self.worker_id}))
+            except Exception:
+                self.is_connected = False
+                self.is_verified = False
 
         @channel.on("close")
         def on_close():
             logger.warning(f"P2P WebRTC DataChannel CLOSED between {self.worker_id} and {self.target_worker_id}")
             self.is_connected = False
+            self.is_verified = False
 
         @channel.on("message")
         def on_message(message):
-            self.on_message_fn(message)
+            self._handle_incoming_channel_message(message)
+
+    def _handle_incoming_channel_message(self, message: Any):
+        if isinstance(message, str) and "__situs_probe__" in message:
+            try:
+                p = json.loads(message)
+                if p.get("__situs_probe__") == "ping":
+                    if self.channel:
+                        self.channel.send(json.dumps({"__situs_probe__": "pong", "src": self.worker_id}))
+                    self.is_verified = True
+                    logger.info(f"P2P DataChannel verified bidirectional UDP delivery with {self.target_worker_id}")
+                elif p.get("__situs_probe__") == "pong":
+                    self.is_verified = True
+                    logger.info(f"P2P DataChannel confirmed bidirectional UDP delivery from {self.target_worker_id}")
+                return
+            except Exception:
+                pass
+        self.on_message_fn(message)
 
     async def handle_signaling_message(self, msg: Dict[str, Any]):
         """Handles incoming SDP offers/answers and ICE candidates from peer."""
@@ -148,8 +174,8 @@ class P2PDataChannelNode:
                 logger.debug(f"Ignoring ice_answer in signaling state {self.pc.signalingState}")
 
     def send_frame(self, data_str: Union[str, bytes]) -> bool:
-        """Sends data over direct P2P UDP DataChannel if open and within safe SCTP bounds."""
-        if not (self.is_connected and self.channel and self.channel.readyState == "open"):
+        """Sends data over direct P2P UDP DataChannel if open, verified, and within safe SCTP bounds."""
+        if not (self.is_connected and self.is_verified and self.channel and self.channel.readyState == "open"):
             return False
         byte_len = len(data_str) if isinstance(data_str, bytes) else len(data_str.encode("utf-8"))
         max_allowed = get_safe_sctp_max_bytes()
@@ -161,9 +187,11 @@ class P2PDataChannelNode:
         except Exception as e:
             logger.debug(f"P2P DataChannel send failed ({e}); falling back to WebSocket relay.")
             self.is_connected = False
+            self.is_verified = False
             return False
 
     async def close(self):
         if self.pc:
             await self.pc.close()
             self.is_connected = False
+            self.is_verified = False

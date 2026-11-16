@@ -183,6 +183,7 @@ def test_p2p_send_frame_bytes_and_string():
     mock_chan.readyState = "open"
     node.channel = mock_chan
     node.is_connected = True
+    node.is_verified = True
 
     # Test str
     res_str = node.send_frame('{"type": "ping"}')

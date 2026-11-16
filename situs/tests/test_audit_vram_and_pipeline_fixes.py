@@ -331,6 +331,7 @@ def test_safe_sctp_threshold_for_dense_bursts():
 
     node = P2PDataChannelNode("w1", "w2", MagicMock(), MagicMock())
     node.is_connected = True
+    node.is_verified = True
     node.channel = MagicMock()
     node.channel.readyState = "open"
 
@@ -426,3 +427,172 @@ def test_live_socket_handshake_and_registration_invariants(monkeypatch):
             break
 
     assert registered is True, "Worker node failed to complete live socket registration handshake over wire."
+
+
+def test_chunked_int8_linear_numerical_parity_and_no_oom():
+    """Verify Int8WeightLinear chunked forward produces identical output to standard linear without allocating huge buffers."""
+    from situs.worker.loader import Int8WeightLinear
+    torch.manual_seed(42)
+    in_features = 2048
+    out_features = 4096
+    batch = 1
+    seq_len = 16
+
+    weight = torch.randint(-128, 127, (out_features, in_features), dtype=torch.int8)
+    weight_scale = torch.rand(out_features, 1, dtype=torch.float32) * 0.01
+    int8_lin = Int8WeightLinear(in_features, out_features, weight=weight, weight_scale=weight_scale)
+
+    x = torch.randn(batch, seq_len, in_features, dtype=torch.float32)
+    y_chunked = int8_lin(x)
+
+    # Calculate ground truth full float dequantization
+    w_fp = int8_lin.weight.to(torch.float32) * int8_lin.weight_scale.to(torch.float32)
+    y_ref = torch.nn.functional.linear(x, w_fp)
+
+    assert y_chunked.shape == (batch, seq_len, out_features)
+    assert torch.allclose(y_chunked, y_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_optimal_heterogeneous_partition_gemma3_headroom():
+    """Verify optimal_heterogeneous_partition preserves dedicated GPU headroom and distributes Gemma 3 4B evenly across two 6GB GPUs."""
+    meta = {
+        "total_layers": 34,
+        "hidden_dim": 2560,
+        "intermediate_size": 10240,
+        "vocab_size": 256000,
+        "num_heads": 16,
+        "num_kv_heads": 4,
+        "context_length": 8192,
+        "torch_dtype": "bfloat16",
+        "model_type": "gemma3",
+    }
+    # Two identical RTX 3050 / RTX 4050 6GB Laptop GPUs
+    six_gb = int(6.0 * 1024**3)
+    w1 = WorkerNode(
+        worker_id="w-ritvik",
+        gpu_name="NVIDIA GeForce RTX 3050 6GB Laptop GPU",
+        total_vram_bytes=six_gb,
+        free_vram_bytes=int(4.5 * 1024**3),
+        used_vram_bytes=int(1.5 * 1024**3),
+        device_type="cuda",
+        last_heartbeat=time.time(),
+    )
+    w2 = WorkerNode(
+        worker_id="w-laptop2",
+        gpu_name="NVIDIA GeForce RTX 4050 Laptop GPU",
+        total_vram_bytes=six_gb,
+        free_vram_bytes=int(4.8 * 1024**3),
+        used_vram_bytes=int(1.2 * 1024**3),
+        device_type="cuda",
+        last_heartbeat=time.time(),
+    )
+
+    part = optimal_heterogeneous_partition([w1, w2], total_layers=34, model_metadata=meta)
+    assert len(part) == 2
+    # Total layers must be 34
+    total_assigned = sum(p[1] - p[0] for p in part)
+    assert total_assigned == 34
+    # Neither worker should be overloaded beyond 20 layers
+    for p in part:
+        layers = p[1] - p[0]
+        assert 14 <= layers <= 20, f"Unbalanced partition for 6GB GPUs: {layers} layers"
+
+
+def test_p2p_verified_handshake_and_relay_fallback():
+    """Verify P2P DataChannel requires probe verification before routing frames directly."""
+    node = P2PDataChannelNode(
+        worker_id="w1",
+        target_worker_id="w2",
+        signaling_send_fn=MagicMock(),
+        on_message_fn=MagicMock(),
+    )
+    assert node.is_verified is False
+    assert node.is_connected is False
+
+    mock_channel = MagicMock()
+    mock_channel.readyState = "open"
+    mock_channel.send = MagicMock()
+    node.channel = mock_channel
+    node.is_connected = True
+
+    # Unverified channel must NOT route data frames directly
+    sent = node.send_frame('{"type": "forward_activation"}')
+    assert sent is False
+    mock_channel.send.assert_not_called()
+
+    # Receiving pong verifies channel
+    node._handle_incoming_channel_message('{"__situs_probe__": "pong"}')
+    assert node.is_verified is True
+
+    # Verified channel routes data frame
+    sent2 = node.send_frame('{"type": "forward_activation"}')
+    assert sent2 is True
+    mock_channel.send.assert_called_once_with('{"type": "forward_activation"}')
+
+
+def test_bounded_set_fifo_eviction_and_concurrency():
+    """Verify BoundedSet caps size and evicts oldest entries under concurrent access."""
+    import concurrent.futures
+    from situs.worker.engine import BoundedSet
+
+    b_set = BoundedSet(max_size=50)
+
+    # 1. Sequential insertion beyond capacity
+    for i in range(100):
+        b_set.add(f"req-{i}")
+
+    assert len(b_set) == 50
+    # Oldest 50 items (req-0 .. req-49) must be evicted
+    assert "req-0" not in b_set
+    assert "req-49" not in b_set
+    # Newest 50 items (req-50 .. req-99) must be present
+    assert "req-50" in b_set
+    assert "req-99" in b_set
+
+    # 2. Concurrency test with 10 threads
+    def worker_add(start):
+        for j in range(100):
+            b_set.add(f"thread-{start}-{j}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(worker_add, t) for t in range(10)]
+        concurrent.futures.wait(futures)
+
+    assert len(b_set) <= 50
+
+
+def test_tokenizer_double_checked_locking_concurrency(monkeypatch):
+    """Verify get_or_load_tokenizer double-checked locking resolves safely across concurrent threads."""
+    import concurrent.futures
+    import threading
+    import situs.tokenizer as tok_mod
+
+    # Clean cache
+    tok_mod._tokenizers_cache.clear()
+
+    load_count = 0
+    load_lock = threading.Lock()
+
+    def mock_resolve(model_name, clean_name, local_files_only=False):
+        nonlocal load_count
+        time.sleep(0.05)  # simulate disk I/O
+        with load_lock:
+            load_count += 1
+        mock_tok = MagicMock()
+        mock_tok.name = model_name
+        return mock_tok
+
+    monkeypatch.setattr(tok_mod, "_resolve_and_load_tokenizer", mock_resolve)
+
+    def load_call():
+        return tok_mod.get_or_load_tokenizer("concurrent-test-model")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(load_call) for _ in range(8)]
+        results = [f.result() for f in futures]
+
+    # Exactly one load should have occurred despite 8 simultaneous threads
+    assert load_count == 1
+    assert all(r is results[0] for r in results)
+
+
