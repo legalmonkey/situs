@@ -220,7 +220,10 @@ def _query_nvml(dev_idx: int = 0, force_refresh: bool = False) -> Optional[Tuple
                 mem2 = _NvmlMemoryV2()
                 mem2.version = (2 << 24) | ctypes.sizeof(_NvmlMemoryV2)
                 if _nvml_lib.nvmlDeviceGetMemoryInfo_v2(handle, ctypes.byref(mem2)) == 0:
-                    res = (gpu_name, int(mem2.total), int(mem2.free), int(mem2.used))
+                    tot = int(mem2.total)
+                    fr = min(tot, max(0, int(mem2.free)))
+                    us = min(tot, max(0, tot - fr))
+                    res = (gpu_name, tot, fr, us)
                     _last_nvml_cache[dev_idx] = res
                     _last_nvml_time = now
                     return res
@@ -228,7 +231,10 @@ def _query_nvml(dev_idx: int = 0, force_refresh: bool = False) -> Optional[Tuple
             if hasattr(_nvml_lib, "nvmlDeviceGetMemoryInfo"):
                 mem1 = _NvmlMemoryV1()
                 if _nvml_lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem1)) == 0:
-                    res = (gpu_name, int(mem1.total), int(mem1.free), int(mem1.used))
+                    tot = int(mem1.total)
+                    fr = min(tot, max(0, int(mem1.free)))
+                    us = min(tot, max(0, tot - fr))
+                    res = (gpu_name, tot, fr, us)
                     _last_nvml_cache[dev_idx] = res
                     _last_nvml_time = now
                     return res
@@ -296,7 +302,7 @@ _vram_lock = threading.Lock()
 def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
     """
     Returns live (total_bytes, used_bytes, free_bytes) from dedicated dGPU VRAM.
-    Uses live hardware NVML/nvidia-smi telemetry so external CUDA engines (Ollama, llama.cpp)
+    Uses live hardware NVML/nvidia-smi telemetry so external compute engines
     and PyTorch allocations are both reflected accurately in real time.
     """
     with _vram_lock:
@@ -311,6 +317,8 @@ def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
                             used_b = alloc_b
                 except Exception:
                     pass
+            used_b = min(total_b, max(0, used_b))
+            free_b = min(total_b, max(0, free_b))
             return (total_b, used_b, free_b)
 
         t = _get_torch()
@@ -320,15 +328,18 @@ def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
                     free_b, total_b = t.cuda.mem_get_info(dev_idx)
                     alloc_b = t.cuda.memory_allocated(dev_idx)
                     res_b = t.cuda.memory_reserved(dev_idx)
-                    effective_free_b = free_b + max(0, res_b - alloc_b)
-                    used_b = max(alloc_b, max(0, total_b - effective_free_b))
+                    effective_free_b = min(total_b, max(0, free_b + max(0, res_b - alloc_b)))
+                    used_b = min(total_b, max(alloc_b, max(0, total_b - effective_free_b)))
                     return (total_b, used_b, effective_free_b)
             except Exception:
                 pass
 
     cim = query_windows_cim_gpus()
     if cim is not None:
-        return (cim[1], cim[3], cim[2])
+        cim_tot = cim[1]
+        cim_fr = min(cim_tot, max(0, cim[2]))
+        cim_us = min(cim_tot, max(0, cim[3]))
+        return (cim_tot, cim_us, cim_fr)
 
     tot_ram, free_ram, _ = get_system_ram_and_cpu()
     used_ram = 0
@@ -337,6 +348,8 @@ def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
         used_ram = psutil.Process().memory_info().rss
     except Exception:
         used_ram = max(0, tot_ram - free_ram)
+    used_ram = min(tot_ram, max(0, used_ram))
+    free_ram = min(tot_ram, max(0, free_ram))
     return (tot_ram, used_ram, free_ram)
 
 
@@ -480,6 +493,9 @@ def detect_hardware(requested_device: Optional[str] = "auto", bypass_cache: bool
                 res_b = t.cuda.memory_reserved(dev_idx)
                 eff_free_b = free_b + max(0, res_b - alloc_b)
                 used_b = max(alloc_b, max(0, total_b - eff_free_b))
+
+            used_b = min(total_b, max(0, used_b))
+            eff_free_b = min(total_b, max(0, eff_free_b))
 
             info = HardwareInfo(
                 gpu_available=True,

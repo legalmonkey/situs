@@ -409,6 +409,7 @@ class OpenCodeSlashCompleter(Completer):
         ("/cuda", "Diagnose GPU & show PyTorch CUDA acceleration install command"),
         ("/models", "List curated 6GB-16GB models for distributed pooling"),
         ("/model", "Select or switch models (e.g. /model 1, /model 2, /model <name>)"),
+        ("/hf", "View or set Hugging Face token for gated models: /hf [token]"),
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
         ("/speculative", "Toggle prompt-lookup speculative candidate drafting"),
         ("/tokens", "View or set maximum generation tokens: /tokens [count] (default: 2048)"),
@@ -431,6 +432,21 @@ class OpenCodeSlashCompleter(Completer):
                         display=f"/model {idx} ({m['name']})",
                         display_meta=f"{m['vram_gb']} GB · {m['recommended_split']}"
                     )
+            return
+
+        if text.startswith(("/hf ", "/token ")):
+            yield Completion(
+                "/hf status",
+                start_position=-len(text),
+                display="/hf status",
+                display_meta="View active Hugging Face token & source"
+            )
+            yield Completion(
+                "/hf clear",
+                start_position=-len(text),
+                display="/hf clear",
+                display_meta="Clear stored Hugging Face access token"
+            )
             return
 
         if text.startswith("/join "):
@@ -1542,15 +1558,20 @@ def execute_slash_command(
     elif root_cmd in ("/tunnel", "tunnel"):
         from situs.network.tunnel import start_public_tunnel, stop_public_tunnel, get_active_tunnel_url, is_tunnel_active
         sub = parts[1].lower() if len(parts) > 1 else ""
+        tunnel_token = None
+        if len(parts) > 2 and sub in ("token", "--token", "-t"):
+            tunnel_token = parts[2]
+        elif len(parts) > 1 and sub not in ("start", "on", "new", "stop", "kill", "close", "off", "status"):
+            tunnel_token = parts[1]
 
         if sub in ("stop", "kill", "close", "off"):
             stop_public_tunnel()
             emit("[yellow]Public WAN tunnel has been stopped.[/yellow]", "Public Tunnel")
             return True
 
-        if sub in ("start", "on", "new") or not is_tunnel_active():
-            emit("[cyan]Establishing Cloudflare Quick Tunnel for cross-Wi-Fi clustering...[/cyan]", "Public Tunnel")
-            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=15.0)
+        if sub in ("start", "on", "new") or tunnel_token or not is_tunnel_active():
+            emit("[cyan]Establishing public WAN tunnel for cross-Wi-Fi clustering...[/cyan]", "Public Tunnel")
+            succ, t_url, t_msg = start_public_tunnel(port=8000, timeout=15.0, token=tunnel_token)
             if succ and t_url:
                 panel = Panel(
                     f"[bold green]✓ Public WAN Tunnel Active[/bold green]\n\n"
@@ -2069,6 +2090,19 @@ def execute_slash_command(
                                                         except Exception:
                                                             pass
                                                     break
+                                                elif p_type == "model_loading_error":
+                                                    session_state["is_pulling"] = False
+                                                    err_msg = p_chunk.get("error", "Download failed.")
+                                                    req_auth = p_chunk.get("requires_auth", False)
+                                                    auth_hint = "\n[bold yellow]To authenticate with Hugging Face, run:[/bold yellow] [bold cyan]/hf <your_token>[/bold cyan]" if req_auth else ""
+                                                    err_text = f"[bold red]✗ Model Download Failed[/bold red]\n{err_msg}{auth_hint}"
+                                                    session_state["pull_stage"] = "Download Failed"
+                                                    if log_output_fn:
+                                                        try:
+                                                            log_output_fn(err_text, "Download Error")
+                                                        except Exception:
+                                                            pass
+                                                    break
                                             except Exception:
                                                 pass
                     except Exception:
@@ -2110,6 +2144,85 @@ def execute_slash_command(
                 border_style="green",
             )
             emit(custom_panel, "Model Selected")
+        return True
+
+    elif root_cmd in ("/hf", "hf", "/token", "token", "/hftoken", "hftoken"):
+        from situs.token_manager import (
+            get_hf_token,
+            get_hf_token_source,
+            mask_token,
+            save_hf_token,
+            clear_hf_token,
+            validate_hf_token,
+        )
+        if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() in ("status", "info", "check")):
+            curr_token = get_hf_token()
+            source = get_hf_token_source()
+            if curr_token:
+                masked = mask_token(curr_token)
+                valid, username, warn = validate_hf_token(curr_token)
+                user_line = f"\n[bold #ff70a6]• Account:[/bold #ff70a6]      [bold green]{username}[/bold green]" if username else ""
+                panel = Panel(
+                    f"[bold green]✓ Hugging Face Authentication Configured[/bold green]\n\n"
+                    f"[bold #ff70a6]• Active Token:[/bold #ff70a6] {masked}\n"
+                    f"[bold #ff70a6]• Source:[/bold #ff70a6]       {source}{user_line}\n\n"
+                    f"[white]Downloads for gated models (Google Gemma 3, Meta Llama 3.1) are unlocked.[/white]\n\n"
+                    f"[dim]To update token: [bold yellow]/hf <new_token>[/bold yellow]\n"
+                    f"To remove token: [bold yellow]/hf clear[/bold yellow][/dim]",
+                    title="Hugging Face Token Status",
+                    border_style="green",
+                )
+            else:
+                panel = Panel(
+                    f"[bold yellow]Hugging Face Token Not Configured[/bold yellow]\n\n"
+                    f"[white]Public models (Qwen 2.5, DeepSeek R1, Mistral) download without a token.\n"
+                    f"Gated models (Google Gemma 3, Meta Llama 3.1) require authentication.[/white]\n\n"
+                    f"[bold #ff70a6]To add your token:[/bold #ff70a6]\n"
+                    f"  [bold yellow]/hf <your_huggingface_token>[/bold yellow]\n\n"
+                    f"[dim]Get a free Read-access token at: [underline]https://huggingface.co/settings/tokens[/underline][/dim]",
+                    title="Hugging Face Token Configuration",
+                    border_style="yellow",
+                )
+            emit(panel, "Hugging Face Authentication")
+            return True
+
+        sub = parts[1].strip()
+        if sub.lower() in ("clear", "logout", "remove", "delete", "reset"):
+            clear_hf_token()
+            panel = Panel(
+                f"[bold green]✓ Hugging Face token successfully cleared.[/bold green]\n\n"
+                f"[dim]Removed from active session, ~/.cache/huggingface/token, and ~/.situs/config.json.[/dim]",
+                title="Hugging Face Token Cleared",
+                border_style="green",
+            )
+            emit(panel, "Hugging Face Authentication")
+            return True
+
+        # User passed a token!
+        new_token = sub
+        emit("[cyan]Validating and saving Hugging Face token...[/cyan]", "Hugging Face Authentication")
+        succ, msg, user = save_hf_token(new_token, validate=True)
+        if succ:
+            masked = mask_token(new_token)
+            user_line = f"\n[bold #ff70a6]• Account:[/bold #ff70a6]   [bold green]{user}[/bold green]" if user else ""
+            panel = Panel(
+                f"[bold green]✓ Hugging Face Token Successfully Saved & Verified![/bold green]\n\n"
+                f"[bold #ff70a6]• Stored Token:[/bold #ff70a6] {masked}{user_line}\n"
+                f"[bold #ff70a6]• Locations:[/bold #ff70a6]    ~/.cache/huggingface/token & ~/.situs/config.json\n\n"
+                f"[white]Seamless downloads for gated models (Gemma 3, Llama 3.1) are now active.[/white]",
+                title="Hugging Face Token Configured",
+                border_style="green",
+            )
+            emit(panel, "Hugging Face Authentication")
+        else:
+            panel = Panel(
+                f"[bold red]✗ Failed to Configure Hugging Face Token[/bold red]\n\n"
+                f"[white]{msg}[/white]\n\n"
+                f"[dim]Please check your token permissions at: https://huggingface.co/settings/tokens[/dim]",
+                title="Hugging Face Authentication Error",
+                border_style="red",
+            )
+            emit(panel, "Hugging Face Authentication")
         return True
 
     elif root_cmd in ("/system", "system"):
@@ -2805,6 +2918,9 @@ def run_opencode_tui(
         loc_pct = session_state.get("local_vram_pct", 0.0)
 
         def _append_vram_gauge(label: str, used_g: float, tot_g: float, free_g: float, pct_v: float, suffix: str = "") -> None:
+            pct_v = min(100.0, max(0.0, pct_v))
+            used_g = min(tot_g, max(0.0, used_g))
+            free_g = min(tot_g, max(0.0, free_g))
             frags.append(("#94a3b8", f"{label}: "))
             frags.append(("bold #ffffff", f"{used_g:.1f}/{tot_g:.1f} GB "))
             frags.append(("bold #ff70a6", f"({pct_v:.0f}%)\n"))
@@ -2959,6 +3075,7 @@ def run_opencode_tui(
 
                 total_gb = float(w.get("total_gb", 0.0))
                 used_gb = float(w.get("used_gb", 0.0))
+                used_gb = min(total_gb, max(0.0, used_gb))
                 vram_str = f"{used_gb:.1f}/{total_gb:.1f}GB" if total_gb > 0 else ""
 
                 # Header line: ● worker-id  [✕ Remove]
@@ -3425,7 +3542,10 @@ def run_opencode_tui(
                                     chunk = json.loads(line[6:].strip())
                                     if "error" in chunk and chunk["error"]:
                                         session_state["is_pulling"] = False
-                                        history_entries.append(("system", f"Inference Error: {chunk['error']}", "Error"))
+                                        err_txt = chunk["error"]
+                                        req_auth = chunk.get("requires_auth", False) or "hugging face" in err_txt.lower() or "restricted" in err_txt.lower() or "401" in err_txt
+                                        auth_hint = "\n[bold yellow]To authenticate with Hugging Face, run:[/bold yellow] [bold cyan]/hf <your_token>[/bold cyan]" if req_auth else ""
+                                        history_entries.append(("system", f"Inference Error: {err_txt}{auth_hint}", "Error"))
                                         error_reported = True
                                         if app_instance[0]:
                                             app_instance[0].invalidate()

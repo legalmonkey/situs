@@ -1,10 +1,16 @@
 """Stage execution engine managing local KV cache and pipelined forward passes."""
 
 import base64
+import contextlib
 import logging
+import os
 import threading
 from collections import OrderedDict
 from typing import Optional, Dict, List, Any, Tuple
+
+# Enable PyTorch expandable segments to strictly prevent virtual memory fragmentation OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from situs.protocol.compression import compress_tensor, decompress_tensor, decompress_layer_bytes
 from situs.protocol.messages import (
     MessageType,
@@ -32,6 +38,19 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+
+@contextlib.contextmanager
+def _inference_context():
+    """Wrap forward passes in torch.inference_mode to reduce autograd tracking overhead and memory churn."""
+    if HAS_TORCH and hasattr(torch, "inference_mode"):
+        with torch.inference_mode():
+            yield
+    elif HAS_TORCH and hasattr(torch, "no_grad"):
+        with torch.no_grad():
+            yield
+    else:
+        yield
 
 
 class StageOrderingError(ValueError):
@@ -278,56 +297,60 @@ class StageExecutionEngine:
         self.session_token_histories[request_id] = list(start_msg.input_ids)
 
         try:
-            # Memory check & reservation based on model KV architecture
-            n_layers = max(1, self.assignment.layer_end - self.assignment.layer_start)
-            n_kv_heads = getattr(self.stage_model, "num_kv_heads", getattr(self.stage_model, "n_local_kv_heads", 4))
-            h_dim = getattr(self.stage_model, "head_dim", 64)
-            max_new = (getattr(start_msg, "max_new_tokens", 2048) or 2048) if start_msg else 2048
-            expected_total_seq = len(start_msg.input_ids) + max_new
-            est_bytes = 2 * n_layers * n_kv_heads * h_dim * expected_total_seq * 2
-            self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
+            with _inference_context():
+                # Memory check & reservation based on model KV architecture
+                n_layers = max(1, self.assignment.layer_end - self.assignment.layer_start)
+                n_kv_heads = getattr(self.stage_model, "num_kv_heads", getattr(self.stage_model, "n_local_kv_heads", 4))
+                h_dim = getattr(self.stage_model, "head_dim", 64)
+                max_new = min(getattr(start_msg, "max_new_tokens", 2048) or 2048, 1024) if start_msg else 1024
+                expected_total_seq = len(start_msg.input_ids) + max_new
+                est_bytes = 2 * n_layers * n_kv_heads * h_dim * expected_total_seq * 2
+                try:
+                    self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
+                except Exception as alloc_err:
+                    logger.debug(f"kv_cache_manager allocation note for {request_id}: {alloc_err}")
 
-            input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
-            h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
-            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
-            self.session_kv_caches[request_id] = new_kvs
+                input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
+                h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
+                self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
+                self.session_kv_caches[request_id] = new_kvs
 
-            # Compress boundary activation
-            comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
-            b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+                # Compress boundary activation
+                comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
+                b64_payload = base64.b64encode(comp_bytes).decode("ascii")
 
-            # Record in activation replay ring buffer for downstream fault tolerance
-            self.replay_buffer.record(
-                request_id=request_id,
-                step_index=0,
-                payload_bytes=comp_bytes,
-                metadata={"shape": list(shape), "scale": scale, "dtype": self.compression_dtype},
-            )
+                # Record in activation replay ring buffer for downstream fault tolerance
+                self.replay_buffer.record(
+                    request_id=request_id,
+                    step_index=0,
+                    payload_bytes=comp_bytes,
+                    metadata={"shape": list(shape), "scale": scale, "dtype": self.compression_dtype},
+                )
 
-            forward_act = ForwardActivation(
-                request_id=request_id,
-                step_index=0,
-                shape=list(shape),
-                dtype=self.compression_dtype,
-                scale=scale,
-                payload_b64=b64_payload,
-                stage_index=self.assignment.layer_start,
-                expected_next_stage=self.assignment.layer_end,
-                position_offset=0,
-                is_verified=True,
-                is_experimental=False,
-            )
+                forward_act = ForwardActivation(
+                    request_id=request_id,
+                    step_index=0,
+                    shape=list(shape),
+                    dtype=self.compression_dtype,
+                    scale=scale,
+                    payload_b64=b64_payload,
+                    stage_index=self.assignment.layer_start,
+                    expected_next_stage=self.assignment.layer_end,
+                    position_offset=0,
+                    is_verified=True,
+                    is_experimental=False,
+                )
 
-            if self.is_last_stage():
-                # Single worker: worker holds all stages, process activation directly to emit first token
-                return self.process_forward_activation(forward_act)
+                if self.is_last_stage():
+                    # Single worker: worker holds all stages, process activation directly to emit first token
+                    return self.process_forward_activation(forward_act)
 
-            return ProtocolFrame(
-                type=MessageType.FORWARD_ACTIVATION,
-                source=self.assignment.worker_id,
-                target=self.assignment.next_worker_id,
-                payload=forward_act.model_dump(),
-            )
+                return ProtocolFrame(
+                    type=MessageType.FORWARD_ACTIVATION,
+                    source=self.assignment.worker_id,
+                    target=self.assignment.next_worker_id,
+                    payload=forward_act.model_dump(),
+                )
         except Exception as e:
             logger.error(f"Error in start_inference for {request_id}: {e}", exc_info=True)
             self.abort_inference(request_id)
@@ -357,141 +380,145 @@ class StageExecutionEngine:
                 )
 
         try:
-            comp_bytes = base64.b64decode(act_frame.payload_b64)
+            with _inference_context():
+                comp_bytes = base64.b64decode(act_frame.payload_b64)
 
-            act_dtype = getattr(self.stage_model, "dtype", None) or torch.float32
-            hidden_states = decompress_tensor(
-                comp_bytes,
-                scale=act_frame.scale,
-                shape=tuple(act_frame.shape),
-                method=act_frame.dtype,
-                device=self.stage_model.device,
-                dtype=act_dtype,
-            )
-            if request_id not in self.session_kv_caches and request_id not in self.finished_sessions:
-                n_layers = max(1, self.assignment.layer_end - self.assignment.layer_start)
-                n_kv_heads = getattr(self.stage_model, "num_kv_heads", getattr(self.stage_model, "n_local_kv_heads", 4))
-                h_dim = getattr(self.stage_model, "head_dim", 64)
-                seq_len = act_frame.shape[1] if (len(act_frame.shape) > 1) else 1
-                cfg_session = self.session_configs.get(request_id)
-                max_new = (cfg_session.max_new_tokens if (cfg_session and cfg_session.max_new_tokens is not None) else 2048)
-                est_bytes = 2 * n_layers * n_kv_heads * h_dim * (seq_len + max_new) * 2
-                try:
-                    self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
-                except Exception as alloc_err:
-                    logger.debug(f"kv_cache_manager allocation note for {request_id}: {alloc_err}")
-
-            past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
-            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
-            self.session_kv_caches[request_id] = new_kvs
-
-            if not self.is_last_stage():
-                # Middle stage: forward activations down the chain
-                comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
-                b64_payload = base64.b64encode(comp_bytes).decode("ascii")
-
-                # Record in activation replay buffer
-                self.replay_buffer.record(
-                    request_id=request_id,
-                    step_index=act_frame.step_index,
-                    payload_bytes=comp_bytes,
-                    metadata={"shape": list(shape), "scale": scale, "dtype": self.compression_dtype},
+                act_dtype = getattr(self.stage_model, "dtype", None) or torch.float32
+                hidden_states = decompress_tensor(
+                    comp_bytes,
+                    scale=act_frame.scale,
+                    shape=tuple(act_frame.shape),
+                    method=act_frame.dtype,
+                    device=self.stage_model.device,
+                    dtype=act_dtype,
                 )
+                del comp_bytes
 
-                forward_act = ForwardActivation(
-                    request_id=request_id,
-                    step_index=act_frame.step_index,
-                    shape=list(shape),
-                    dtype=self.compression_dtype,
-                    scale=scale,
-                    payload_b64=b64_payload,
-                    stage_index=self.assignment.layer_start,
-                    expected_next_stage=self.assignment.layer_end,
-                    position_offset=act_frame.position_offset,
-                    is_verified=True,
-                    is_experimental=False,
-                )
-                return ProtocolFrame(
-                    type=MessageType.FORWARD_ACTIVATION,
-                    source=self.assignment.worker_id,
-                    target=self.assignment.next_worker_id,
-                    payload=forward_act.model_dump(),
-                )
-            else:
-                # Last stage: compute next token from logits!
-                cfg = self.session_configs.get(request_id)
-                temperature = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
-                top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
-                seed = getattr(cfg, "seed", None)
-                max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
-                stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
-                tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
-                if tok_stops:
-                    for sid in tok_stops:
-                        if sid not in stop_token_ids:
-                            stop_token_ids.append(int(sid))
-                step_idx = act_frame.step_index
+                if request_id not in self.session_kv_caches and request_id not in self.finished_sessions:
+                    n_layers = max(1, self.assignment.layer_end - self.assignment.layer_start)
+                    n_kv_heads = getattr(self.stage_model, "num_kv_heads", getattr(self.stage_model, "n_local_kv_heads", 4))
+                    h_dim = getattr(self.stage_model, "head_dim", 64)
+                    seq_len = act_frame.shape[1] if (len(act_frame.shape) > 1) else 1
+                    cfg_session = self.session_configs.get(request_id)
+                    max_new = min(cfg_session.max_new_tokens if (cfg_session and cfg_session.max_new_tokens is not None) else 2048, 1024)
+                    est_bytes = 2 * n_layers * n_kv_heads * h_dim * (seq_len + max_new) * 2
+                    try:
+                        self.kv_cache_manager.allocate_request(request_id, estimated_bytes=est_bytes)
+                    except Exception as alloc_err:
+                        logger.debug(f"kv_cache_manager allocation note for {request_id}: {alloc_err}")
 
-                if HAS_TORCH and isinstance(out, torch.Tensor):
-                    if out.dim() == 3:
-                        last_logits = out[0, -1, :]
-                    elif out.dim() == 2:
-                        last_logits = out[-1, :]
+                past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
+                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+                del hidden_states
+                self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
+                self.session_kv_caches[request_id] = new_kvs
+
+                if not self.is_last_stage():
+                    # Middle stage: forward activations down the chain
+                    comp_bytes, scale, shape = compress_tensor(out, method=self.compression_dtype)
+                    b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+
+                    # Record in activation replay buffer
+                    self.replay_buffer.record(
+                        request_id=request_id,
+                        step_index=act_frame.step_index,
+                        payload_bytes=comp_bytes,
+                        metadata={"shape": list(shape), "scale": scale, "dtype": self.compression_dtype},
+                    )
+
+                    forward_act = ForwardActivation(
+                        request_id=request_id,
+                        step_index=act_frame.step_index,
+                        shape=list(shape),
+                        dtype=self.compression_dtype,
+                        scale=scale,
+                        payload_b64=b64_payload,
+                        stage_index=self.assignment.layer_start,
+                        expected_next_stage=self.assignment.layer_end,
+                        position_offset=act_frame.position_offset,
+                        is_verified=True,
+                        is_experimental=False,
+                    )
+                    return ProtocolFrame(
+                        type=MessageType.FORWARD_ACTIVATION,
+                        source=self.assignment.worker_id,
+                        target=self.assignment.next_worker_id,
+                        payload=forward_act.model_dump(),
+                    )
+                else:
+                    # Last stage: compute next token from logits!
+                    cfg = self.session_configs.get(request_id)
+                    temperature = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
+                    top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
+                    seed = getattr(cfg, "seed", None)
+                    max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
+                    stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
+                    tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
+                    if tok_stops:
+                        for sid in tok_stops:
+                            if sid not in stop_token_ids:
+                                stop_token_ids.append(int(sid))
+                    step_idx = act_frame.step_index
+
+                    if HAS_TORCH and isinstance(out, torch.Tensor):
+                        if out.dim() == 3:
+                            last_logits = out[0, -1, :]
+                        elif out.dim() == 2:
+                            last_logits = out[-1, :]
+                        else:
+                            last_logits = out
                     else:
                         last_logits = out
-                else:
-                    last_logits = out
 
-                top_k = getattr(cfg, "top_k", 50) if cfg else 50
-                token_id = self.sampler.sample_next_token(
-                    last_logits,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    seed=seed,
-                    step_index=step_idx,
-                )
-                token_text = self.sampler.decode_token(token_id)
-                eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
-                if stop_token_ids:
-                    is_eos = token_id in stop_token_ids
-                elif eos_id is not None:
-                    is_eos = (token_id == eos_id)
-                else:
-                    is_eos = False
+                    top_k = getattr(cfg, "top_k", 50) if cfg else 50
+                    token_id = self.sampler.sample_next_token(
+                        last_logits,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        seed=seed,
+                        step_index=step_idx,
+                    )
+                    token_text = self.sampler.decode_token(token_id)
+                    eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
+                    if stop_token_ids:
+                        is_eos = token_id in stop_token_ids
+                    elif eos_id is not None:
+                        is_eos = (token_id == eos_id)
+                    else:
+                        is_eos = False
 
-                if not is_eos and token_text:
-                    is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
-                if is_eos and token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>"):
-                    token_text = ""
+                    if not is_eos and token_text:
+                        is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+                    if is_eos and token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>"):
+                        token_text = ""
 
-                is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
-                finish_reason = "stop" if is_eos else ("length" if is_finished else None)
+                    is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
+                    finish_reason = "stop" if is_eos else ("length" if is_finished else None)
 
-                if is_finished:
-                    # Clean up session KV cache and state
-                    self.process_inference_finish(request_id)
+                    if is_finished:
+                        # Clean up session KV cache and state
+                        self.process_inference_finish(request_id)
 
-                next_token = NextToken(
-                    request_id=request_id,
-                    step_index=step_idx + 1,
-                    token_id=token_id,
-                    token_text=token_text,
-                    is_finished=is_finished,
-                    finish_reason=finish_reason,
-                    is_verified=True,
-                    is_experimental=False,
-                )
+                    next_token = NextToken(
+                        request_id=request_id,
+                        step_index=step_idx + 1,
+                        token_id=token_id,
+                        token_text=token_text,
+                        is_finished=is_finished,
+                        finish_reason=finish_reason,
+                        is_verified=True,
+                        is_experimental=False,
+                    )
 
-                # Target the first worker (to embed next token) AND Coordinator
-                target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
-                return ProtocolFrame(
-                    type=MessageType.NEXT_TOKEN,
-                    source=self.assignment.worker_id,
-                    target=target_first,
-                    payload=next_token.model_dump(),
-                )
+                    # Target the first worker (to embed next token) AND Coordinator
+                    target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.prev_worker_id
+                    return ProtocolFrame(
+                        type=MessageType.NEXT_TOKEN,
+                        source=self.assignment.worker_id,
+                        target=target_first,
+                        payload=next_token.model_dump(),
+                    )
         except Exception as e:
             logger.error(f"Error in process_forward_activation for {request_id}: {e}", exc_info=True)
             self.abort_inference(request_id)
@@ -529,21 +556,24 @@ class StageExecutionEngine:
         if request_id in self.finished_sessions:
             return None
 
-        comp_bytes = base64.b64decode(cand_frame.payload_b64)
+        with _inference_context():
+            comp_bytes = base64.b64decode(cand_frame.payload_b64)
 
-        act_dtype = getattr(self.stage_model, "dtype", None) or torch.float32
-        hidden_states = decompress_tensor(
-            comp_bytes,
-            scale=cand_frame.scale,
-            shape=tuple(cand_frame.shape),
-            method=cand_frame.dtype,
-            device=self.stage_model.device,
-            dtype=act_dtype,
-        )
-        past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-        out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
-        self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
-        self.session_kv_caches[request_id] = new_kvs
+            act_dtype = getattr(self.stage_model, "dtype", None) or torch.float32
+            hidden_states = decompress_tensor(
+                comp_bytes,
+                scale=cand_frame.scale,
+                shape=tuple(cand_frame.shape),
+                method=cand_frame.dtype,
+                device=self.stage_model.device,
+                dtype=act_dtype,
+            )
+            del comp_bytes
+            past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
+            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs, compute_all_logits=True)
+            del hidden_states
+            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
+            self.session_kv_caches[request_id] = new_kvs
 
         if not self.is_last_stage():
             # Middle stage: forward intermediate candidate activations down the chain
@@ -718,10 +748,42 @@ class StageExecutionEngine:
         self.session_token_histories[request_id].append(token_frame.token_id)
 
         try:
-            # 1. Speculative Path: check for candidate n-grams
-            candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
-            if candidates:
-                input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
+            with _inference_context():
+                # 1. Speculative Path: check for candidate n-grams
+                candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
+                if candidates:
+                    input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
+                    past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
+                    h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+                    self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
+                    self.session_kv_caches[request_id] = new_kvs
+
+                    comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
+                    b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+                    del h, input_tensor
+
+                    spec_cand = SpeculativeCandidates(
+                        request_id=request_id,
+                        step_index=token_frame.step_index,
+                        candidate_tokens=candidates,
+                        shape=list(shape),
+                        dtype=self.compression_dtype,
+                        scale=scale,
+                        payload_b64=b64_payload,
+                        is_verified=True,
+                        is_experimental=False,
+                    )
+                    if self.is_last_stage():
+                        return self.process_speculative_candidates(spec_cand)
+                    return ProtocolFrame(
+                        type=MessageType.SPECULATIVE_CANDIDATES,
+                        source=self.assignment.worker_id,
+                        target=self.assignment.next_worker_id,
+                        payload=spec_cand.model_dump(),
+                    )
+
+                # 2. Standard Single-Token Path
+                input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
                 past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
                 h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
@@ -729,60 +791,31 @@ class StageExecutionEngine:
 
                 comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
                 b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+                del h, input_tensor
 
-                spec_cand = SpeculativeCandidates(
+                forward_act = ForwardActivation(
                     request_id=request_id,
                     step_index=token_frame.step_index,
-                    candidate_tokens=candidates,
                     shape=list(shape),
                     dtype=self.compression_dtype,
                     scale=scale,
                     payload_b64=b64_payload,
+                    stage_index=self.assignment.layer_start,
+                    expected_next_stage=self.assignment.layer_end,
                     is_verified=True,
                     is_experimental=False,
                 )
+
                 if self.is_last_stage():
-                    return self.process_speculative_candidates(spec_cand)
+                    # Single worker: worker holds all stages, process activation directly
+                    return self.process_forward_activation(forward_act)
+
                 return ProtocolFrame(
-                    type=MessageType.SPECULATIVE_CANDIDATES,
+                    type=MessageType.FORWARD_ACTIVATION,
                     source=self.assignment.worker_id,
                     target=self.assignment.next_worker_id,
-                    payload=spec_cand.model_dump(),
+                    payload=forward_act.model_dump(),
                 )
-
-            # 2. Standard Single-Token Path
-            input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
-            past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-            h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
-            self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
-            self.session_kv_caches[request_id] = new_kvs
-
-            comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
-            b64_payload = base64.b64encode(comp_bytes).decode("ascii")
-
-            forward_act = ForwardActivation(
-                request_id=request_id,
-                step_index=token_frame.step_index,
-                shape=list(shape),
-                dtype=self.compression_dtype,
-                scale=scale,
-                payload_b64=b64_payload,
-                stage_index=self.assignment.layer_start,
-                expected_next_stage=self.assignment.layer_end,
-                is_verified=True,
-                is_experimental=False,
-            )
-
-            if self.is_last_stage():
-                # Single worker: worker holds all stages, process activation directly
-                return self.process_forward_activation(forward_act)
-
-            return ProtocolFrame(
-                type=MessageType.FORWARD_ACTIVATION,
-                source=self.assignment.worker_id,
-                target=self.assignment.next_worker_id,
-                payload=forward_act.model_dump(),
-            )
         except Exception as e:
             logger.error(f"Error in process_next_token for {request_id}: {e}", exc_info=True)
             self.abort_inference(request_id)

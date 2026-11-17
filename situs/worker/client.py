@@ -212,8 +212,8 @@ class WorkerDaemon:
                 except Exception:
                     dev_idx = 0
 
-            if self._cached_hw is None:
-                hw = detect_hardware(requested_device=self.config.device)
+            if self._cached_hw is None or (self._cached_hw[3] != "cuda" and HAS_TORCH and torch.cuda.is_available() and str(self.config.device).startswith("cuda")):
+                hw = detect_hardware(requested_device=self.config.device, bypass_cache=True)
                 if hw.device != self.config.device and str(self.config.device).startswith("cuda"):
                     self.config.device = hw.device
                 self._cached_hw = (hw.device_name, hw.total_memory_bytes, hw.free_memory_bytes, hw.device_type, hw.used_memory_bytes)
@@ -225,14 +225,19 @@ class WorkerDaemon:
                         free_b, total_b = torch.cuda.mem_get_info(dev_idx)
                         alloc_b = torch.cuda.memory_allocated(dev_idx)
                         res_b = torch.cuda.memory_reserved(dev_idx)
-                        effective_free_b = free_b + max(0, res_b - alloc_b)
-                        used_b = max(alloc_b, max(0, total_b - effective_free_b))
+                        effective_free_b = min(total_b, max(0, free_b + max(0, res_b - alloc_b)))
+                        used_b = min(total_b, max(alloc_b, max(0, total_b - effective_free_b)))
                         return dev_name, total_b, effective_free_b, "cuda", used_b
                     except Exception:
                         pass
                 live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
                 if live_tot > 0:
+                    live_used = min(live_tot, max(0, live_used))
+                    live_free = min(live_tot, max(0, live_free))
                     return dev_name, live_tot, live_free, "cuda", live_used
+
+            used_b = min(tot_b, max(0, used_b))
+            free_b = min(tot_b, max(0, free_b))
             return dev_name, tot_b, free_b, dev_type, used_b
         except Exception as e:
             logger.warning(f"Hardware query failed, falling back to real CPU/RAM: {e}")
@@ -414,7 +419,7 @@ class WorkerDaemon:
                                             f"is not supported for multi-node PyTorch pipeline execution."
                                         )
                                         logger.info(
-                                            f"Model '{assign.model_name}' (architecture '{arch}') executes via single-node Ollama runtime. "
+                                            f"Model '{assign.model_name}' (architecture '{arch}') is not supported for multi-node PyTorch pipeline execution. "
                                             f"Pipeline assignment [{assign.layer_start}..{assign.layer_end}) recorded for cluster topology."
                                         )
                                         self.engine = None
@@ -422,7 +427,7 @@ class WorkerDaemon:
 
                                     if not wfiles and not assign.progressive:
                                         self.engine_error = (
-                                            f"Worker '{self.worker_id}' could not find local safetensors or Ollama GGUF weights "
+                                            f"Worker '{self.worker_id}' could not find local weights "
                                             f"for '{assign.model_name}' (stage [{assign.layer_start}..{assign.layer_end}))."
                                         )
                                         logger.warning(self.engine_error)

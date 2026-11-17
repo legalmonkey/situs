@@ -177,16 +177,13 @@ def _resolve_and_load_tokenizer(
     local_files_only: bool = False,
 ) -> Any:
     """Internal disk and network resolution for tokenizers."""
-    # Prefer embedded GGUF tokenizer whenever running from a local GGUF / Ollama model without local HF safetensors
+    # Prefer embedded GGUF tokenizer if a direct GGUF file is supplied
     if model_name and model_name not in ("default", "gpt2"):
         try:
-            from situs.worker.loader import find_local_safetensors_files, find_local_ollama_gguf_file
-            if not find_local_safetensors_files(model_name):
-                gguf_path = model_name if (os.path.isfile(model_name) and model_name.lower().endswith(".gguf")) else find_local_ollama_gguf_file(model_name)
-                if gguf_path:
-                    tok = GGUFTokenizerAdapter(gguf_path)
-                    logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {gguf_path}")
-                    return tok
+            if os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
+                tok = GGUFTokenizerAdapter(model_name)
+                logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {model_name}")
+                return tok
         except Exception as e:
             logger.debug(f"GGUF tokenizer construction skipped for '{model_name}': {e}")
 
@@ -306,10 +303,12 @@ def _resolve_and_load_tokenizer(
 
     # 3. Online attempt if allowed and connected (never attempted if local_files_only is requested)
     if not local_files_only:
+        from situs.token_manager import get_hf_token
+        token = get_hf_token()
         for cand in candidates:
             if not os.path.exists(cand):
                 try:
-                    tok = AutoTokenizer.from_pretrained(cand)
+                    tok = AutoTokenizer.from_pretrained(cand, token=token)
                     if tok is not None:
                         logger.info(f"Downloaded and loaded tokenizer for '{model_name}' from {cand}")
                         return tok

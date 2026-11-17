@@ -1049,13 +1049,14 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             return torch.matmul(attn_probs, v_exp)
 
         sdpa_scale = self.attn_scale if self.query_pre_attn_scalar is not None else None
+        enable_gqa = (k_exp.shape[1] < q.shape[1])
         if use_sliding:
-            return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale)
+            return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale, enable_gqa=enable_gqa)
         if seq_len > 1:
             if past_len > 0:
-                return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale)
-            return F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True, scale=sdpa_scale)
-        return F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False, scale=sdpa_scale)
+                return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale, enable_gqa=enable_gqa)
+            return F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True, scale=sdpa_scale, enable_gqa=enable_gqa)
+        return F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False, scale=sdpa_scale, enable_gqa=enable_gqa)
 
     def forward(
         self,
@@ -1105,10 +1106,19 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
                 k = torch.cat([past_k, k], dim=-2)
                 v = torch.cat([past_v, v], dim=-2)
 
+        # Sliding window pruning: prune tokens exceeding window limit to strictly bound KV cache memory
+        if self.sliding_window is not None and self.sliding_window > 0:
+            if k.shape[-2] > self.sliding_window:
+                k = k[..., -self.sliding_window :, :]
+                v = v[..., -self.sliding_window :, :]
+
         new_kv = (k, v)
 
         # Grouped-Query Attention head expansion if GQA is active
-        if self.num_kv_heads < self.num_heads:
+        # PyTorch >= 2.4 supports native enable_gqa=True in scaled_dot_product_attention without physical memory replication.
+        # Fall back to repeat_interleave only when explicit logit softcapping is enabled.
+        has_softcapping = self.attn_logit_softcapping is not None and self.attn_logit_softcapping > 0
+        if self.num_kv_heads < self.num_heads and has_softcapping:
             repeats = self.num_heads // self.num_kv_heads
             k_exp = k.repeat_interleave(repeats, dim=1)
             v_exp = v.repeat_interleave(repeats, dim=1)
@@ -1988,6 +1998,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         hidden_states: "torch.Tensor",
         past_kvs: Optional[List[Any]] = None,
         position_ids: Optional[Any] = None,
+        compute_all_logits: bool = False,
     ):
         """Middle or last stage: incoming activations -> assigned layers."""
         if not HAS_TORCH:
@@ -2003,6 +2014,11 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             new_kvs.append(new_kv)
 
         if self.is_last_stage:
+            # Autoregressive generation & prompt prefill only sample from the last sequence position.
+            # Slicing h to h[:, -1:, :] before norm & lm_head saves over 99.8% VRAM on 262k vocabularies (e.g. Gemma 3 4B).
+            # When compute_all_logits is True (e.g. small speculative candidate batch verification), compute all positions.
+            if not compute_all_logits and h.shape[1] > 1:
+                h = h[:, -1:, :]
             h = self.norm(h)
             logits = self.lm_head(h)
             cap = getattr(self, "final_logit_softcapping", None)
@@ -2027,7 +2043,11 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
             return [model_name]
 
     # 2. Hugging Face hub cache (~/.cache/huggingface/hub/models--*)
-    hub_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    hub_dir = (
+        os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.path.expanduser("~/.cache/huggingface/hub")
+    )
     if os.path.isdir(hub_dir):
         clean_name = model_name.replace("/", "--").replace(":", "--").lower()
         prefix = model_name.split(":")[0].split("/")[0].lower()
@@ -2078,8 +2098,8 @@ def find_local_ollama_gguf_file(model_name: str) -> Optional[str]:
 
     candidates_names = [model_name.strip()]
     try:
-        from situs.inference_backend import normalize_ollama_model
-        norm_name = normalize_ollama_model(model_name)
+        from situs.inference_backend import normalize_model_name
+        norm_name = normalize_model_name(model_name)
         if norm_name and norm_name not in candidates_names:
             candidates_names.append(norm_name)
     except Exception:
@@ -2126,7 +2146,7 @@ def find_local_ollama_gguf_file(model_name: str) -> Optional[str]:
 
 
 def find_local_weight_files(model_name: str) -> List[str]:
-    """Finds local weights from HuggingFace safetensors/bin, direct GGUF paths, or Ollama GGUF blobs."""
+    """Finds local weights from Hugging Face safetensors/bin, direct GGUF paths, or cached model files."""
     sfiles = find_local_safetensors_files(model_name)
     if sfiles:
         return sfiles
@@ -2324,7 +2344,7 @@ def load_hf_stage_model(
                 logger.info(f"All stage [{layer_start}..{layer_end}) layers and embeddings loaded from local disk cache.")
                 sfiles = []
 
-            # 1. Try FastGGUFFile reader if file has GGUF format (handles quantized Ollama blobs & unquantized GGUF)
+            # 1. Try FastGGUFFile reader if file has GGUF format (handles direct & cached GGUF files)
             gguf_loaded_files = set()
             for sf in sfiles:
                 if not os.path.isfile(sf):

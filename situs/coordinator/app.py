@@ -404,15 +404,16 @@ async def cluster_status():
     pipeline = registry.get_pipeline_order()
     curr_model = registry.active_model or config.default_model
     total_vram_b = sum(w.total_vram_bytes for w in alive)
-    free_vram_b = sum(w.free_vram_bytes for w in alive)
-    used_vram_b = sum(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) for w in alive)
+    free_vram_b = sum(min(w.total_vram_bytes, w.free_vram_bytes) for w in alive)
+    used_vram_b = sum(min(w.total_vram_bytes, getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes))) for w in alive)
+    used_vram_b = min(total_vram_b, max(0, used_vram_b))
     return {
         "status": "healthy" if alive else "no_workers",
         "active_workers_count": len(alive),
         "total_vram_gb": round(total_vram_b / (1024**3), 2),
-        "free_vram_gb": round(free_vram_b / (1024**3), 2),
+        "free_vram_gb": round(min(total_vram_b, free_vram_b) / (1024**3), 2),
         "used_vram_gb": round(used_vram_b / (1024**3), 2),
-        "vram_usage_pct": round((used_vram_b / max(1, total_vram_b)) * 100, 1),
+        "vram_usage_pct": min(100.0, round((used_vram_b / max(1, total_vram_b)) * 100, 1)),
         "pure_vram_enforced": True,
         "model": curr_model,
         "active_model": curr_model,
@@ -426,10 +427,10 @@ async def cluster_status():
                 "gpu": w.gpu_name,
                 "device": w.device_type,
                 "total_gb": round(w.total_vram_bytes / (1024**3), 2),
-                "used_gb": round(getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / (1024**3), 2),
-                "free_gb": round(w.free_vram_bytes / (1024**3), 2),
-                "vram_available_mb": round(w.free_vram_bytes / (1024**2), 1),
-                "usage_pct": round((getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes)) / max(1, w.total_vram_bytes)) * 100, 1),
+                "used_gb": round(min(w.total_vram_bytes, getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes))) / (1024**3), 2),
+                "free_gb": round(min(w.total_vram_bytes, w.free_vram_bytes) / (1024**3), 2),
+                "vram_available_mb": round(min(w.total_vram_bytes, w.free_vram_bytes) / (1024**2), 1),
+                "usage_pct": min(100.0, round((min(w.total_vram_bytes, getattr(w, "used_vram_bytes", max(0, w.total_vram_bytes - w.free_vram_bytes))) / max(1, w.total_vram_bytes)) * 100, 1)),
                 "p2p_verified": getattr(w, "p2p_verified", False),
                 "vram_exclusive": True,
                 "layer_range": f"{w.assigned_layer_start}..{w.assigned_layer_end}" if w.assigned_layer_start is not None else "unassigned",
@@ -471,8 +472,8 @@ async def trigger_pull(request: Request, model_name: Optional[str] = None):
     """Streams live model pull progress events from online server via SSE."""
     verify_admin_key(request)
     target_pull_model = model_name or registry.active_model or config.default_model
-    from situs.inference_backend import stream_pull_model, normalize_ollama_model
-    canonical = normalize_ollama_model(target_pull_model)
+    from situs.inference_backend import stream_pull_model, normalize_model_name
+    canonical = normalize_model_name(target_pull_model)
 
     async def pull_events():
         yield ": connected\n\n"
@@ -645,10 +646,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     from situs.inference_backend import (
         is_model_downloaded,
         stream_pull_model,
-        normalize_ollama_model,
-        ensure_ollama_model,
-        ensure_ollama_running,
-        get_ollama_endpoints,
+        normalize_model_name,
     )
     model_is_local = is_model_downloaded(target_model)
 
@@ -688,7 +686,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
                 # Check if model needs downloading from online registry
                 if not is_model_downloaded(target_model):
-                    canonical = normalize_ollama_model(target_model)
+                    canonical = normalize_model_name(target_model)
                     logger.info(f"Model '{target_model}' ({canonical}) not present locally. Streaming download via SSE...")
                     async for progress in stream_pull_model(canonical):
                         yield f"data: {json.dumps(progress)}\n\n"
@@ -743,87 +741,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     yield "data: [DONE]\n\n"
                     return
 
-                # Fallback for unsupported architectures: attempt direct streaming via Ollama.
-                # When architecture is supported, execution proceeds through the distributed worker pipeline.
+                # Verify architecture is supported by the distributed engine
                 from situs.worker.loader import is_architecture_supported
                 meta = resolve_model_metadata(target_model)
                 arch = meta.get("architecture") or meta.get("model_type")
                 arch_supported = is_architecture_supported(arch)
 
                 if not arch_supported:
-                    allow_local_fallback = os.environ.get("SITUS_STRICT_DISTRIBUTED") == "0"
-                    if not allow_local_fallback:
-                        yield f"data: {json.dumps({'error': f'Model architecture {arch} is not supported by Situs distributed engine. To bypass cluster and execute locally via Ollama, set SITUS_STRICT_DISTRIBUTED=0.'})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    logger.warning(
-                        f"Model architecture '{arch}' is not supported by Situs distributed engine. "
-                        f"Streaming via Coordinator local Ollama daemon for request {request_id}."
-                    )
-                    yield f"data: {json.dumps({'type': 'execution_notice', 'notice': f'Model architecture {arch} is not supported by distributed cluster; executing locally via Ollama fallback.'})}\n\n"
-                    canonical = normalize_ollama_model(target_model)
-                    ensure_ollama_running()
-                    direct_success = False
-                    try:
-                        async with httpx.AsyncClient(timeout=180.0) as client:
-                            gen_payload = {
-                                "model": canonical,
-                                "prompt": pipeline_prompt,
-                                "stream": True,
-                                "options": {
-                                    "num_predict": req.max_tokens if req.max_tokens is not None else 2048,
-                                    "temperature": req.temperature if req.temperature is not None else 0.7,
-                                    "top_p": req.top_p if req.top_p is not None else 0.9,
-                                },
-                            }
-                            from situs.inference_backend import get_ollama_endpoints
-                            endpoints = get_ollama_endpoints()
-                            for ep in endpoints:
-                                try:
-                                    async with client.stream("POST", f"{ep}/api/generate", json=gen_payload) as gen_resp:
-                                        if gen_resp.status_code == 200:
-                                            async for line in gen_resp.aiter_lines():
-                                                if not line:
-                                                    continue
-                                                try:
-                                                    g_chunk = json.loads(line)
-                                                    token_txt = g_chunk.get("response", "")
-                                                    is_done = g_chunk.get("done", False)
-                                                    if token_txt:
-                                                        chunk = {
-                                                            "id": request_id,
-                                                            "object": "chat.completion.chunk",
-                                                            "created": created_ts,
-                                                            "model": target_model,
-                                                            "choices": [
-                                                                {
-                                                                    "index": 0,
-                                                                    "delta": {"content": token_txt},
-                                                                    "finish_reason": "stop" if is_done else None,
-                                                                }
-                                                            ],
-                                                            "is_verified": True,
-                                                            "unverified_draft": False,
-                                                        }
-                                                        yield f"data: {json.dumps(chunk)}\n\n"
-                                                    if is_done:
-                                                        yield "data: [DONE]\n\n"
-                                                        done_yielded = True
-                                                        break
-                                                except Exception:
-                                                    pass
-                                            direct_success = True
-                                            return
-                                except Exception:
-                                    continue
-                    except Exception as e:
-                        logger.warning(f"Direct Ollama inference for unsupported architecture '{arch}' failed: {e}")
-
-                    if not direct_success:
-                        err_chunk = {"error": f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback failed."}
-                        yield f"data: {json.dumps(err_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+                    err_chunk = {"error": f"Model architecture '{arch}' is not supported by Situs distributed engine."}
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
                 first_worker = pipeline[0]
                 last_worker = pipeline[-1]
@@ -1004,8 +932,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # Non-streaming request flow
         try:
             if not model_is_local:
-                ollama_ep = get_ollama_endpoints()[0] if get_ollama_endpoints() else "http://127.0.0.1:11434"
-                ensure_ollama_model(ollama_ep, target_model)
+                from situs.inference_backend import stream_pull_model, normalize_model_name
+                canonical = normalize_model_name(target_model)
+                logger.info(f"Model '{target_model}' ({canonical}) not present locally. Pulling via native Hugging Face Hub...")
+                async for _ in stream_pull_model(canonical):
+                    pass
             try:
                 tokenizer = get_or_load_tokenizer(target_model)
                 if tokenizer is None:
@@ -1017,52 +948,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Prompt tokenization failed: {e}")
 
-            # Fallback for unsupported architectures: direct execution via local Ollama daemon
+            # Verify architecture is supported by the distributed engine
             from situs.worker.loader import is_architecture_supported
             meta = resolve_model_metadata(target_model)
             arch = meta.get("architecture") or meta.get("model_type")
             arch_supported = is_architecture_supported(arch)
 
             if not arch_supported:
-                allow_local_fallback = os.environ.get("SITUS_STRICT_DISTRIBUTED") == "0"
-                if not allow_local_fallback:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Model architecture '{arch}' is not supported by Situs distributed engine. To bypass cluster and execute locally via Ollama, set SITUS_STRICT_DISTRIBUTED=0.",
-                    )
-                logger.warning(
-                    f"Model architecture '{arch}' is not supported by Situs distributed engine. "
-                    f"Falling back to Coordinator local Ollama daemon for request {request_id}."
-                )
-                from situs.inference_backend import query_ollama
-                direct_ans = await asyncio.to_thread(query_ollama, pipeline_prompt, target_model)
-                if direct_ans:
-                    from fastapi.responses import JSONResponse
-                    resp_dict = {
-                        "id": request_id,
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": target_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {"role": "assistant", "content": direct_ans},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": len(input_ids),
-                            "completion_tokens": len(direct_ans.split()),
-                            "total_tokens": len(input_ids) + len(direct_ans.split()),
-                        },
-                    }
-                    return JSONResponse(
-                        content=resp_dict,
-                        headers={"X-Situs-Execution": "local-ollama-fallback"},
-                    )
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Model architecture '{arch}' is not supported by Situs distributed engine, and local Ollama fallback was unavailable.",
+                    detail=f"Model architecture '{arch}' is not supported by Situs distributed engine.",
                 )
 
             if len(pipeline) < 1:

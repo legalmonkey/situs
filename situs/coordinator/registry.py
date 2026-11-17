@@ -222,8 +222,8 @@ def _score_local_config_match(model_name: str, cfg_stem: str) -> int:
 def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
     """
     Dynamically discovers model configuration (total layers, hidden dimensions, heads, vocab).
-    Derives values directly from verified model configs (AutoConfig or local config files),
-    cached weights, or Ollama daemon.
+    Derives values directly from verified model configs (AutoConfig or local config files)
+    or cached weights in Hugging Face Hub cache.
     Explicitly rejects unsupported models and disallows arbitrary fallback defaults.
     """
     import os
@@ -336,82 +336,23 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
                             except Exception:
                                 pass
 
+        if config is None:
+            try:
+                from situs.token_manager import get_hf_token
+                token = get_hf_token()
+                config = AutoConfig.from_pretrained(model_name, token=token)
+            except Exception:
+                pass
+
         if config is not None:
             return _apply_inferred_precision(_parse_verified_config_dict(config.to_dict() if hasattr(config, "to_dict") else vars(config)))
     except Exception as e:
         logger.debug(f"AutoConfig metadata resolution failed for '{model_name}': {e}")
 
-    # 5. Check Ollama daemon /api/show
-    try:
-        import httpx
-        from situs.inference_backend import get_ollama_endpoints
-        endpoints = get_ollama_endpoints()
-        with httpx.Client(timeout=1.0) as client:
-            for ep in endpoints:
-                try:
-                    resp = client.post(f"{ep.rstrip('/')}/api/show", json={"name": model_name})
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        model_info = data.get("model_info", {})
-                        block_count = None
-                        hidden_dim = None
-                        vocab_size = None
-                        intermediate = None
-                        heads = None
-                        kv_heads = None
-                        head_dim = None
-                        context_length = None
-                        torch_dtype = None
-                        for k, v in model_info.items():
-                            if k.endswith(".block_count") and isinstance(v, int):
-                                block_count = v
-                            elif (k.endswith(".embedding_length") or k.endswith(".hidden_size")) and isinstance(v, int):
-                                hidden_dim = v
-                            elif k.endswith(".vocab_size") and isinstance(v, int):
-                                vocab_size = v
-                            elif k.endswith(".feed_forward_length") and isinstance(v, int):
-                                intermediate = v
-                            elif k.endswith(".head_count") and not k.endswith("_kv") and isinstance(v, int):
-                                heads = v
-                            elif k.endswith(".head_count_kv") and isinstance(v, int):
-                                kv_heads = v
-                            elif (k.endswith(".key_length") or k.endswith(".head_dim")) and isinstance(v, int):
-                                head_dim = v
-                            elif (k.endswith(".context_length") or k.endswith(".max_position_embeddings")) and isinstance(v, int):
-                                context_length = v
-                            elif k.endswith(".file_type") or k.endswith(".precision"):
-                                torch_dtype = str(v)
-                        arch = model_info.get("general.architecture")
-                        if head_dim is None and hidden_dim and heads:
-                            head_dim = max(1, hidden_dim // max(1, heads))
-
-                        if block_count and hidden_dim and vocab_size and intermediate and heads:
-                            return _apply_inferred_precision({
-                                "total_layers": block_count,
-                                "hidden_dim": hidden_dim,
-                                "intermediate_size": intermediate,
-                                "vocab_size": vocab_size,
-                                "num_heads": heads,
-                                "num_kv_heads": kv_heads if kv_heads else heads,
-                                "head_dim": head_dim,
-                                "architecture": arch,
-                                "context_length": context_length,
-                                "max_position_embeddings": context_length,
-                                "torch_dtype": torch_dtype,
-                            })
-                        else:
-                            logger.warning(
-                                f"Ollama returned incomplete model_info for '{model_name}'; rejecting due to missing attributes."
-                            )
-                except Exception:
-                    continue
-    except Exception as e:
-        logger.debug(f"Ollama metadata query failed: {e}")
-
     raise RuntimeError(
         f"Cannot resolve model metadata for '{model_name}'. "
         f"Model is unsupported: verified configuration could not be resolved from "
-        f"local config files, Hugging Face AutoConfig, or Ollama daemon."
+        f"local config files or Hugging Face Hub AutoConfig."
     )
 
 
@@ -686,8 +627,27 @@ def optimal_heterogeneous_partition(
                     alloc[idx] += 1
 
     diff = total_layers - sum(alloc)
-    if diff != 0:
-        alloc[-1] += diff
+    while diff > 0:
+        # Find worker with largest remaining capacity margin (capacities_layers[w] - alloc[w])
+        best_w = None
+        best_margin = -1
+        for w_idx in range(K):
+            margin = capacities_layers[w_idx] - alloc[w_idx]
+            if margin > best_margin:
+                best_margin = margin
+                best_w = w_idx
+        if best_w is not None and best_margin > 0:
+            alloc[best_w] += 1
+            diff -= 1
+        else:
+            # Distribute to worker with fewest assigned layers
+            min_w = min(range(K), key=lambda x: alloc[x])
+            alloc[min_w] += 1
+            diff -= 1
+    while diff < 0:
+        max_w = max(range(K), key=lambda x: alloc[x])
+        alloc[max_w] -= 1
+        diff += 1
 
     intervals = []
     curr_s = 0
@@ -715,11 +675,13 @@ class WorkerRegistry:
         used_b = getattr(reg, "used_vram_bytes", None)
         if used_b is None:
             used_b = max(0, reg.total_vram_bytes - reg.free_vram_bytes)
+        used_b = min(reg.total_vram_bytes, max(0, used_b))
+        free_b = min(reg.total_vram_bytes, max(0, reg.free_vram_bytes))
         node = WorkerNode(
             worker_id=reg.worker_id,
             gpu_name=reg.gpu_name,
             total_vram_bytes=reg.total_vram_bytes,
-            free_vram_bytes=reg.free_vram_bytes,
+            free_vram_bytes=free_b,
             used_vram_bytes=used_b,
             device_type=reg.device_type,
             last_heartbeat=time.time(),
@@ -736,7 +698,7 @@ class WorkerRegistry:
             node.first_worker_id = existing.first_worker_id
 
         self.workers[reg.worker_id] = node
-        logger.info(f"Registered worker {reg.worker_id} ({reg.gpu_name}, {reg.free_vram_bytes / (1024**3):.2f} GB free)")
+        logger.info(f"Registered worker {reg.worker_id} ({reg.gpu_name}, {free_b / (1024**3):.2f} GB free)")
         return node
 
     def update_heartbeat(
@@ -752,16 +714,16 @@ class WorkerRegistry:
         if worker_id in self.workers:
             w = self.workers[worker_id]
             w.last_heartbeat = time.time()
-            w.free_vram_bytes = free_vram
+            if total_vram and total_vram > 0:
+                w.total_vram_bytes = total_vram
+            w.free_vram_bytes = min(w.total_vram_bytes, max(0, free_vram))
             if used_vram is not None:
-                w.used_vram_bytes = used_vram
+                w.used_vram_bytes = min(w.total_vram_bytes, max(0, used_vram))
             elif w.total_vram_bytes > free_vram:
-                w.used_vram_bytes = w.total_vram_bytes - free_vram
+                w.used_vram_bytes = min(w.total_vram_bytes, max(0, w.total_vram_bytes - free_vram))
             w.is_alive = True
             if gpu_name and ("Family" not in gpu_name or "Family" in w.gpu_name):
                 w.gpu_name = gpu_name
-            if total_vram and total_vram > 0:
-                w.total_vram_bytes = total_vram
             if device_type:
                 w.device_type = device_type
             if p2p_verified is not None:

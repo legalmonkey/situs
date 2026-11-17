@@ -205,8 +205,13 @@ def main_callback(
 @app.command("setup")
 def setup(
     json_output: bool = typer.Option(False, "--json", help="Output diagnostics as structured JSON"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token", help="Hugging Face access token to configure"),
 ):
     """Run comprehensive system & hardware diagnostics (GPU, VRAM, CUDA, network)."""
+    if hf_token:
+        from situs.token_manager import save_hf_token
+        save_hf_token(hf_token)
+
     if not json_output:
         print_banner()
         if console:
@@ -315,6 +320,14 @@ def setup(
         "[bold green]READY[/bold green]" if webrtc_ok else "[bold yellow]OPTIONAL[/bold yellow]"
     )
 
+    from situs.token_manager import get_hf_token, get_hf_token_source, mask_token
+    curr_hf = get_hf_token()
+    source_hf = get_hf_token_source()
+    if curr_hf:
+        table.add_row("Hugging Face Hub", f"{mask_token(curr_hf)} ({source_hf})", "[bold green]CONFIGURED[/bold green]")
+    else:
+        table.add_row("Hugging Face Hub", "Public-only (Run 'situs hf <token>' for gated models)", "[bold yellow]OPTIONAL[/bold yellow]")
+
     if console:
         console.print(table)
         console.print()
@@ -405,8 +418,12 @@ def start_coordinator(
     worker_auth_token: Optional[str] = typer.Option(None, "--worker-auth-token", "--token", envvar="SITUS_WORKER_AUTH_TOKEN", help="Worker authentication token"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="SITUS_API_KEY", help="OpenAI API key for coordinator gateway"),
     admin_key: Optional[str] = typer.Option(None, "--admin-key", envvar="SITUS_ADMIN_KEY", help="Administrator authorization key"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token", help="Hugging Face access token for gated models"),
 ):
     """Start the Situs Coordinator, WebSocket Relay, and OpenAI API Gateway."""
+    if hf_token:
+        from situs.token_manager import save_hf_token
+        save_hf_token(hf_token)
     from situs.network.tunnel import start_public_tunnel, stop_public_tunnel, get_active_tunnel_url
     lan_ip = get_local_ip()
 
@@ -510,8 +527,12 @@ def join_cluster(
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
     compression: str = typer.Option("fp16", "--compression", "-c", help="Activation format ('fp16', 'bf16', 'none', 'int8')"),
     token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token", help="Hugging Face access token for gated models"),
 ):
     """Join a Situs cluster as a GPU/CPU inference worker daemon."""
+    if hf_token:
+        from situs.token_manager import save_hf_token
+        save_hf_token(hf_token)
     normalized_ws = normalize_ws_url(coordinator)
 
     # Detect hardware and verify GPU availability
@@ -929,6 +950,66 @@ def remove_device(
         console.print(f"[bold red]Failed to connect to coordinator at {base_url}:[/bold red] {e}")
 
 
+@app.command("hf")
+def manage_hf_token(
+    token: Optional[str] = typer.Argument(None, help="Hugging Face access token to configure"),
+    clear: bool = typer.Option(False, "--clear", "--logout", help="Clear saved Hugging Face token"),
+):
+    """View or configure Hugging Face access token for gated models (Gemma 3, Llama 3.1)."""
+    from situs.token_manager import (
+        get_hf_token,
+        get_hf_token_source,
+        mask_token,
+        save_hf_token,
+        clear_hf_token,
+        validate_hf_token,
+    )
+    if clear:
+        clear_hf_token()
+        console.print("[bold green]✓ Hugging Face token cleared.[/bold green] (Removed from active session and local storage)")
+        return
+
+    if not token:
+        curr_token = get_hf_token()
+        source = get_hf_token_source()
+        if curr_token:
+            masked = mask_token(curr_token)
+            valid, username, warn = validate_hf_token(curr_token)
+            user_str = f" ({username})" if username else ""
+            table = Table(title="Hugging Face Authentication Status", border_style="green", title_style="bold green")
+            table.add_column("Property", style="bold cyan")
+            table.add_column("Value", style="white")
+            table.add_row("Status", f"[bold green]Configured & Active{user_str}[/bold green]")
+            table.add_row("Token", masked)
+            table.add_row("Source", source or "Unknown")
+            console.print(table)
+            console.print("\n[dim]To update: situs hf <new_token> | To remove: situs hf --clear[/dim]")
+        else:
+            table = Table(title="Hugging Face Authentication Status", border_style="yellow", title_style="bold yellow")
+            table.add_column("Property", style="bold yellow")
+            table.add_column("Value", style="white")
+            table.add_row("Status", "[bold yellow]Not Configured[/bold yellow]")
+            table.add_row("Gated Models", "Requires token (Google Gemma 3, Meta Llama 3.1)")
+            table.add_row("Public Models", "No token required (Qwen 2.5, DeepSeek R1, Mistral)")
+            console.print(table)
+            console.print("\n[bold cyan]To configure your token:[/bold cyan] situs hf <token>")
+            console.print("[dim]Get a free Read-access token at: https://huggingface.co/settings/tokens[/dim]")
+        return
+
+    # User provided token!
+    console.print("[cyan]Validating and saving Hugging Face token...[/cyan]")
+    succ, msg, user = save_hf_token(token, validate=True)
+    if succ:
+        masked = mask_token(token)
+        user_str = f" for user '{user}'" if user else ""
+        console.print(f"[bold green]✓ Hugging Face token successfully configured{user_str}![/bold green]")
+        console.print(f"[cyan]Active Token:[/cyan] {masked}")
+        console.print("[dim]Stored in ~/.cache/huggingface/token and ~/.situs/config.json. Gated models unlocked.[/dim]")
+    else:
+        console.print(f"[bold red]✗ Failed to configure token:[/bold red] {msg}")
+        raise typer.Exit(code=1)
+
+
 @app.command("chat")
 def interactive_chat(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
@@ -1000,7 +1081,7 @@ def main():
     import re
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         first_arg = sys.argv[1].strip()
-        known_cmds = {"setup", "cuda", "coordinator", "join", "connect", "status", "partition", "remove", "chat", "run"}
+        known_cmds = {"setup", "cuda", "coordinator", "join", "connect", "status", "partition", "remove", "chat", "run", "hf", "token"}
         if first_arg.lower() not in known_cmds:
             # Check if first_arg looks like an address, URL, or tunnel domain
             is_url_or_addr = (
