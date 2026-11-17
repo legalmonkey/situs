@@ -694,7 +694,7 @@ def main():
     parser.add_argument("--id", default=None, help="Worker ID (auto-generated if omitted)")
     parser.add_argument("--device", default="cuda:0" if HAS_TORCH and torch.cuda.is_available() else "cpu", help="PyTorch compute device")
     parser.add_argument("--model", default="gemma3:4b", help="Model identifier")
-    parser.add_argument("--compression", default="fp16", choices=["none", "fp16", "bf16", "int8"], help="Activation compression dtype")
+    parser.add_argument("--compression", default="bf16", choices=["none", "fp16", "bf16", "int8"], help="Activation compression dtype")
     parser.add_argument("--token", "--auth-token", default=os.getenv("SITUS_WORKER_AUTH_TOKEN"), help="Worker authentication token")
     args = parser.parse_args()
 

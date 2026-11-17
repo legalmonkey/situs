@@ -119,7 +119,7 @@ def test_stage_engine_decompresses_activations_to_stage_dtype():
 
 def test_ollama_gguf_discovery_and_fast_dequant_and_int8_parity(tmp_path, monkeypatch):
     """Verify Ollama manifest -> GGUF blob discovery, vectorized Q8_0/Q4_K/Q6_K dequant parity, and Int8 layers."""
-    import gguf
+    gguf = pytest.importorskip("gguf")
 
     # 1. Mock ~/.ollama/models layout
     ollama_dir = tmp_path / "ollama_models"

@@ -1223,7 +1223,7 @@ def start_in_process_worker(
             worker_id=w_id,
             device=dev,
             model_name=model,
-            compression_dtype="fp16",
+            compression_dtype="bf16",
             enable_speculative=True,
             p2p_direct_enabled=True,
         )
@@ -1889,7 +1889,7 @@ def execute_slash_command(
             f"[bold cyan]• Diagnostics:[/bold cyan]     {hw.status_message}\n"
             f"[bold cyan]• Transport:[/bold cyan]       WebRTC P2P Direct + Relay Fallback\n"
             f"[bold cyan]• Speculative:[/bold cyan]     Enabled (Prompt-Lookup)\n"
-            f"[bold cyan]• Compression:[/bold cyan]     INT8 Dynamic Quantization"
+            f"[bold cyan]• Compression:[/bold cyan]     BF16 Lossless Floating Point"
             f"{cuda_notice}\n\n"
             f"[white]Run [bold cyan]/status[/bold cyan] or press [bold cyan]Tab[/bold cyan] to see registered cluster GPUs.[/white]",
             title="Situs Worker Joined",

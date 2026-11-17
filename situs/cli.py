@@ -525,7 +525,7 @@ def join_cluster(
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Target model identifier"),
     speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
-    compression: str = typer.Option("fp16", "--compression", "-c", help="Activation format ('fp16', 'bf16', 'none', 'int8')"),
+    compression: str = typer.Option("bf16", "--compression", "-c", help="Activation format ('bf16', 'fp16', 'none', 'int8')"),
     token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),
     hf_token: Optional[str] = typer.Option(None, "--hf-token", help="Hugging Face access token for gated models"),
 ):
@@ -589,7 +589,7 @@ def join_cluster(
             f"[bold cyan]• Model:[/bold cyan]          {model}\n"
             f"[bold cyan]• Speculative:[/bold cyan]    {'Enabled (Prompt-Lookup)' if speculative else 'Disabled'}\n"
             f"[bold cyan]• Transport:[/bold cyan]      {'WebRTC P2P Direct + Relay Fallback' if p2p else 'WebSocket Relay Only'}\n"
-            f"[bold cyan]• Compression:[/bold cyan]    {compression.upper()} Dynamic Quantization",
+            f"[bold cyan]• Compression:[/bold cyan]    {compression.upper()} ({'Lossless Floating Point' if compression in ('bf16', 'fp16', 'none') else 'Dynamic Quantization'})",
             title="Situs Worker Daemon",
             border_style=border_col,
         )
@@ -664,7 +664,7 @@ def connect_cluster(
     worker_id: Optional[str] = typer.Option(None, "--worker-id", "--id", "-w", help="Custom worker ID"),
     device: str = typer.Option("auto", "--device", "-d", help="Compute device ('cuda', 'cuda:0', 'cpu', or 'auto')"),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Target model identifier"),
-    compression: str = typer.Option("fp16", "--compression", "-c", help="Activation format ('fp16', 'bf16', 'none', 'int8')"),
+    compression: str = typer.Option("bf16", "--compression", "-c", help="Activation format ('bf16', 'fp16', 'none', 'int8')"),
     speculative: bool = typer.Option(True, "--speculative/--no-speculative", help="Enable speculative candidate decoding"),
     p2p: bool = typer.Option(True, "--p2p/--no-p2p", help="Enable direct WebRTC P2P DataChannels"),
     token: Optional[str] = typer.Option(None, "--token", "-t", envvar="SITUS_WORKER_AUTH_TOKEN", help="Cluster worker authentication token"),

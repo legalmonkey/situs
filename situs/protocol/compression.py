@@ -20,11 +20,11 @@ except ImportError:
 
 def compress_tensor(
     tensor: Union["torch.Tensor", np.ndarray],
-    method: str = "fp16"
+    method: str = "bf16"
 ) -> Tuple[bytes, float, Tuple[int, ...]]:
     """
     Serializes an activation tensor for transmission across WAN.
-    Defaults to unquantized dense FP16 / BF16 representation.
+    Defaults to unquantized dense BF16 / FP16 representation.
     
     Returns:
         (compressed_bytes, scale_factor, original_shape)
@@ -33,10 +33,13 @@ def compress_tensor(
     if HAS_TORCH and isinstance(tensor, torch.Tensor):
         shape = tuple(tensor.shape)
         tensor = tensor.detach()
-        if norm in ("fp16", "float16"):
-            return tensor.to(torch.float16).contiguous().cpu().numpy().tobytes(), 1.0, shape
-        elif norm in ("bf16", "bfloat16"):
+        if norm in ("bf16", "bfloat16"):
             return tensor.to(torch.bfloat16).contiguous().cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
+        elif norm in ("fp16", "float16"):
+            # If tensor is already bfloat16 or has values that exceed float16 max (65504), preserve as bf16 to avoid Inf/NaN collapse
+            if tensor.dtype == torch.bfloat16 or float(tensor.abs().max()) > 65500.0:
+                return tensor.to(torch.bfloat16).contiguous().cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
+            return tensor.to(torch.float16).contiguous().cpu().numpy().tobytes(), 1.0, shape
         elif norm in ("none", "fp32", "float32"):
             return tensor.to(torch.float32).contiguous().cpu().numpy().tobytes(), 1.0, shape
         elif norm in ("int8", "q8_0"):
@@ -50,12 +53,12 @@ def compress_tensor(
     arr = np.asarray(tensor)
     shape = arr.shape
 
-    if norm in ("fp16", "float16"):
-        return arr.astype(np.float16).tobytes(), 1.0, shape
-    elif norm in ("bf16", "bfloat16"):
+    if norm in ("bf16", "bfloat16"):
         if HAS_TORCH:
             t = torch.from_numpy(arr.astype(np.float32)).to(torch.bfloat16).contiguous()
             return t.cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
+        return arr.astype(np.float16).tobytes(), 1.0, shape
+    elif norm in ("fp16", "float16"):
         return arr.astype(np.float16).tobytes(), 1.0, shape
     elif norm in ("none", "fp32", "float32"):
         return arr.astype(np.float32).tobytes(), 1.0, shape
@@ -72,30 +75,33 @@ def decompress_tensor(
     data: bytes,
     scale: float = 1.0,
     shape: Tuple[int, ...] = (),
-    method: str = "fp16",
+    method: str = "bf16",
     device: Optional[Union[str, "torch.device"]] = None,
     dtype: Optional[Any] = None
 ) -> Union["torch.Tensor", np.ndarray]:
     """
     Dequantizes/deserializes received compressed bytes back into an activation tensor.
-    Defaults to unquantized dense FP16 / BF16 representation.
+    Defaults to unquantized dense BF16 / FP16 representation.
     """
     norm = method.lower()
     target_device = device or ("cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu")
 
-    if norm in ("fp16", "float16"):
-        arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
-        if HAS_TORCH:
-            target_dtype = dtype or torch.float16
-            return torch.from_numpy(arr.copy()).to(device=target_device, dtype=target_dtype)
-        return arr.astype(np.float32)
-
-    elif norm in ("bf16", "bfloat16"):
+    if norm in ("bf16", "bfloat16"):
         if HAS_TORCH:
             target_dtype = dtype or torch.bfloat16
             raw_int16 = np.frombuffer(data, dtype=np.int16).copy()
             return torch.from_numpy(raw_int16).view(torch.bfloat16).reshape(shape).to(device=target_device, dtype=target_dtype)
         return np.frombuffer(data, dtype=np.float16).reshape(shape).astype(np.float32)
+
+    elif norm in ("fp16", "float16"):
+        if dtype == torch.bfloat16:
+            raw_int16 = np.frombuffer(data, dtype=np.int16).copy()
+            return torch.from_numpy(raw_int16).view(torch.bfloat16).reshape(shape).to(device=target_device, dtype=torch.bfloat16)
+        arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
+        if HAS_TORCH:
+            target_dtype = dtype or torch.float16
+            return torch.from_numpy(arr.copy()).to(device=target_device, dtype=target_dtype)
+        return arr.astype(np.float32)
 
     elif norm in ("none", "fp32", "float32"):
         arr = np.frombuffer(data, dtype=np.float32).reshape(shape)

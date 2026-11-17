@@ -120,7 +120,7 @@ class CoordinatorConfig:
             if o.strip()
         ]
     )
-    request_timeout_s: float = 60.0
+    request_timeout_s: float = 300.0
     max_concurrent_requests: int = 16
     ssl_certfile: Optional[str] = None
     ssl_keyfile: Optional[str] = None
@@ -188,7 +188,7 @@ class WorkerConfig:
     vram_budget_gb: Optional[float] = None
     assigned_layer_start: Optional[int] = None
     assigned_layer_end: Optional[int] = None
-    compression_dtype: str = "fp16"  # 'fp16', 'bf16', 'none', 'int8'
+    compression_dtype: str = "bf16"  # 'bf16', 'fp16', 'none', 'int8'
     heartbeat_interval_s: float = 1.0
     enable_speculative: bool = True
     ngram_size: int = 2

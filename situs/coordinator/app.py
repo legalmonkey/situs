@@ -643,7 +643,25 @@ def _format_pipeline_prompt(messages: List[Any], tokenizer: Any) -> str:
                 return templated
         except Exception:
             pass
-    return "\n".join([f"{m.role}: {m.content}" for m in messages]) + "\nassistant:"
+    # Specific chat template fallback for Gemma and Llama instruction models
+    m_name = (getattr(tokenizer, "model_name", "") or "").lower()
+    if any(g in m_name for g in ("gemma", "gemma2", "gemma3")):
+        parts = []
+        for m in messages:
+            role = "user" if getattr(m, "role", "user") == "user" else "model"
+            content = getattr(m, "content", "") or ""
+            parts.append(f"<start_of_turn>{role}\n{content.strip()}<end_of_turn>\n")
+        parts.append("<start_of_turn>model\n")
+        return "".join(parts)
+    elif any(l in m_name for l in ("llama", "llama-3", "llama3")):
+        parts = ["<|begin_of_text|>"]
+        for m in messages:
+            role = getattr(m, "role", "user")
+            content = getattr(m, "content", "") or ""
+            parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{content.strip()}<|eot_id|>")
+        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        return "".join(parts)
+    return "\n".join([f"{getattr(m, 'role', 'user')}: {getattr(m, 'content', '')}" for m in messages]) + "\nassistant:"
 
 
 @app.post("/v1/chat/completions")

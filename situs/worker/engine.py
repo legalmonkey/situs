@@ -161,7 +161,7 @@ class StageExecutionEngine:
         self,
         stage_model: DistributedStageModel,
         assignment: AssignLayers,
-        compression_dtype: str = "fp16",
+        compression_dtype: str = "bf16",
         tokenizer=None,
         ngram_size: int = 2,
         max_draft_tokens: int = 4,
@@ -594,7 +594,10 @@ class StageExecutionEngine:
             )
             del comp_bytes
             past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-            out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs, compute_all_logits=True)
+            try:
+                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs, compute_all_logits=True)
+            except TypeError:
+                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
             del hidden_states
             self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
             self.session_kv_caches[request_id] = new_kvs

@@ -112,8 +112,8 @@ def test_speculative_pipeline_burst_acceleration():
 
     # Align mock model logits to simulate true target model prediction of candidate tokens
     orig_forward = engine_b.stage_model.forward_intermediate_stage
-    def mock_matching_forward(hidden_states, past_kvs=None):
-        out, new_kvs = orig_forward(hidden_states, past_kvs=past_kvs)
+    def mock_matching_forward(hidden_states, past_kvs=None, *args, **kwargs):
+        out, new_kvs = orig_forward(hidden_states, past_kvs=past_kvs, *args, **kwargs)
         for i, tok in enumerate([30, 40, 99, 10]):
             if i < out.shape[1]:
                 out[0, i, tok] = 1000.0

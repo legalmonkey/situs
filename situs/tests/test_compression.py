@@ -49,7 +49,7 @@ def test_fp16_dense_activation_accuracy():
     original = np.random.randn(1, 4, 2048).astype(np.float32)
 
     # Default method is now unquantized dense FP16
-    comp_bytes, scale, shape = compress_tensor(original)
+    comp_bytes, scale, shape = compress_tensor(original, method="fp16")
     assert shape == (1, 4, 2048)
     assert len(comp_bytes) == 1 * 4 * 2048 * 2  # 2 bytes per element (FP16)
     assert scale == 1.0
