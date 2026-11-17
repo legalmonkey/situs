@@ -28,7 +28,7 @@ from situs.coordinator.registry import resolve_model_metadata
 
 def test_normalize_model_name_catalog_mappings():
     """Verify standard model aliases are mapped cleanly to canonical Hugging Face repositories."""
-    assert normalize_model_name("gemma3:4b") == "google/gemma-3-4b-it"
+    assert normalize_model_name("gemma3:4b") == "google/gemma-3-4b-it-qat-q4_0-gguf"
     assert normalize_model_name("gemma2:2b") == "google/gemma-2-2b-it"
     assert normalize_model_name("llama3.1:8b") == "meta-llama/Llama-3.1-8B-Instruct"
     assert normalize_model_name("qwen2.5:7b") == "Qwen/Qwen2.5-7B-Instruct"
@@ -39,7 +39,7 @@ def test_normalize_model_name_catalog_mappings():
     assert normalize_model_name("custom-org/my-model") == "custom-org/my-model"
 
     # Backward compatibility alias
-    assert normalize_ollama_model("gemma3:4b") == "google/gemma-3-4b-it"
+    assert normalize_ollama_model("gemma3:4b") == "google/gemma-3-4b-it-qat-q4_0-gguf"
 
 
 def test_is_model_downloaded_without_ollama_daemon(tmp_path, monkeypatch):

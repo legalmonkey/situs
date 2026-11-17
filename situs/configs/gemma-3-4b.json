@@ -6,7 +6,7 @@
   "num_hidden_layers": 34,
   "hidden_size": 2560,
   "intermediate_size": 10240,
-  "vocab_size": 256000,
+  "vocab_size": 262208,
   "num_attention_heads": 8,
   "num_key_value_heads": 4,
   "head_dim": 256,

@@ -8,8 +8,32 @@ import threading
 from collections import OrderedDict
 from typing import Optional, Dict, List, Any, Tuple
 
-# Enable PyTorch expandable segments to strictly prevent virtual memory fragmentation OOM
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import sys
+import warnings
+
+def configure_pytorch_allocator():
+    """Configures PYTORCH_CUDA_ALLOC_CONF safely based on platform capabilities.
+    On Windows (WDDM), expandable_segments is NOT supported by PyTorch CUDAAllocatorConfig.h
+    and triggers noisy UserWarnings that corrupt full-screen terminal UIs.
+    On Linux/POSIX, expandable_segments:True prevents virtual memory fragmentation."""
+    if sys.platform == "win32":
+        alloc = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        parts = [p.strip() for p in alloc.split(",") if p.strip() and not p.strip().startswith("expandable_segments")]
+        if not any(p.startswith("max_split_size_mb") for p in parts):
+            parts.append("max_split_size_mb:128")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
+    else:
+        alloc = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        parts = [p.strip() for p in alloc.split(",") if p.strip()]
+        if not any(p.startswith("expandable_segments") for p in parts):
+            parts.append("expandable_segments:True")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
+
+configure_pytorch_allocator()
+
+# Suppress PyTorch internal C++ allocator warnings that can disrupt full-screen terminal layouts
+warnings.filterwarnings("ignore", message=".*expandable_segments not supported on this platform.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
 
 from situs.protocol.compression import compress_tensor, decompress_tensor, decompress_layer_bytes
 from situs.protocol.messages import (

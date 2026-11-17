@@ -92,6 +92,11 @@ class GGUFTokenizerAdapter:
             if end_tok in vocab and vocab[end_tok] not in stop_ids:
                 stop_ids.append(int(vocab[end_tok]))
         self.stop_token_ids: List[int] = stop_ids
+        self.all_special_ids: List[int] = list(set([
+            s for s in (self.bos_token_id, self.eos_token_id, self.unk_token_id) if s is not None
+        ] + self.stop_token_ids + [
+            idx for idx, tt in enumerate(token_types or []) if tt == 3
+        ]))
 
         unk_tok = tokens[self.unk_token_id] if 0 <= self.unk_token_id < len(tokens) else "<unk>"
 
@@ -177,13 +182,20 @@ def _resolve_and_load_tokenizer(
     local_files_only: bool = False,
 ) -> Any:
     """Internal disk and network resolution for tokenizers."""
-    # Prefer embedded GGUF tokenizer if a direct GGUF file is supplied
+    # Prefer embedded GGUF tokenizer if a direct GGUF file or cached GGUF model is available
     if model_name and model_name not in ("default", "gpt2"):
         try:
             if os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
                 tok = GGUFTokenizerAdapter(model_name)
                 logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {model_name}")
                 return tok
+            from situs.worker.loader import find_local_weight_files
+            wfiles = find_local_weight_files(model_name)
+            for wf in wfiles:
+                if wf.lower().endswith(".gguf") and os.path.isfile(wf):
+                    tok = GGUFTokenizerAdapter(wf)
+                    logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {wf}")
+                    return tok
         except Exception as e:
             logger.debug(f"GGUF tokenizer construction skipped for '{model_name}': {e}")
 
@@ -215,6 +227,7 @@ def _resolve_and_load_tokenizer(
             gemma_cands = []
             if "gemma3" in clean_name or "gemma-3" in clean_name:
                 gemma_cands.append("google/gemma-3-4b-it")
+                gemma_cands.append("google/gemma-3-4b-it-qat-q4_0-gguf")
             gemma_cands.extend([
                 "google/gemma-2-9b-it",
                 "google/gemma-2-2b-it",

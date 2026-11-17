@@ -19,12 +19,15 @@ import html
 import io
 import logging
 import datetime
+import warnings
 from urllib.parse import urlparse
 from typing import Optional, List, Dict, Tuple, Any, Callable, Union
 
 # Suppress noisy HuggingFace / Transformers library warnings (e.g., PyTorch version, legacy activation warnings)
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+warnings.filterwarnings("ignore", message=".*expandable_segments not supported on this platform.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
 
 # Ensure proper UTF-8 handling and native virtual terminal sequences on Windows
 def enable_windows_vt_support():
@@ -73,6 +76,8 @@ def restore_terminal_colors():
 # Silence HTTP request loggers to prevent leaking HTTP GET/POST logs into the TUI
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+logger = logging.getLogger("situs.tui")
 
 import httpx
 from rich import box
@@ -185,6 +190,36 @@ TUI_STYLE = Style.from_dict({
 })
 
 
+class TuiStderrRedirector:
+    """Redirects unmanaged sys.stderr.write() calls from background threads or C libraries
+    into situs.log rather than letting raw text disrupt full-screen Prompt Toolkit VT100 buffers."""
+    def __init__(self, logger_instance: logging.Logger):
+        self.logger = logger_instance
+        self._buf = ""
+
+    def write(self, s: str):
+        if not s:
+            return
+        self._buf += s
+        if "\n" in self._buf or "\r" in self._buf:
+            lines = self._buf.splitlines(keepends=True)
+            complete = [l for l in lines if l.endswith(("\n", "\r"))]
+            remainder = lines[-1] if not lines[-1].endswith(("\n", "\r")) else ""
+            for line in complete:
+                stripped = line.strip()
+                if stripped:
+                    self.logger.warning(f"[stderr] {stripped}")
+            self._buf = remainder
+
+    def flush(self):
+        if self._buf.strip():
+            self.logger.warning(f"[stderr] {self._buf.strip()}")
+            self._buf = ""
+
+    def isatty(self):
+        return False
+
+
 def create_safe_output(custom_output: Optional[Any] = None) -> Any:
     """Creates a resilient prompt_toolkit Output instance across all Windows console environments."""
     if custom_output is not None:
@@ -233,17 +268,19 @@ DEFAULT_MODEL = os.getenv("SITUS_DEFAULT_MODEL", "gemma3:4b")
 DISTRIBUTED_MODELS_6GB_10GB = [
     {
         "id": "llama-3.1:8b-instruct-q8_0",
-        "name": "Llama 3.1 8B Instruct (Q8_0)",
+        "hf_repo": "meta-llama/Llama-3.1-8B-Instruct",
+        "name": "Meta Llama 3.1 8B Instruct",
         "vram_gb": 8.5,
         "params": "8.0B",
         "layers": 32,
         "context": "128k",
         "recommended_split": "2x 6GB GPUs (4.3 GB / GPU)",
-        "desc": "Meta Llama 3.1 flagship 8B high-precision 8-bit quantized weights.",
+        "desc": "Meta Llama 3.1 flagship 8B instruction-tuned model.",
     },
     {
         "id": "qwen2.5:7b-instruct-q8_0",
-        "name": "Qwen 2.5 7B Instruct (Q8_0)",
+        "hf_repo": "Qwen/Qwen2.5-7B-Instruct",
+        "name": "Qwen 2.5 7B Instruct",
         "vram_gb": 8.1,
         "params": "7.6B",
         "layers": 28,
@@ -253,7 +290,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "deepseek-r1:7b-q8_0",
-        "name": "DeepSeek R1 Distill 7B (Q8_0)",
+        "hf_repo": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+        "name": "DeepSeek R1 Distill Qwen 7B",
         "vram_gb": 8.2,
         "params": "7.6B",
         "layers": 28,
@@ -263,7 +301,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "gemma-2:9b-instruct-q6_k",
-        "name": "Gemma 2 9B Instruct (Q6_K)",
+        "hf_repo": "google/gemma-2-9b-it",
+        "name": "Google Gemma 2 9B Instruct",
         "vram_gb": 7.8,
         "params": "9.2B",
         "layers": 42,
@@ -273,17 +312,19 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "gemma3:4b",
+        "hf_repo": "google/gemma-3-4b-it-qat-q4_0-gguf",
         "name": "Google Gemma 3 4B",
-        "vram_gb": 3.4,
+        "vram_gb": 3.2,
         "params": "4.0B",
         "layers": 34,
         "context": "8k",
-        "recommended_split": "1-2x GPUs (1.7 GB / GPU)",
-        "desc": "Google Gemma 3 dense lightweight instruction-tuned model.",
+        "recommended_split": "1x GPU (3.2 GB) or 2x GPUs (1.7 GB / GPU)",
+        "desc": "Google Gemma 3 dense 4-bit Quantization-Aware Trained (QAT) model (3.16 GB). Fits natively in 6GB VRAM.",
     },
     {
         "id": "mistral:7b-instruct-v0.3-q8_0",
-        "name": "Mistral 7B Instruct v0.3 (Q8_0)",
+        "hf_repo": "mistralai/Mistral-7B-Instruct-v0.3",
+        "name": "Mistral 7B Instruct v0.3",
         "vram_gb": 7.7,
         "params": "7.2B",
         "layers": 32,
@@ -293,7 +334,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "qwen2.5-coder:7b-instruct-q8_0",
-        "name": "Qwen 2.5 Coder 7B (Q8_0)",
+        "hf_repo": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "name": "Qwen 2.5 Coder 7B Instruct",
         "vram_gb": 8.1,
         "params": "7.6B",
         "layers": 28,
@@ -303,7 +345,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "starcoder2:7b-q8_0",
-        "name": "StarCoder 2 7B (Q8_0)",
+        "hf_repo": "bigcode/starcoder2-7b",
+        "name": "StarCoder 2 7B",
         "vram_gb": 7.6,
         "params": "7.2B",
         "layers": 32,
@@ -313,7 +356,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "llama-3.2:3b-instruct-q8_0",
-        "name": "Llama 3.2 3B Instruct (Q8_0)",
+        "hf_repo": "meta-llama/Llama-3.2-3B-Instruct",
+        "name": "Meta Llama 3.2 3B Instruct",
         "vram_gb": 3.8,
         "params": "3.2B",
         "layers": 28,
@@ -323,7 +367,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "qwen2.5:14b-instruct-q8_0",
-        "name": "Qwen 2.5 14B Instruct (Q8_0)",
+        "hf_repo": "Qwen/Qwen2.5-14B-Instruct",
+        "name": "Qwen 2.5 14B Instruct",
         "vram_gb": 15.2,
         "params": "14.7B",
         "layers": 48,
@@ -333,7 +378,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "deepseek-r1:14b-q8_0",
-        "name": "DeepSeek R1 Distill 14B (Q8_0)",
+        "hf_repo": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        "name": "DeepSeek R1 Distill Qwen 14B",
         "vram_gb": 14.9,
         "params": "14.7B",
         "layers": 48,
@@ -343,7 +389,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "mistral-nemo:12b-instruct-fp16",
-        "name": "Mistral NeMo 12B (FP16)",
+        "hf_repo": "mistralai/Mistral-Nemo-Instruct-2407",
+        "name": "Mistral NeMo 12B Instruct",
         "vram_gb": 14.6,
         "params": "12.2B",
         "layers": 40,
@@ -353,7 +400,8 @@ DISTRIBUTED_MODELS_6GB_10GB = [
     },
     {
         "id": "llama-3.1:8b-fp16",
-        "name": "Llama 3.1 8B (FP16)",
+        "hf_repo": "meta-llama/Llama-3.1-8B-Instruct",
+        "name": "Meta Llama 3.1 8B (FP16)",
         "vram_gb": 16.0,
         "params": "8.0B",
         "layers": 32,
@@ -382,7 +430,7 @@ def render_models_table() -> Table:
     for i, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
         table.add_row(
             str(i),
-            m["id"],
+            m["name"],
             f"{m['vram_gb']} GB",
             m["params"],
             str(m["layers"]),
@@ -409,12 +457,15 @@ class OpenCodeSlashCompleter(Completer):
         ("/cuda", "Diagnose GPU & show PyTorch CUDA acceleration install command"),
         ("/models", "List curated 6GB-16GB models for distributed pooling"),
         ("/model", "Select or switch models (e.g. /model 1, /model 2, /model <name>)"),
+        ("/pull", "Pull / download a model from Hugging Face Hub: /pull <model> or /pull <1-N>"),
         ("/hf", "View or set Hugging Face token for gated models: /hf [token]"),
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
         ("/speculative", "Toggle prompt-lookup speculative candidate drafting"),
         ("/tokens", "View or set maximum generation tokens: /tokens [count] (default: 2048)"),
         ("/unload", "Unload active model from GPU VRAM to return memory to 0 MB"),
         ("/sleep", "Put cluster into idle sleep mode and free GPU VRAM"),
+        ("/refresh", "Redraw and resynchronize full-screen terminal interface"),
+        ("/redraw", "Redraw and resynchronize full-screen terminal interface"),
         ("/clear", "Clear chat memory and reset interface"),
         ("/system", "View or update system prompt instructions"),
         ("/help", "Show all commands, custom worker IDs & model selection guide"),
@@ -427,12 +478,50 @@ class OpenCodeSlashCompleter(Completer):
             sub = text[7:].strip().lower()
             for idx, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
                 num_str = str(idx)
-                if not sub or num_str.startswith(sub) or m["id"].lower().startswith(sub) or m["name"].lower().startswith(sub):
+                hf_repo = m.get("hf_repo", m["id"])
+                if not sub:
+                    match = True
+                elif sub.isdigit():
+                    match = num_str.startswith(sub)
+                else:
+                    match = (
+                        sub in m["name"].lower()
+                        or sub in hf_repo.lower()
+                        or sub in m["id"].lower()
+                    )
+                if match:
                     yield Completion(
                         f"/model {idx}",
                         start_position=-len(text),
                         display=f"/model {idx} ({m['name']})",
                         display_meta=f"{m['vram_gb']} GB · {m['recommended_split']}"
+                    )
+            return
+
+        if text.startswith(("/pull ", "/pull")):
+            sub = text[6:].strip().lower() if text.startswith("/pull ") else ""
+            for idx, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
+                num_str = str(idx)
+                hf_repo = m.get("hf_repo", m["id"])
+                if not sub:
+                    match = True
+                elif sub.isdigit():
+                    match = num_str.startswith(sub)
+                else:
+                    match = (
+                        sub in m["name"].lower()
+                        or sub in hf_repo.lower()
+                        or sub in m["id"].lower()
+                    )
+
+                if match:
+                    # If user explicitly typed a repo slash e.g. /pull meta-llama/
+                    completion_target = f"/pull {hf_repo}" if "/" in sub else f"/pull {idx}"
+                    yield Completion(
+                        completion_target,
+                        start_position=-len(text),
+                        display=f"/pull {idx} ({m['name']})",
+                        display_meta=f"{hf_repo} · {m['vram_gb']} GB"
                     )
             return
 
@@ -1385,6 +1474,101 @@ def prompt_in_centered_box(
         restore_terminal_colors()
 
 
+def _handle_pull_chunk(p_chunk: dict, session_state: Dict[str, Any], log_output_fn: Optional[Callable]):
+    """Processes an incoming SSE model download chunk and updates TUI session state & logs."""
+    from situs.inference_backend import make_progress_bar
+    p_type = p_chunk.get("type")
+    if p_type == "model_loading":
+        pct = float(p_chunk.get("percent", 0.0))
+        stage = p_chunk.get("stage", "Streaming Layers...")
+        bar = p_chunk.get("bar") or make_progress_bar(pct, width=22)
+        spd = float(p_chunk.get("speed_mb", 0.0))
+        eta = int(p_chunk.get("eta_s", 0))
+        cb = int(p_chunk.get("completed_bytes", 0))
+        tb = int(p_chunk.get("total_bytes", 0))
+        if tb > 0 and cb > tb:
+            cb = tb
+        b_str = f" · {cb / 1e9:.2f} / {tb / 1e9:.2f} GB" if tb > 0 else ""
+        s_str = f" · {spd:.1f} MB/s" if spd > 0 else ""
+        e_str = f" · ETA: {eta}s" if eta > 0 else ""
+        p_text = f"{stage}\n{bar} {pct:.1f}%{b_str}{s_str}{e_str}"
+
+        session_state["is_pulling"] = True
+        session_state["pull_percent"] = pct
+        session_state["pull_stage"] = stage
+        session_state["pull_speed"] = f"{spd:.1f} MB/s" if spd > 0 else ""
+
+        if log_output_fn:
+            try:
+                log_output_fn("LOADING", p_text)
+            except Exception:
+                pass
+    elif p_type == "model_ready":
+        session_state["is_pulling"] = False
+        r_stage = p_chunk.get("stage", "Model Ready in Memory")
+        r_text = f"[✓ Online Model Download Complete]\n{r_stage}"
+        session_state["pull_stage"] = r_stage
+        if log_output_fn:
+            try:
+                log_output_fn("Model Ready", r_text)
+            except Exception:
+                pass
+    elif p_type == "model_loading_error":
+        session_state["is_pulling"] = False
+        err_msg = p_chunk.get("error", "Download failed.")
+        req_auth = p_chunk.get("requires_auth", False)
+        auth_hint = "\n[bold yellow]To authenticate with Hugging Face, run:[/bold yellow] [bold cyan]/hf <your_token>[/bold cyan]" if req_auth else ""
+        err_text = f"[bold red]✗ Model Download Failed[/bold red]\n{err_msg}{auth_hint}"
+        session_state["pull_stage"] = "Download Failed"
+        if log_output_fn:
+            try:
+                log_output_fn("Download Error", err_text)
+            except Exception:
+                pass
+
+
+def _trigger_model_pull_streaming(
+    m_id: str,
+    m_name_title: str,
+    coord_url: str,
+    session_state: Dict[str, Any],
+    log_output_fn: Optional[Callable],
+):
+    """Asynchronously streams model download events via coordinator SSE endpoint if online,
+    or directly via in-process stream_pull_model if coordinator is offline."""
+    def _bg_pull():
+        try:
+            norm_c = normalize_fast_url(coord_url)
+            coord_online = is_coordinator_online(norm_c)
+            if coord_online:
+                with httpx.Client(timeout=3600.0) as cl:
+                    with cl.stream("POST", f"{norm_c}/admin/pull?model_name={m_id}") as p_resp:
+                        if p_resp.status_code == 200:
+                            for p_line in p_resp.iter_lines():
+                                if p_line.startswith("data: ") and not p_line.startswith("data: [DONE]"):
+                                    try:
+                                        p_chunk = json.loads(p_line[6:].strip())
+                                        _handle_pull_chunk(p_chunk, session_state, log_output_fn)
+                                    except Exception:
+                                        pass
+                            return
+            # Fallback to direct in-process streaming
+            async def _run_direct():
+                from situs.inference_backend import stream_pull_model
+                async for p_chunk in stream_pull_model(m_id):
+                    _handle_pull_chunk(p_chunk, session_state, log_output_fn)
+            asyncio.run(_run_direct())
+        except Exception as e:
+            session_state["is_pulling"] = False
+            if log_output_fn:
+                try:
+                    log_output_fn(f"[bold red]✗ Model Pull Failed: {e}[/bold red]", "Download Error")
+                except Exception:
+                    pass
+
+    threading.Thread(target=_bg_pull, daemon=True).start()
+
+
 def execute_slash_command(
     cmd: str,
     coordinator_url: str,
@@ -1432,6 +1616,13 @@ def execute_slash_command(
         else:
             console.clear()
             session_state["show_splash"] = True
+        return True
+
+    elif root_cmd in ("/refresh", "refresh", "/redraw", "redraw"):
+        if log_output_fn is not None:
+            log_output_fn("REDRAW", None)
+        else:
+            console.clear()
         return True
 
     elif root_cmd in ("/help", "help", "?", "/", ""):
@@ -2010,6 +2201,93 @@ def execute_slash_command(
         emit(prompt_panel, "Select Model")
         return True
 
+    elif root_cmd in ("/pull", "pull"):
+        from situs.inference_backend import is_model_downloaded, normalize_model_name
+        if len(parts) == 1:
+            table = Table(
+                title="Curated Models to Pull from Hugging Face Hub",
+                border_style="#ff2a85",
+                title_style="bold #ff2a85",
+            )
+            table.add_column("#", justify="center", style="bold #ff70a6", width=3)
+            table.add_column("Model Name", style="bold white", width=28)
+            table.add_column("Hugging Face Repository", style="bold cyan", width=38)
+            table.add_column("VRAM", style="green", width=9)
+            table.add_column("Status", style="bold", width=12)
+
+            for idx, m in enumerate(DISTRIBUTED_MODELS_6GB_10GB, start=1):
+                repo = m.get("hf_repo") or normalize_model_name(m["id"])
+                downloaded = is_model_downloaded(m["id"]) or is_model_downloaded(repo)
+                status_str = "[bold green]✓ Cached[/bold green]" if downloaded else "[yellow]Not Cached[/yellow]"
+                table.add_row(str(idx), m["name"], repo, f"{m['vram_gb']} GB", status_str)
+
+            emit(table, "Pull Models")
+            prompt_panel = Panel(
+                "[bold white]To pull and cache a model from Hugging Face Hub:[/bold white]\n"
+                f"Type [bold #ff70a6]/pull <1-{len(DISTRIBUTED_MODELS_6GB_10GB)}>[/bold #ff70a6] or [bold #ff70a6]/pull <model_id>[/bold #ff70a6]\n\n"
+                "Examples:\n"
+                "  [bold yellow]/pull 5[/bold yellow]          ->  Pull Google Gemma 3 4B\n"
+                "  [bold yellow]/pull gemma3:4b[/bold yellow]  ->  Pull Google Gemma 3 4B\n"
+                "  [bold yellow]/pull 1[/bold yellow]          ->  Pull Meta Llama 3.1 8B Instruct\n"
+                "  [bold yellow]/pull meta-llama/Llama-3.1-8B-Instruct[/bold yellow] -> Pull custom HF repo\n\n"
+                "[dim]Tip: If pulling a gated model (like Llama or Gemma), ensure you have set your token via [bold cyan]/hf <token>[/bold cyan][/dim]",
+                title="Model Pull Guide",
+                border_style="#ff2a85",
+            )
+            emit(prompt_panel, "Pull Model Guide")
+            return True
+
+        target_arg = parts[1].strip()
+        matched = None
+        if target_arg.isdigit():
+            idx = int(target_arg)
+            if 1 <= idx <= len(DISTRIBUTED_MODELS_6GB_10GB):
+                matched = DISTRIBUTED_MODELS_6GB_10GB[idx - 1]
+        else:
+            arg_lower = target_arg.lower()
+            matched = next(
+                (m for m in DISTRIBUTED_MODELS_6GB_10GB
+                 if m["id"].lower() == arg_lower or m["name"].lower() == arg_lower or m.get("hf_repo", "").lower() == arg_lower),
+                None
+            )
+            if not matched:
+                matched = next(
+                    (m for m in DISTRIBUTED_MODELS_6GB_10GB
+                     if arg_lower in m["id"].lower() or arg_lower in m["name"].lower() or arg_lower in m.get("hf_repo", "").lower()),
+                    None
+                )
+
+        model_id = matched["id"] if matched else target_arg
+        model_name_title = matched["name"] if matched else target_arg
+        canonical_repo = matched.get("hf_repo") or normalize_model_name(model_id)
+
+        if is_model_downloaded(model_id) or is_model_downloaded(canonical_repo):
+            cached_panel = Panel(
+                f"[bold green]✓ Model '{model_name_title}' is already cached locally![/bold green]\n\n"
+                f"[bold cyan]• Model ID:[/bold cyan]    {model_id}\n"
+                f"[bold cyan]• HF Repo:[/bold cyan]     {canonical_repo}\n"
+                f"[bold cyan]• Ready:[/bold cyan]       Weights verified on disk for distributed cluster inference.",
+                title="Model Cached",
+                border_style="green",
+            )
+            emit(cached_panel, "Model Cached")
+            return True
+
+        pull_start_panel = Panel(
+            f"[bold cyan]Starting Hugging Face Hub streaming download for '{model_name_title}'...[/bold cyan]\n\n"
+            f"[bold #ff70a6]• Model ID:[/bold #ff70a6]    {model_id}\n"
+            f"[bold #ff70a6]• HF Repo:[/bold #ff70a6]     {canonical_repo}\n"
+            f"[bold #ff70a6]• Storage:[/bold #ff70a6]     ~/.cache/huggingface/hub/\n\n"
+            f"[dim white]Real-time progress, speed, and ETA will stream into the status bar below.[/dim white]",
+            title="Pulling Model",
+            border_style="#ff2a85",
+        )
+        emit(pull_start_panel, "Pulling Model")
+
+        coord_url = session_state.get("coordinator_url", coordinator_url)
+        _trigger_model_pull_streaming(model_id, model_name_title, coord_url, session_state, log_output_fn)
+        return True
+
     elif root_cmd in ("/model", "model"):
         if len(parts) == 1:
             curr_model = session_state.get("model", model)
@@ -2091,71 +2369,7 @@ def execute_slash_command(
                 except Exception:
                     pass
 
-                # Background live pull streaming if model weights are not local
-                def _bg_pull_cli(m_id, m_name_title):
-                    try:
-                        norm_c = normalize_fast_url(coord_url)
-                        with httpx.Client(timeout=1800.0) as cl:
-                            with cl.stream("POST", f"{norm_c}/admin/pull?model_name={m_id}") as p_resp:
-                                if p_resp.status_code == 200:
-                                    for p_line in p_resp.iter_lines():
-                                        if p_line.startswith("data: ") and not p_line.startswith("data: [DONE]"):
-                                            try:
-                                                p_chunk = json.loads(p_line[6:].strip())
-                                                p_type = p_chunk.get("type")
-                                                if p_type == "model_loading":
-                                                    pct = float(p_chunk.get("percent", 0.0))
-                                                    stage = p_chunk.get("stage", "Streaming Layers...")
-                                                    bar = p_chunk.get("bar") or make_progress_bar(pct, width=22)
-                                                    spd = float(p_chunk.get("speed_mb", 0.0))
-                                                    eta = int(p_chunk.get("eta_s", 0))
-                                                    cb = int(p_chunk.get("completed_bytes", 0))
-                                                    tb = int(p_chunk.get("total_bytes", 0))
-                                                    b_str = f" · {cb / 1e9:.2f} / {tb / 1e9:.2f} GB" if tb > 0 else ""
-                                                    s_str = f" · {spd:.1f} MB/s" if spd > 0 else ""
-                                                    e_str = f" · ETA: {eta}s" if eta > 0 else ""
-                                                    p_text = f"{stage}\n{bar} {pct:.1f}%{b_str}{s_str}{e_str}"
-
-                                                    session_state["is_pulling"] = True
-                                                    session_state["pull_percent"] = pct
-                                                    session_state["pull_stage"] = stage
-                                                    session_state["pull_speed"] = f"{spd:.1f} MB/s" if spd > 0 else ""
-
-                                                    if log_output_fn:
-                                                        try:
-                                                            log_output_fn(p_text, "Model Pull")
-                                                        except Exception:
-                                                            pass
-                                                elif p_type == "model_ready":
-                                                    session_state["is_pulling"] = False
-                                                    r_stage = p_chunk.get("stage", "Model Ready in Memory")
-                                                    r_text = f"[✓ Online Model Download Complete]\n{r_stage}"
-                                                    session_state["pull_stage"] = r_stage
-                                                    if log_output_fn:
-                                                        try:
-                                                            log_output_fn(r_text, "Model Ready")
-                                                        except Exception:
-                                                            pass
-                                                    break
-                                                elif p_type == "model_loading_error":
-                                                    session_state["is_pulling"] = False
-                                                    err_msg = p_chunk.get("error", "Download failed.")
-                                                    req_auth = p_chunk.get("requires_auth", False)
-                                                    auth_hint = "\n[bold yellow]To authenticate with Hugging Face, run:[/bold yellow] [bold cyan]/hf <your_token>[/bold cyan]" if req_auth else ""
-                                                    err_text = f"[bold red]✗ Model Download Failed[/bold red]\n{err_msg}{auth_hint}"
-                                                    session_state["pull_stage"] = "Download Failed"
-                                                    if log_output_fn:
-                                                        try:
-                                                            log_output_fn(err_text, "Download Error")
-                                                        except Exception:
-                                                            pass
-                                                    break
-                                            except Exception:
-                                                pass
-                    except Exception:
-                        session_state["is_pulling"] = False
-
-                threading.Thread(target=_bg_pull_cli, args=(matched["id"], matched["name"]), daemon=True).start()
+                _trigger_model_pull_streaming(matched["id"], matched["name"], coord_url, session_state, log_output_fn)
 
             switched_panel = Panel(
                 f"[bold green]✓ Active Model Switched to {matched['name']}[/bold green]\n\n"
@@ -2378,13 +2592,28 @@ def run_opencode_tui(
     logging.root.setLevel(logging.INFO)
 
     for log_name in (
-        "situs", "situs.worker", "situs.coordinator", "situs.coordinator.registry",
+        "situs", "situs.tui", "situs.worker", "situs.coordinator", "situs.coordinator.registry",
         "situs.coordinator.relay", "situs.network.p2p", "uvicorn", "uvicorn.error",
         "uvicorn.access", "websockets", "asyncio", "httpx", "httpcore"
     ):
         l = logging.getLogger(log_name)
         l.handlers = [log_file_handler]
         l.propagate = False
+
+    orig_stderr = sys.stderr
+    orig_showwarning = warnings.showwarning
+
+    def _tui_showwarning(message, category, filename, lineno, file=None, line=None):
+        logger.warning(f"[warning] {category.__name__}: {message} ({filename}:{lineno})")
+
+    # Install warning suppression and redirection
+    warnings.filterwarnings("ignore", message=".*expandable_segments not supported on this platform.*")
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
+    warnings.showwarning = _tui_showwarning
+
+    # Redirect stderr to isolate background threads and C++ libraries from corrupting console
+    stderr_redirector = TuiStderrRedirector(logger)
+    sys.stderr = stderr_redirector
 
     # Hardware detection
     gpu_name, total_b, free_b, dev_type = detect_hardware_gpu()
@@ -2580,6 +2809,21 @@ def run_opencode_tui(
     def log_output_fn(title: str, renderable: Any):
         cached_history_frags.clear()
         cached_history_len[0] = 0
+        if renderable is None and title == "REDRAW":
+            cached_history_frags.clear()
+            cached_history_len[0] = 0
+            cached_history_ver[0] = -1
+            if app_instance[0]:
+                try:
+                    app_instance[0].renderer.clear()
+                except Exception:
+                    pass
+                try:
+                    app_instance[0].invalidate()
+                except Exception:
+                    pass
+            return
+
         if renderable is None and title == "CLEAR":
             history_entries.clear()
             session_state["active_screen"] = "startup"
@@ -2590,8 +2834,30 @@ def run_opencode_tui(
             scroll_offset[0] = 0
             auto_scroll_locked[0] = True
             if app_instance[0]:
+                try:
+                    app_instance[0].renderer.clear()
+                except Exception:
+                    pass
+                try:
+                    app_instance[0].invalidate()
+                except Exception:
+                    pass
+            return
+
+        if title == "LOADING":
+            p_text = str(renderable)
+            if history_entries and history_entries[-1][0] == "loading":
+                history_entries[-1] = ("loading", p_text, "Model Pull")
+            else:
+                history_entries.append(("loading", p_text, "Model Pull"))
+            session_state["active_screen"] = "active"
+            cached_history_ver[0] = -1
+            if app_instance[0]:
                 app_instance[0].invalidate()
             return
+
+        if history_entries and history_entries[-1][0] == "loading" and title in ("Model Ready", "Download Error", "Model Pull Failed"):
+            history_entries.pop()
 
         session_state["active_screen"] = "active"
         if title:
@@ -3572,7 +3838,7 @@ def run_opencode_tui(
                 "stream": True,
             }
             try:
-                with httpx.Client(base_url=normalized, timeout=httpx.Timeout(300.0, connect=15.0, read=240.0)) as client:
+                with httpx.Client(base_url=normalized, timeout=httpx.Timeout(3600.0, connect=30.0, read=600.0)) as client:
                     with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
                         if resp.status_code != 200:
                             err_msg = resp.read().decode("utf-8", errors="replace")
@@ -4092,7 +4358,15 @@ def run_opencode_tui(
 
     @kb.add("c-l")
     def on_ctrl_l(event):
+        try:
+            event.app.renderer.clear()
+        except Exception:
+            pass
         log_output_fn("CLEAR", None)
+        try:
+            event.app.invalidate()
+        except Exception:
+            pass
 
     # Determine full_screen mode
     is_fs = full_screen if full_screen is not None else (app_input is None)
@@ -4162,6 +4436,8 @@ def run_opencode_tui(
                 sys.stderr.write(f"\nSitus TUI runtime error: {e}\n")
                 return ""
     finally:
+        sys.stderr = orig_stderr
+        warnings.showwarning = orig_showwarning
         stop_bg_sync.set()
         restore_terminal_colors()
 

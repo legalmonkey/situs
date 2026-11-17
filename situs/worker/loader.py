@@ -6,7 +6,11 @@ import time
 import math
 import logging
 import threading
+import warnings
 from typing import Optional, List, Tuple, Any, Dict, Set, Union
+
+warnings.filterwarnings("ignore", message=".*expandable_segments not supported on this platform.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
 
 try:
     import torch
@@ -1804,6 +1808,13 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if src.shape != target_shape:
                 if src.dim() == 2 and src.T.shape == target_shape:
                     src = src.T
+                elif src.dim() == 2 and src.shape[1] == target_shape[1]:
+                    logger.info(f"Dynamically adapting embedding table from {tuple(target_shape)} to {tuple(src.shape)}.")
+                    self.vocab_size = src.shape[0]
+                    self.embed_tokens = nn.Embedding.from_pretrained(
+                        src.to(dtype=self.embed_tokens.weight.dtype), freeze=False
+                    ).to(device=self.device)
+                    return
                 else:
                     raise ValueError(
                         f"Embedding weight shape mismatch: expected {tuple(target_shape)}, got {tuple(src.shape)}. "
@@ -1862,6 +1873,11 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 if h_src.shape != target_shape:
                     if h_src.dim() == 2 and h_src.T.shape == target_shape:
                         h_src = h_src.T
+                    elif h_src.dim() == 2 and h_src.shape[1] == self.lm_head.in_features:
+                        logger.info(f"Dynamically adapting lm_head out_features from {self.lm_head.out_features} to {h_src.shape[0]}.")
+                        self.lm_head = nn.Linear(
+                            self.lm_head.in_features, h_src.shape[0], bias=False, device=self.device, dtype=self.lm_head.weight.dtype
+                        )
                     else:
                         raise ValueError(
                             f"LM Head weight shape mismatch: expected {tuple(target_shape)}, got {tuple(h_src.shape)}. "
@@ -2049,12 +2065,24 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
         or os.path.expanduser("~/.cache/huggingface/hub")
     )
     if os.path.isdir(hub_dir):
-        clean_name = model_name.replace("/", "--").replace(":", "--").lower()
-        prefix = model_name.split(":")[0].split("/")[0].lower()
+        try:
+            from situs.inference_backend import normalize_model_name
+            canonical = normalize_model_name(model_name)
+        except Exception:
+            canonical = model_name
+
+        names_to_check = {
+            model_name.replace("/", "--").replace(":", "--").lower(),
+            canonical.replace("/", "--").replace(":", "--").lower(),
+            f"models--{canonical.replace('/', '--').lower()}",
+            f"models--{model_name.replace('/', '--').lower()}",
+        }
+        prefix = canonical.split(":")[0].split("/")[0].lower()
+        sub_prefix = canonical.split("/")[-1].split(":")[0].lower()
         known_prefixes = ("gemma", "qwen", "llama", "mistral", "deepseek", "starcoder2")
         for d in os.listdir(hub_dir):
             d_lower = d.lower()
-            if clean_name in d_lower or (prefix in d_lower and any(kp in prefix for kp in known_prefixes)):
+            if any(n in d_lower for n in names_to_check) or any(kp in d_lower and (kp in prefix or kp in sub_prefix) for kp in known_prefixes):
                 snapshots_dir = os.path.join(hub_dir, d, "snapshots")
                 if os.path.isdir(snapshots_dir):
                     for snap in os.listdir(snapshots_dir):
@@ -2146,15 +2174,60 @@ def find_local_ollama_gguf_file(model_name: str) -> Optional[str]:
 
 
 def find_local_weight_files(model_name: str) -> List[str]:
-    """Finds local weights from Hugging Face safetensors/bin, direct GGUF paths, or cached model files."""
+    """Finds local weights from Hugging Face GGUF, direct GGUF paths, Hugging Face safetensors/bin, or cached model files."""
+    if not model_name:
+        return []
+
+    import glob
+    import os
+
+    # 1. Direct path to a GGUF file
+    if os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
+        return [model_name]
+
+    # 2. Check Hugging Face hub cache for .gguf files
+    hub_dir = (
+        os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.path.expanduser("~/.cache/huggingface/hub")
+    )
+    if os.path.isdir(hub_dir):
+        try:
+            from situs.inference_backend import normalize_model_name
+            canonical = normalize_model_name(model_name)
+        except Exception:
+            canonical = model_name
+
+        names_to_check = {
+            model_name.replace("/", "--").replace(":", "--").lower(),
+            canonical.replace("/", "--").replace(":", "--").lower(),
+            f"models--{canonical.replace('/', '--').lower()}",
+            f"models--{model_name.replace('/', '--').lower()}",
+        }
+        for d in os.listdir(hub_dir):
+            d_lower = d.lower()
+            if any(n in d_lower for n in names_to_check):
+                snapshots_dir = os.path.join(hub_dir, d, "snapshots")
+                if os.path.isdir(snapshots_dir):
+                    for snap in os.listdir(snapshots_dir):
+                        snap_path = os.path.join(snapshots_dir, snap)
+                        if os.path.isdir(snap_path):
+                            gguf_files = sorted(glob.glob(os.path.join(snap_path, "*.gguf")))
+                            if gguf_files:
+                                # Return non-mmproj llm weights first
+                                llm_ggufs = [g for g in gguf_files if not os.path.basename(g).lower().startswith("mmproj")]
+                                return llm_ggufs or gguf_files
+
+    # 3. Check Hugging Face safetensors/bin files
     sfiles = find_local_safetensors_files(model_name)
     if sfiles:
         return sfiles
-    if model_name and os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
-        return [model_name]
+
+    # 4. Check Ollama blob cache
     gguf_blob = find_local_ollama_gguf_file(model_name)
     if gguf_blob:
         return [gguf_blob]
+
     return []
 
 

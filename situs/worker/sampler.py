@@ -139,11 +139,15 @@ class TokenSampler:
 
     def decode_token(self, token_id: int) -> str:
         """Decodes token ID to text string using the verified tokenizer."""
-
         if self.tokenizer:
             try:
-                text = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                all_specials = getattr(self.tokenizer, "all_special_ids", [])
+                if token_id in all_specials:
+                    return ""
+                text = self.tokenizer.decode([token_id], skip_special_tokens=True)
                 if text is not None:
+                    if text.startswith("<unused") and text.endswith(">"):
+                        return ""
                     return text
             except Exception:
                 pass

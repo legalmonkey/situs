@@ -1031,6 +1031,75 @@ def interactive_chat(
     run_opencode_tui(coordinator_url=base_url, model=model, temperature=temperature, system_prompt=system)
 
 
+@app.command("pull")
+def pull_model(
+    model: str = typer.Argument(..., help="Model identifier, alias, or index to pull from Hugging Face Hub"),
+    coordinator: Optional[str] = typer.Option(None, "--coordinator", "-c", help="Coordinator URL (optional; streams directly if omitted)"),
+):
+    """Download and cache Hugging Face model weights locally with live progress bar."""
+    import asyncio
+    from situs.inference_backend import stream_pull_model, normalize_model_name, is_model_downloaded
+    from situs.tui import DISTRIBUTED_MODELS_6GB_10GB
+
+    matched = None
+    if model.isdigit():
+        idx = int(model)
+        if 1 <= idx <= len(DISTRIBUTED_MODELS_6GB_10GB):
+            matched = DISTRIBUTED_MODELS_6GB_10GB[idx - 1]
+    else:
+        arg_lower = model.lower()
+        matched = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if m["id"].lower() == arg_lower or m["name"].lower() == arg_lower), None)
+        if not matched:
+            matched = next((m for m in DISTRIBUTED_MODELS_6GB_10GB if arg_lower in m["id"].lower() or arg_lower in m["name"].lower()), None)
+
+    target_id = matched["id"] if matched else model
+    target_name = matched["name"] if matched else model
+    canonical_repo = normalize_model_name(target_id)
+
+    if console:
+        console.print(f"[bold cyan]Resolving model '{target_name}' -> [bold white]{canonical_repo}[/bold white]...[/bold cyan]")
+
+    if is_model_downloaded(target_id):
+        if console:
+            console.print(f"[bold green]✓ Model '{target_name}' is already downloaded and cached locally.[/bold green]")
+        else:
+            print(f"[situs] Model '{target_name}' is already downloaded.")
+        return
+
+    async def _do_pull():
+        async for chunk in stream_pull_model(canonical_repo):
+            c_type = chunk.get("type")
+            if c_type == "model_loading":
+                pct = chunk.get("percent", 0.0)
+                stage = chunk.get("stage", "")
+                spd = chunk.get("speed_mb", 0.0)
+                eta = chunk.get("eta_s", 0)
+                cb = chunk.get("completed_bytes", 0)
+                tb = chunk.get("total_bytes", 0)
+                b_str = f" · {cb / 1e9:.2f} / {tb / 1e9:.2f} GB" if tb > 0 else ""
+                s_str = f" · {spd:.1f} MB/s" if spd > 0 else ""
+                e_str = f" · ETA: {eta}s" if eta > 0 else ""
+                sys.stdout.write(f"\r\033[K[situs:pull] {stage} | {pct:.1f}%{b_str}{s_str}{e_str}")
+                sys.stdout.flush()
+            elif c_type == "model_ready":
+                sys.stdout.write("\n")
+                if console:
+                    console.print(f"[bold green]✓ Model Ready: '{target_name}' successfully downloaded into local cache.[/bold green]")
+                else:
+                    print(f"[situs] Model '{target_name}' successfully downloaded.")
+                return
+            elif c_type == "model_loading_error":
+                sys.stdout.write("\n")
+                err = chunk.get("error", "Unknown download error")
+                if console:
+                    console.print(f"[bold red]✗ Model Download Error: {err}[/bold red]")
+                else:
+                    sys.stderr.write(f"[situs] Model Download Error: {err}\n")
+                raise typer.Exit(code=1)
+
+    asyncio.run(_do_pull())
+
+
 @app.command("run")
 def one_shot_run(
     prompt: str = typer.Argument(..., help="Prompt to execute across the cluster"),
@@ -1081,7 +1150,7 @@ def main():
     import re
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         first_arg = sys.argv[1].strip()
-        known_cmds = {"setup", "cuda", "coordinator", "join", "connect", "status", "partition", "remove", "chat", "run", "hf", "token"}
+        known_cmds = {"setup", "cuda", "coordinator", "join", "connect", "status", "partition", "remove", "chat", "run", "hf", "token", "pull"}
         if first_arg.lower() not in known_cmds:
             # Check if first_arg looks like an address, URL, or tunnel domain
             is_url_or_addr = (

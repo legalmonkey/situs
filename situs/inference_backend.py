@@ -14,7 +14,7 @@ import pathlib
 import re
 import shutil
 import time
-from typing import Optional, List, Dict, Any, AsyncGenerator, Callable
+from typing import Optional, List, Dict, Any, AsyncGenerator, Callable, Tuple
 import httpx
 
 logger = logging.getLogger("situs.inference_backend")
@@ -23,13 +23,23 @@ logger = logging.getLogger("situs.inference_backend")
 HF_HUB_CACHE_DIR = pathlib.Path(os.path.expanduser("~/.cache/huggingface/hub"))
 SITUS_CACHE_DIR = pathlib.Path(os.path.expanduser("~/.cache/situs/models"))
 
+# Force disable Xet client dynamically to guarantee standard streaming HTTP downloads
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+try:
+    import huggingface_hub.constants as _hfc
+    _hfc.HF_HUB_DISABLE_XET = True
+except Exception:
+    pass
+
 # Canonical mapping from friendly short tags to official Hugging Face Hub repositories
 HF_MODEL_REGISTRY_MAP: Dict[str, str] = {
-    # Gemma series
-    "gemma3:4b": "google/gemma-3-4b-it",
-    "gemma3": "google/gemma-3-4b-it",
-    "gemma-3-4b": "google/gemma-3-4b-it",
-    "gemma-3-4b-it": "google/gemma-3-4b-it",
+    # Gemma series (mapped to official Google Gemma 3 4-bit Quantization-Aware Trained Q4_0 GGUF for native 6GB VRAM fit)
+    "gemma3:4b": "google/gemma-3-4b-it-qat-q4_0-gguf",
+    "gemma3": "google/gemma-3-4b-it-qat-q4_0-gguf",
+    "gemma-3-4b": "google/gemma-3-4b-it-qat-q4_0-gguf",
+    "gemma-3-4b-it": "google/gemma-3-4b-it-qat-q4_0-gguf",
+    "gemma3:4b-qat": "google/gemma-3-4b-it-qat-q4_0-gguf",
     "gemma2:9b": "google/gemma-2-9b-it",
     "gemma-2:9b": "google/gemma-2-9b-it",
     "gemma-2:9b-instruct-q6_k": "google/gemma-2-9b-it",
@@ -118,49 +128,142 @@ def get_hf_cache_dir() -> pathlib.Path:
     )
 
 
-def is_model_downloaded(model_name: str) -> bool:
-    """Checks whether the requested model weights (.safetensors, .bin, or .gguf) are cached locally."""
-    # 1. Direct local file or directory
-    if model_name and (os.path.isdir(model_name) or os.path.isfile(model_name)):
-        return True
-
-    # 2. Check local safetensors finder
+def _prune_stale_hf_locks(repo_id: Optional[str] = None) -> None:
+    """Removes stale .lock files created by interrupted previous download processes."""
     try:
-        from situs.worker.loader import find_local_safetensors_files
-        sfiles = find_local_safetensors_files(model_name)
-        if sfiles:
-            return True
+        hub_cache = get_hf_cache_dir()
+        locks_dir = hub_cache / ".locks"
+        if not locks_dir.is_dir():
+            return
+        now = time.time()
+        target_dirs = [locks_dir]
+        if repo_id:
+            safe_repo = f"models--{repo_id.replace('/', '--')}"
+            repo_lock_dir = locks_dir / safe_repo
+            if repo_lock_dir.is_dir():
+                target_dirs.append(repo_lock_dir)
+
+        for d in target_dirs:
+            for lf in d.glob("*.lock"):
+                try:
+                    # If lock file hasn't been touched in > 30 seconds, prune it
+                    if (now - lf.stat().st_mtime) > 30:
+                        lf.unlink(missing_ok=True)
+                except Exception:
+                    pass
     except Exception:
         pass
 
-    # 3. Check HuggingFace hub cache by repo directory
-    hub_cache = get_hf_cache_dir()
+
+def _is_snapshot_complete(snap_path: pathlib.Path) -> bool:
+    """Verifies that all weight shards, tokenizer files, and config files exist and have non-zero size."""
+    if not snap_path.is_dir():
+        return False
+
+    # 1. Check for single GGUF file (> 10MB, excluding mmproj vision projector)
+    gguf_files = [f for f in snap_path.glob("*.gguf") if f.is_file() and f.stat().st_size > 10 * 1024 * 1024]
+    llm_ggufs = [f for f in gguf_files if not f.name.lower().startswith("mmproj")]
+    if llm_ggufs:
+        return True
+
+    # 2. Check for indexed multi-shard model (e.g. Gemma, LLaMA, Qwen multi-shard safetensors)
+    index_file = snap_path / "model.safetensors.index.json"
+    if not index_file.is_file():
+        index_file = snap_path / "pytorch_model.bin.index.json"
+
+    if index_file.is_file() and index_file.stat().st_size > 0:
+        # Indexed models strictly require config and tokenizer files
+        cfg_file = snap_path / "config.json"
+        if not (cfg_file.is_file() and cfg_file.stat().st_size > 0):
+            return False
+
+        has_tokenizer = any(
+            (snap_path / tok_name).is_file() and (snap_path / tok_name).stat().st_size > 0
+            for tok_name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")
+        )
+        if not has_tokenizer:
+            return False
+
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                idx_data = json.load(f)
+            weight_map = idx_data.get("weight_map", {})
+            if not weight_map:
+                return False
+            required_shards = set(weight_map.values())
+            for shard in required_shards:
+                shard_path = snap_path / shard
+                if not (shard_path.is_file() and shard_path.stat().st_size > 1024 * 1024):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    # 3. If no index file, check for at least one valid safetensors or bin weight file
+    weights = [
+        f for f in (list(snap_path.glob("*.safetensors")) + list(snap_path.glob("*.bin")))
+        if f.is_file() and f.stat().st_size > 0
+    ]
+    return len(weights) > 0
+
+
+def is_model_downloaded(model_name: str) -> bool:
+    """Checks whether the requested model weights and tokenizer are completely cached locally."""
+    if not model_name:
+        return False
+    # 1. Direct local file or directory
+    if os.path.isdir(model_name) or os.path.isfile(model_name):
+        return True
+
     repo_id = normalize_model_name(model_name)
+    hub_cache = get_hf_cache_dir()
+
+    # 2. Check HuggingFace hub cache by repo directory
     repo_dir = hub_cache / f"models--{repo_id.replace('/', '--')}"
     if repo_dir.is_dir():
         snapshots_dir = repo_dir / "snapshots"
         if snapshots_dir.is_dir():
             for snap in snapshots_dir.iterdir():
-                if snap.is_dir():
-                    has_weights = bool(
-                        list(snap.glob("*.safetensors"))
-                        or list(snap.glob("*.bin"))
-                        or list(snap.glob("*.gguf"))
-                    )
-                    if has_weights:
-                        return True
+                if snap.is_dir() and _is_snapshot_complete(snap):
+                    return True
+
+    # 3. Check local weight files (GGUF, safetensors, bin)
+    try:
+        from situs.worker.loader import find_local_weight_files
+        wfiles = find_local_weight_files(model_name)
+        if wfiles and any(
+            _is_snapshot_complete(pathlib.Path(wf).parent)
+            or (wf.lower().endswith(".gguf") and os.path.isfile(wf) and os.path.getsize(wf) > 10 * 1024 * 1024)
+            for wf in wfiles
+        ):
+            return True
+    except Exception:
+        pass
 
     # 4. Check Situs local cache
     safe_name = repo_id.replace("/", "_").replace(":", "_")
     situs_model_dir = SITUS_CACHE_DIR / safe_name
-    if situs_model_dir.is_dir() and (
-        list(situs_model_dir.glob("*.safetensors"))
-        or list(situs_model_dir.glob("*.bin"))
-        or list(situs_model_dir.glob("*.gguf"))
-    ):
+    if situs_model_dir.is_dir() and _is_snapshot_complete(situs_model_dir):
         return True
 
     return False
+
+
+def _make_progress_tqdm(progress_cb: Callable[[int], None]):
+    """Creates a custom tqdm class that feeds chunk-level byte progress from hf_hub_download."""
+    from tqdm import tqdm
+
+    class _FileProgressTqdm(tqdm):
+        def update(self, n=1):
+            super().update(n)
+            try:
+                # Pass absolute byte progress (self.n) from tqdm
+                cur_pos = getattr(self, "n", n)
+                progress_cb(cur_pos)
+            except Exception:
+                pass
+
+    return _FileProgressTqdm
 
 
 async def stream_pull_model(
@@ -174,6 +277,13 @@ async def stream_pull_model(
     """
     repo_id = normalize_model_name(model_name)
     clean_repo = repo_id.replace(":", "-")
+
+    # Enforce standard streaming HTTP download without Xet chunk retry inflation
+    try:
+        import huggingface_hub.constants as _hfc
+        _hfc.HF_HUB_DISABLE_XET = True
+    except Exception:
+        pass
 
     # If already downloaded, emit instant completion
     if is_model_downloaded(model_name):
@@ -194,6 +304,9 @@ async def stream_pull_model(
     # Check for Hugging Face Auth Token (for gated models like Gemma / LLaMA)
     from situs.token_manager import get_hf_token
     token = get_hf_token()
+
+    _prune_stale_hf_locks(repo_id)
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
 
     yield {
         "type": "model_loading",
@@ -216,22 +329,79 @@ async def stream_pull_model(
         info = await asyncio.to_thread(api.model_info, repo_id, files_metadata=True)
         siblings = getattr(info, "siblings", []) or []
 
-        # Filter required files: config, tokenizer, and safetensors / GGUF weights
-        target_files = []
-        total_repo_bytes = 0
-        for s in siblings:
-            rfilename = getattr(s, "rfilename", "")
-            size = getattr(s, "size", 0) or 0
-            if any(
-                rfilename.endswith(ext)
-                for ext in (".json", ".safetensors", ".bin", ".gguf", ".model", ".txt")
-            ) and not rfilename.startswith("."):
-                target_files.append((rfilename, size))
-                total_repo_bytes += size
+        # Check if repository provides GGUF quantizations
+        gguf_siblings = [
+            s for s in siblings
+            if getattr(s, "rfilename", "").endswith(".gguf") and not getattr(s, "rfilename", "").startswith(".")
+        ]
+        if gguf_siblings:
+            # Exclude mmproj (vision projector) unless specifically requested
+            llm_ggufs = [s for s in gguf_siblings if not getattr(s, "rfilename", "").lower().startswith("mmproj")]
+            if not llm_ggufs:
+                llm_ggufs = gguf_siblings
 
-        if not target_files:
-            # Fallback for standard files
-            target_files = [("config.json", 1024)]
+            # Determine best quantization file
+            clean_tag = model_name.split(":")[-1].lower() if ":" in model_name else ""
+            known_quant_tags = {"q4_k_m", "q4_k_s", "q4_0", "q4_1", "q5_k_m", "q5_0", "q6_k", "q8_0", "bf16", "fp16", "q4", "q8"}
+            selected_s = None
+            if clean_tag in known_quant_tags:
+                for s in llm_ggufs:
+                    if clean_tag in getattr(s, "rfilename", "").lower():
+                        selected_s = s
+                        break
+
+            # Prioritize 4-bit standard: Q4_K_M -> Q4_0 -> Q4_K_S -> first under 4GB -> first
+            if selected_s is None:
+                priority_tags = ("q4_k_m", "q4_0", "q4_k_s", "q4_1", "q5_k_m", "q8_0")
+                for ptag in priority_tags:
+                    for s in llm_ggufs:
+                        if ptag in getattr(s, "rfilename", "").lower():
+                            selected_s = s
+                            break
+                    if selected_s is not None:
+                        break
+
+            if selected_s is None:
+                selected_s = llm_ggufs[0]
+
+            # In a GGUF repo, ONLY download the selected GGUF file (plus any accompanying config if available)
+            target_files = [(getattr(selected_s, "rfilename", ""), getattr(selected_s, "size", 0) or 0)]
+            total_repo_bytes = target_files[0][1]
+            for s in siblings:
+                rfn = getattr(s, "rfilename", "")
+                if rfn in ("config.json", "generation_config.json") or (rfn.endswith((".json", ".txt")) and not rfn.startswith(".")):
+                    sz = getattr(s, "size", 0) or 0
+                    target_files.append((rfn, sz))
+                    total_repo_bytes += sz
+        else:
+            # Filter required files: config, tokenizer, and safetensors / bin weights
+            target_files = []
+            total_repo_bytes = 0
+            for s in siblings:
+                rfilename = getattr(s, "rfilename", "")
+                size = getattr(s, "size", 0) or 0
+                if any(
+                    rfilename.endswith(ext)
+                    for ext in (".json", ".safetensors", ".bin", ".model", ".txt")
+                ) and not rfilename.startswith("."):
+                    target_files.append((rfilename, size))
+                    total_repo_bytes += size
+
+            if not target_files:
+                target_files = [("config.json", 1024)]
+
+        # Sort files so configs and tokenizers are downloaded FIRST, followed by large weights
+        def _file_priority_key(item: Tuple[str, int]) -> Tuple[int, str]:
+            fn = item[0].lower()
+            if fn in ("config.json", "generation_config.json") or "index.json" in fn:
+                return (0, fn)
+            if "tokenizer" in fn or fn.endswith(".model") or fn in ("special_tokens_map.json", "chat_template.json", "added_tokens.json"):
+                return (1, fn)
+            if fn.endswith((".json", ".txt")):
+                return (2, fn)
+            return (3, fn)
+
+        target_files.sort(key=_file_priority_key)
 
         yield {
             "type": "model_loading",
@@ -246,33 +416,29 @@ async def stream_pull_model(
             "bar": make_progress_bar(10.0, width=22),
         }
 
-        # Sequentially fetch and stream files into Hugging Face Hub cache
+        # Sequentially fetch and stream files into Hugging Face Hub cache with real-time byte telemetry
         total_completed = 0
         start_t = time.time()
-        last_t = start_t
-        last_bytes = 0
+        last_speed_t = start_t
+        last_speed_bytes = 0
+        speed_mb = 0.0
 
         for idx, (filename, file_size) in enumerate(target_files):
             # Short status description
             short_fn = filename if len(filename) <= 24 else "..." + filename[-21:]
             stage_str = f"Stage 3/3: Streaming [{idx+1}/{len(target_files)}] {short_fn}"
 
-            def _dl(fn: str):
-                return hf_hub_download(repo_id=repo_id, filename=fn, token=token)
+            file_bytes = [0]
+            def _on_chunk(cur_file_pos: int):
+                # Clamp to file_size so chunk repetitions/retries never exceed declared file size
+                file_bytes[0] = min(file_size, max(0, cur_file_pos))
 
-            # Download file in background thread
-            dl_path = await asyncio.to_thread(_dl, filename)
-            actual_size = os.path.getsize(dl_path) if os.path.isfile(dl_path) else file_size
-            total_completed += actual_size
+            tracker_cls = _make_progress_tqdm(_on_chunk)
 
-            now = time.time()
-            dt = max(0.1, now - last_t)
-            speed_mb = round(((total_completed - last_bytes) / dt) / 1e6, 1)
-            last_t = now
-            last_bytes = total_completed
-
-            pct = min(99.0, round((total_completed / max(1, total_repo_bytes)) * 100.0, 1)) if total_repo_bytes > 0 else 50.0
-            rem_bytes = max(0, total_repo_bytes - total_completed)
+            # Immediately yield start of this file so UI reflects new file name right away
+            cur_total = min(total_repo_bytes, total_completed)
+            pct = min(99.0, round((cur_total / max(1, total_repo_bytes)) * 100.0, 1)) if total_repo_bytes > 0 else 50.0
+            rem_bytes = max(0, total_repo_bytes - cur_total)
             eta_s = int(rem_bytes / max(1000, speed_mb * 1e6)) if speed_mb > 0 else 0
 
             yield {
@@ -281,7 +447,65 @@ async def stream_pull_model(
                 "status": "downloading",
                 "stage": stage_str,
                 "percent": pct,
-                "completed_bytes": total_completed,
+                "completed_bytes": cur_total,
+                "total_bytes": total_repo_bytes,
+                "speed_mb": speed_mb,
+                "eta_s": eta_s,
+                "bar": make_progress_bar(pct, width=22),
+            }
+
+            def _dl():
+                _prune_stale_hf_locks(repo_id)
+                return hf_hub_download(repo_id=repo_id, filename=filename, token=token, tqdm_class=tracker_cls)
+
+            loop = asyncio.get_running_loop()
+            dl_future = loop.run_in_executor(None, _dl)
+
+            # Stream real-time progress while file is downloading
+            while not dl_future.done():
+                await asyncio.sleep(0.25)
+                cur_total = min(total_repo_bytes, total_completed + file_bytes[0])
+                now = time.time()
+                dt = now - last_speed_t
+                if dt >= 0.8:
+                    speed_mb = round(((cur_total - last_speed_bytes) / dt) / 1e6, 1)
+                    last_speed_t = now
+                    last_speed_bytes = cur_total
+
+                pct = min(99.0, round((cur_total / max(1, total_repo_bytes)) * 100.0, 1)) if total_repo_bytes > 0 else 50.0
+                rem_bytes = max(0, total_repo_bytes - cur_total)
+                eta_s = int(rem_bytes / max(1000, speed_mb * 1e6)) if speed_mb > 0 else 0
+
+                yield {
+                    "type": "model_loading",
+                    "model": repo_id,
+                    "status": "downloading",
+                    "stage": stage_str,
+                    "percent": pct,
+                    "completed_bytes": cur_total,
+                    "total_bytes": total_repo_bytes,
+                    "speed_mb": speed_mb,
+                    "eta_s": eta_s,
+                    "bar": make_progress_bar(pct, width=22),
+                }
+
+            # Retrieve result (or raise exception if download failed)
+            dl_path = await dl_future
+            actual_size = os.path.getsize(dl_path) if os.path.isfile(dl_path) else file_size
+            total_completed += min(file_size, actual_size)
+
+            cur_total = min(total_repo_bytes, total_completed)
+            pct = min(99.0, round((cur_total / max(1, total_repo_bytes)) * 100.0, 1)) if total_repo_bytes > 0 else 50.0
+            rem_bytes = max(0, total_repo_bytes - cur_total)
+            eta_s = int(rem_bytes / max(1000, speed_mb * 1e6)) if speed_mb > 0 else 0
+
+            yield {
+                "type": "model_loading",
+                "model": repo_id,
+                "status": "downloading",
+                "stage": stage_str,
+                "percent": pct,
+                "completed_bytes": cur_total,
                 "total_bytes": total_repo_bytes,
                 "speed_mb": speed_mb,
                 "eta_s": eta_s,
@@ -378,3 +602,14 @@ def generate_llm_answer(prompt_text: str, model_name: str = "") -> str:
         "Local Ollama fallback has been eliminated. Situs executes neural inference "
         "natively via its distributed cluster engine."
     )
+
+
+def extract_latest_user_query(prompt_str: str) -> str:
+    """Extracts the latest user query from a multi-turn chat prompt."""
+    lines = prompt_str.strip().split("\n")
+    for line in reversed(lines):
+        line = line.strip()
+        if line.lower().startswith("user:"):
+            return line[5:].strip()
+    return prompt_str.strip()
+

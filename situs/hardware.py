@@ -16,8 +16,12 @@ import json
 import time
 import threading
 import ctypes
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
+
+warnings.filterwarnings("ignore", message=".*expandable_segments not supported on this platform.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
 
 logger = logging.getLogger("situs.hardware")
 

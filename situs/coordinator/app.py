@@ -886,7 +886,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             and tokenizer
                         ):
                             try:
-                                tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=False)
+                                all_specials = getattr(tokenizer, "all_special_ids", [])
+                                if token_info.token_id not in all_specials:
+                                    tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=True)
+                                    if tok_txt and tok_txt.startswith("<unused") and tok_txt.endswith(">"):
+                                        tok_txt = ""
+                                else:
+                                    tok_txt = ""
                             except Exception:
                                 tok_txt = ""
                         chunk = {
@@ -1095,7 +1101,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         and tokenizer
                     ):
                         try:
-                            tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=False)
+                            all_specials = getattr(tokenizer, "all_special_ids", [])
+                            if token_info.token_id not in all_specials:
+                                tok_txt = tokenizer.decode([token_info.token_id], skip_special_tokens=True)
+                                if tok_txt and tok_txt.startswith("<unused") and tok_txt.endswith(">"):
+                                    tok_txt = ""
+                            else:
+                                tok_txt = ""
                         except Exception:
                             tok_txt = ""
                     generated_text += tok_txt
