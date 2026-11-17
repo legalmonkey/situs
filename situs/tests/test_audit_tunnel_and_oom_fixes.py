@@ -350,7 +350,6 @@ def find_free_port() -> int:
 async def test_live_socket_handshake_and_vram_reporting():
     """Verify real over-the-wire websocket handshake: WorkerRegister -> WORKER_REGISTERED on live socket."""
     import uvicorn
-    from situs.coordinator.app import app, registry
     from situs.worker.client import WorkerDaemon
     from situs.config import WorkerConfig
 

@@ -132,13 +132,35 @@ def generate_mock_layer_bytes(
     return streamer.generate_mock_layer_bytes(layer_idx)
 
 
+def is_valid_layer_payload(data: bytes) -> bool:
+    """Verifies that data is a valid Safetensors or PyTorch serialized layer payload."""
+    if not data or len(data) < 8:
+        return False
+    # 1. Safetensors format
+    h_len = int.from_bytes(data[:8], "little")
+    if 0 < h_len < len(data) - 8:
+        try:
+            header = json.loads(data[8:8 + h_len].decode("utf-8"))
+            if isinstance(header, dict):
+                return True
+        except Exception:
+            pass
+    # 2. PyTorch zip container or pickle stream
+    if data[:4] == b"PK\x03\x04" or data[:2] in (b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"):
+        return True
+    return False
+
+
 def load_layer_from_cache(
     model_name: str, layer_index: int, cache_dir: Optional[pathlib.Path] = None
 ) -> Optional[bytes]:
     """Loads layer bytes from disk cache if present."""
     if is_layer_cached(model_name, layer_index, cache_dir):
         path = get_layer_cache_path(model_name, layer_index, cache_dir)
-        return path.read_bytes()
+        try:
+            return path.read_bytes()
+        except Exception:
+            pass
     return None
 
 
@@ -234,10 +256,12 @@ class ProgressiveJITStreamer:
         if payload_bytes is None:
             # Check local cache first
             cached = load_layer_from_cache(self.model_name, layer_index, self.cache_dir)
-            if cached is not None:
+            if cached is not None and (is_valid_layer_payload(cached) or not ("test" in self.model_name or self.allow_synthetic)):
                 payload_bytes = cached
             elif self.allow_synthetic or self.model_name.startswith("test") or "test" in self.model_name:
                 payload_bytes = self.generate_mock_layer_bytes(layer_index)
+            elif cached is not None:
+                payload_bytes = cached
             else:
                 raise FileNotFoundError(
                     f"Layer {layer_index} weights for model '{self.model_name}' are not found in cache ({self.cache_dir}). "

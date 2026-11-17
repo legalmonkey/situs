@@ -211,25 +211,26 @@ def decompress_layer_bytes(compressed_bytes: bytes, codec: str = "zstd") -> byte
             try:
                 dctx = zstd.ZstdDecompressor()
                 return dctx.decompress(compressed_bytes)
-            except Exception:
-                pass
-        # Fallback to zlib decompression
-        try:
-            return zlib.decompress(compressed_bytes)
-        except Exception:
-            return compressed_bytes
+            except Exception as e:
+                # Fallback to zlib decompression in case sender fell back
+                try:
+                    return zlib.decompress(compressed_bytes)
+                except Exception:
+                    raise ValueError(f"Failed to decompress layer bytes using zstd or zlib fallback: {e}") from e
+        else:
+            try:
+                return zlib.decompress(compressed_bytes)
+            except Exception as e:
+                raise ValueError(f"Failed to decompress layer bytes using zlib fallback (zstd not installed): {e}") from e
     elif codec == "zlib":
         try:
             return zlib.decompress(compressed_bytes)
-        except Exception:
-            return compressed_bytes
+        except Exception as e:
+            raise ValueError(f"Failed to decompress layer bytes using zlib: {e}") from e
     elif codec == "none":
         return compressed_bytes
     else:
-        try:
-            return zlib.decompress(compressed_bytes)
-        except Exception:
-            return compressed_bytes
+        raise ValueError(f"Unsupported decompression codec: '{codec}'")
 
 
 def pack_ternary_weights(weights: np.ndarray) -> Tuple[bytes, float, Tuple[int, ...]]:

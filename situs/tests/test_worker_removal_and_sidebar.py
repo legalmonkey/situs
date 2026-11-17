@@ -64,7 +64,7 @@ def test_tui_remove_slash_command_usage():
 @pytest.mark.asyncio
 async def test_coordinator_rebalance_on_multiple_workers():
     """Verify registry rebalancing partitions layers across multiple workers and handles removal."""
-    from situs.coordinator.app import registry, rebalance_and_assign_layers
+    from situs.coordinator.app import registry
 
     # Clean registry
     registry.workers.clear()

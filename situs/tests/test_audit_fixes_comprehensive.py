@@ -40,7 +40,6 @@ from situs.network.p2p import P2PDataChannelNode
 def test_tui_dynamic_model_metadata_resolution():
     """Verify that models with non-32 layer counts resolve their metadata dynamically."""
     from situs.tui import DISTRIBUTED_MODELS_6GB_10GB
-    from situs.coordinator.registry import resolve_model_metadata
 
     custom_model = "gemma-2-2b"
     meta = resolve_model_metadata(custom_model)

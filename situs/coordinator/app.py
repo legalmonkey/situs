@@ -815,6 +815,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     yield "data: [DONE]\n\n"
                     return
 
+                # Initialize request configuration on all intermediate pipeline stages
+                for intermediate_worker in pipeline[1:-1]:
+                    mid_frame = ProtocolFrame(
+                        type=MessageType.INFERENCE_START,
+                        source="coordinator",
+                        target=intermediate_worker.worker_id,
+                        payload=start_payload.model_dump(),
+                    )
+                    await relay.send_to_worker(intermediate_worker.worker_id, mid_frame)
+
                 if last_worker.worker_id != first_worker.worker_id:
                     cfg_frame = ProtocolFrame(
                         type=MessageType.INFERENCE_START,
@@ -1030,6 +1040,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
             if not sent:
                 raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
+
+            # Initialize request configuration on all intermediate pipeline stages
+            for intermediate_worker in pipeline[1:-1]:
+                mid_frame = ProtocolFrame(
+                    type=MessageType.INFERENCE_START,
+                    source="coordinator",
+                    target=intermediate_worker.worker_id,
+                    payload=start_payload.model_dump(),
+                )
+                await relay.send_to_worker(intermediate_worker.worker_id, mid_frame)
 
             if last_worker.worker_id != first_worker.worker_id:
                 cfg_frame = ProtocolFrame(

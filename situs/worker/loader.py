@@ -1808,7 +1808,12 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if src.shape != target_shape:
                 if src.dim() == 2 and src.T.shape == target_shape:
                     src = src.T
-                elif src.dim() == 2 and src.shape[1] == target_shape[1]:
+                elif (
+                    src.dim() == 2
+                    and src.shape[1] == target_shape[1]
+                    and src.shape[0] > target_shape[0]
+                    and (target_shape[0] >= 1000 or self.architecture == "gemma3")
+                ):
                     logger.info(f"Dynamically adapting embedding table from {tuple(target_shape)} to {tuple(src.shape)}.")
                     self.vocab_size = src.shape[0]
                     self.embed_tokens = nn.Embedding.from_pretrained(
@@ -1873,7 +1878,12 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 if h_src.shape != target_shape:
                     if h_src.dim() == 2 and h_src.T.shape == target_shape:
                         h_src = h_src.T
-                    elif h_src.dim() == 2 and h_src.shape[1] == self.lm_head.in_features:
+                    elif (
+                        h_src.dim() == 2
+                        and h_src.shape[1] == self.lm_head.in_features
+                        and h_src.shape[0] > target_shape[0]
+                        and (target_shape[0] >= 1000 or self.architecture == "gemma3")
+                    ):
                         logger.info(f"Dynamically adapting lm_head out_features from {self.lm_head.out_features} to {h_src.shape[0]}.")
                         self.lm_head = nn.Linear(
                             self.lm_head.in_features, h_src.shape[0], bias=False, device=self.device, dtype=self.lm_head.weight.dtype
