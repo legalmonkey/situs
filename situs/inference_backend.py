@@ -231,11 +231,22 @@ def is_model_downloaded(model_name: str) -> bool:
     try:
         from situs.worker.loader import find_local_weight_files
         wfiles = find_local_weight_files(model_name)
-        if wfiles and any(
-            _is_snapshot_complete(pathlib.Path(wf).parent)
-            or (wf.lower().endswith(".gguf") and os.path.isfile(wf) and os.path.getsize(wf) > 10 * 1024 * 1024)
-            for wf in wfiles
-        ):
+        def _is_valid_wf(wf: str) -> bool:
+            if not os.path.isfile(wf):
+                return False
+            if _is_snapshot_complete(pathlib.Path(wf).parent):
+                return True
+            if os.path.getsize(wf) > 10 * 1024 * 1024:
+                if wf.lower().endswith(".gguf"):
+                    return True
+                try:
+                    with open(wf, "rb") as f:
+                        return f.read(4) == b"GGUF"
+                except Exception:
+                    pass
+            return False
+
+        if wfiles and any(_is_valid_wf(wf) for wf in wfiles):
             return True
     except Exception:
         pass

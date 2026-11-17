@@ -185,14 +185,25 @@ def _resolve_and_load_tokenizer(
     # Prefer embedded GGUF tokenizer if a direct GGUF file or cached GGUF model is available
     if model_name and model_name not in ("default", "gpt2"):
         try:
-            if os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
+            def _is_gguf(p: str) -> bool:
+                if not (os.path.isfile(p) and os.path.getsize(p) > 10 * 1024 * 1024):
+                    return False
+                if p.lower().endswith(".gguf"):
+                    return True
+                try:
+                    with open(p, "rb") as f:
+                        return f.read(4) == b"GGUF"
+                except Exception:
+                    return False
+
+            if _is_gguf(model_name):
                 tok = GGUFTokenizerAdapter(model_name)
                 logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {model_name}")
                 return tok
             from situs.worker.loader import find_local_weight_files
             wfiles = find_local_weight_files(model_name)
             for wf in wfiles:
-                if wf.lower().endswith(".gguf") and os.path.isfile(wf):
+                if _is_gguf(wf):
                     tok = GGUFTokenizerAdapter(wf)
                     logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {wf}")
                     return tok
