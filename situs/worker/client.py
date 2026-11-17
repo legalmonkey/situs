@@ -220,6 +220,21 @@ class WorkerDaemon:
             dev_name, tot_b, free_b, dev_type, used_b = self._cached_hw
 
             if dev_type == "cuda":
+                live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
+                if live_tot > 0:
+                    if HAS_TORCH and torch.cuda.is_available():
+                        try:
+                            alloc_b = torch.cuda.memory_allocated(dev_idx)
+                            if alloc_b > live_used:
+                                live_used = alloc_b
+                                live_free = max(0, live_tot - live_used)
+                        except Exception:
+                            pass
+                    live_used = min(live_tot, max(0, live_used))
+                    live_free = min(live_tot, max(0, live_free))
+                    return dev_name, live_tot, live_free, "cuda", live_used
+
+                # Fallback if live NVML / nvidia-smi is unavailable
                 if HAS_TORCH and torch.cuda.is_available():
                     try:
                         free_b, total_b = torch.cuda.mem_get_info(dev_idx)
@@ -230,11 +245,6 @@ class WorkerDaemon:
                         return dev_name, total_b, effective_free_b, "cuda", used_b
                     except Exception:
                         pass
-                live_tot, live_used, live_free = get_live_gpu_vram(dev_idx)
-                if live_tot > 0:
-                    live_used = min(live_tot, max(0, live_used))
-                    live_free = min(live_tot, max(0, live_free))
-                    return dev_name, live_tot, live_free, "cuda", live_used
 
             used_b = min(tot_b, max(0, used_b))
             free_b = min(tot_b, max(0, free_b))
@@ -512,6 +522,26 @@ class WorkerDaemon:
                                 finally:
                                     self.engine_ready_event.set()
     
+                            elif frame.type == MessageType.UNLOAD_MODEL:
+                                logger.info(f"Worker '{self.worker_id}': Received UNLOAD_MODEL signal. Freeing GPU memory...")
+                                self.engine_ready_event.clear()
+                                self.engine_error = None
+                                if self.engine is not None:
+                                    self.engine = None
+                                import gc
+                                gc.collect()
+                                if HAS_TORCH and torch.cuda.is_available():
+                                    try:
+                                        torch.cuda.empty_cache()
+                                    except Exception:
+                                        pass
+                                self.engine_ready_event.set()
+                                try:
+                                    await self.send_heartbeat_once()
+                                except Exception:
+                                    pass
+                                logger.info(f"Worker '{self.worker_id}': Model unloaded. GPU VRAM returned to idle.")
+
                             elif frame.type in (MessageType.ICE_OFFER, MessageType.ICE_ANSWER):
                                 src_peer = frame.payload.get("source_worker") if isinstance(frame.payload, dict) else None
                                 if src_peer:

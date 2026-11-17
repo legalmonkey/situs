@@ -488,6 +488,38 @@ async def trigger_pull(request: Request, model_name: Optional[str] = None):
     return StreamingResponse(pull_events(), media_type="text/event-stream")
 
 
+@app.post("/admin/unload")
+async def trigger_unload(request: Request):
+    """Broadcasts UNLOAD_MODEL frame to all active workers to free GPU VRAM and reset model state."""
+    verify_admin_key(request)
+    alive = registry.get_alive_workers()
+    unload_frame = ProtocolFrame(
+        type=MessageType.UNLOAD_MODEL,
+        source="coordinator",
+        target="*",
+        payload={},
+    )
+    unloaded = 0
+    for w in alive:
+        sent = await relay.send_to_worker(w.worker_id, unload_frame)
+        if sent:
+            unloaded += 1
+        w.assigned_layer_start = None
+        w.assigned_layer_end = None
+        w.is_first_stage = False
+        w.is_last_stage = False
+
+    for w in registry.workers.values():
+        w.assigned_layer_start = None
+        w.assigned_layer_end = None
+        w.is_first_stage = False
+        w.is_last_stage = False
+
+    registry.active_model = None
+    logger.info(f"Unloaded model across {unloaded} workers. VRAM freed.")
+    return {"status": "success", "unloaded_workers": unloaded, "message": f"Model unloaded from {unloaded} worker(s)."}
+
+
 @app.delete("/admin/workers/{worker_id}")
 @app.post("/admin/workers/{worker_id}/remove")
 async def remove_worker_endpoint(request: Request, worker_id: str):

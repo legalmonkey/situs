@@ -11,6 +11,7 @@ class MessageType(str, Enum):
     WORKER_REGISTERED = "worker_registered"
     WORKER_REMOVED = "worker_removed"
     ASSIGN_LAYERS = "assign_layers"
+    UNLOAD_MODEL = "unload_model"
     HEARTBEAT = "heartbeat"
     HEARTBEAT_ACK = "heartbeat_ack"
     

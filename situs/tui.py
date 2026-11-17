@@ -413,6 +413,8 @@ class OpenCodeSlashCompleter(Completer):
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
         ("/speculative", "Toggle prompt-lookup speculative candidate drafting"),
         ("/tokens", "View or set maximum generation tokens: /tokens [count] (default: 2048)"),
+        ("/unload", "Unload active model from GPU VRAM to return memory to 0 MB"),
+        ("/sleep", "Put cluster into idle sleep mode and free GPU VRAM"),
         ("/clear", "Clear chat memory and reset interface"),
         ("/system", "View or update system prompt instructions"),
         ("/help", "Show all commands, custom worker IDs & model selection guide"),
@@ -1943,6 +1945,51 @@ def execute_slash_command(
         meta = fetch_cluster_metadata(normalized)
         table = render_vram_telemetry_table(meta)
         emit(table, "Live GPU VRAM Monitor")
+        return True
+
+    elif root_cmd in ("/unload", "unload", "/sleep", "sleep"):
+        coord_url = session_state.get("coordinator_url", coordinator_url)
+        normalized = normalize_fast_url(coord_url)
+        api_key = os.environ.get("SITUS_COORDINATOR_KEY", "").strip()
+        headers = {"x-admin-key": api_key} if api_key else {}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(f"{normalized}/admin/unload", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    unloaded_count = data.get("unloaded_workers", 0)
+                    session_state["model_loaded"] = False
+                    emit(
+                        Panel(
+                            f"[bold green]✔ Model Unloaded Successfully[/bold green]\n\n"
+                            f"• Freeing GPU VRAM on [bold white]{unloaded_count}[/bold white] active worker node(s).\n"
+                            f"• PyTorch GPU memory cache cleared ([bold cyan]empty_cache()[/bold cyan]).\n"
+                            f"• Idle VRAM returned to 0 MB baseline.\n\n"
+                            f"[dim]The model will automatically re-partition and reload whenever a new prompt is submitted.[/dim]",
+                            title="Situs Idle Sleep & Memory Free",
+                            border_style="green",
+                        ),
+                        "Model Unload",
+                    )
+                else:
+                    emit(
+                        Panel(
+                            f"[bold red]Failed to unload model:[/bold red] Server returned HTTP {resp.status_code}\n{resp.text}",
+                            title="Unload Failed",
+                            border_style="red",
+                        ),
+                        "Error",
+                    )
+        except Exception as e:
+            emit(
+                Panel(
+                    f"[bold red]Failed to communicate with coordinator:[/bold red] {e}\n"
+                    f"Make sure coordinator is active at [bold yellow]{normalized}[/bold yellow].",
+                    title="Connection Error",
+                    border_style="red",
+                ),
+                "Error",
+            )
         return True
 
     elif root_cmd in ("/models", "models"):

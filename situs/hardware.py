@@ -221,8 +221,8 @@ def _query_nvml(dev_idx: int = 0, force_refresh: bool = False) -> Optional[Tuple
                 mem2.version = (2 << 24) | ctypes.sizeof(_NvmlMemoryV2)
                 if _nvml_lib.nvmlDeviceGetMemoryInfo_v2(handle, ctypes.byref(mem2)) == 0:
                     tot = int(mem2.total)
+                    us = min(tot, max(0, int(mem2.used)))
                     fr = min(tot, max(0, int(mem2.free)))
-                    us = min(tot, max(0, tot - fr))
                     res = (gpu_name, tot, fr, us)
                     _last_nvml_cache[dev_idx] = res
                     _last_nvml_time = now
@@ -232,8 +232,8 @@ def _query_nvml(dev_idx: int = 0, force_refresh: bool = False) -> Optional[Tuple
                 mem1 = _NvmlMemoryV1()
                 if _nvml_lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem1)) == 0:
                     tot = int(mem1.total)
+                    us = min(tot, max(0, int(mem1.used)))
                     fr = min(tot, max(0, int(mem1.free)))
-                    us = min(tot, max(0, tot - fr))
                     res = (gpu_name, tot, fr, us)
                     _last_nvml_cache[dev_idx] = res
                     _last_nvml_time = now
@@ -309,16 +309,17 @@ def get_live_gpu_vram(dev_idx: int = 0) -> Tuple[int, int, int]:
         smi = query_nvidia_smi() if dev_idx == 0 else query_nvidia_smi(dev_idx=dev_idx)
         if smi is not None:
             _name, total_b, free_b, used_b = smi
-            if _torch_checked and _torch is not None:
+            t = _get_torch()
+            if t is not None:
                 try:
-                    if _torch.cuda.is_available():
-                        alloc_b = _torch.cuda.memory_allocated(dev_idx)
+                    if t.cuda.is_available():
+                        alloc_b = t.cuda.memory_allocated(dev_idx)
                         if alloc_b > used_b:
                             used_b = alloc_b
                 except Exception:
                     pass
             used_b = min(total_b, max(0, used_b))
-            free_b = min(total_b, max(0, free_b))
+            free_b = min(total_b, max(0, total_b - used_b))
             return (total_b, used_b, free_b)
 
         t = _get_torch()
