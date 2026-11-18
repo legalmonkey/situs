@@ -83,7 +83,7 @@ async def test_stream_pull_model_selects_single_q4_km_gguf():
         mock_dl.side_effect = fake_download
 
         events = []
-        async for chunk in stream_pull_model("gemma3:4b"):
+        async for chunk in stream_pull_model("gemma3:4b", force=True):
             events.append(chunk)
 
         # Ensure only the single Q4_K_M GGUF (and optional config) was downloaded

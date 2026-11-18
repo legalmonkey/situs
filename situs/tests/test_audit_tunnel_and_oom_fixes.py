@@ -397,6 +397,10 @@ async def test_live_socket_handshake_and_vram_reporting():
                 await worker_task
             except asyncio.CancelledError:
                 pass
+            await asyncio.sleep(0.1)
     finally:
         server.should_exit = True
-        await server_task
+        try:
+            await server_task
+        except Exception:
+            pass

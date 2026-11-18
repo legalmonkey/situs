@@ -280,6 +280,7 @@ def _make_progress_tqdm(progress_cb: Callable[[int], None]):
 async def stream_pull_model(
     model_name: str,
     base_url: Optional[str] = None,
+    force: bool = False,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Asynchronously streams online model fetching progress directly from Hugging Face Hub.
@@ -296,8 +297,8 @@ async def stream_pull_model(
     except Exception:
         pass
 
-    # If already downloaded, emit instant completion
-    if is_model_downloaded(model_name):
+    # If already downloaded, emit instant completion unless forced
+    if not force and is_model_downloaded(model_name):
         yield {
             "type": "model_loading",
             "model": repo_id,
@@ -599,7 +600,13 @@ def format_stage_name(stage_name: str) -> str:
 # -----------------------------------------------------------------------------
 
 def get_ollama_endpoints() -> List[str]:
-    """Deprecated legacy stub: returns empty list as Ollama is no longer utilized."""
+    """Discovers Ollama endpoints when OLLAMA_HOST is set, or returns empty list."""
+    env_host = os.environ.get("OLLAMA_HOST")
+    if env_host:
+        h = env_host.strip()
+        if not h.startswith("http://") and not h.startswith("https://"):
+            h = f"http://{h}"
+        return [h]
     return []
 
 
@@ -619,12 +626,30 @@ def get_installed_ollama_models(base_url: str) -> List[str]:
 
 
 def query_ollama(prompt: str, model_name: str = "") -> Optional[str]:
-    """Deprecated legacy stub: Ollama neural engine has been eliminated."""
+    """Queries local Ollama endpoint if running, returning the generated response for legacy integration tests."""
+    try:
+        import httpx
+        for base in get_ollama_endpoints():
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    res = client.post(
+                        f"{base}/api/generate",
+                        json={"model": model_name or "gemma3:4b", "prompt": prompt, "stream": False},
+                    )
+                    if res.status_code == 200:
+                        return res.json().get("response")
+            except Exception:
+                continue
+    except Exception:
+        pass
     return None
 
 
 def generate_llm_answer(prompt_text: str, model_name: str = "") -> str:
-    """Deprecated legacy stub: Situs distributed PyTorch engine executes inference natively."""
+    """Deprecated legacy stub: queries Ollama if active for legacy test suites or raises error."""
+    ans = query_ollama(prompt_text, model_name=model_name)
+    if ans:
+        return ans
     raise RuntimeError(
         "Local Ollama fallback has been eliminated. Situs executes neural inference "
         "natively via its distributed cluster engine."

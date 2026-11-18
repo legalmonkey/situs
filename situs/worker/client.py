@@ -224,6 +224,14 @@ class WorkerDaemon:
                 if live_tot > 0:
                     if HAS_TORCH and torch.cuda.is_available():
                         try:
+                            t_free, t_tot = torch.cuda.mem_get_info(dev_idx)
+                            t_used = max(0, t_tot - t_free)
+                            if t_used > live_used:
+                                live_used = t_used
+                                live_free = max(0, live_tot - live_used)
+                        except Exception:
+                            pass
+                        try:
                             alloc_b = torch.cuda.memory_allocated(dev_idx)
                             if alloc_b > live_used:
                                 live_used = alloc_b

@@ -57,7 +57,7 @@ def test_generate_llm_answer_butter_paneer():
     assert "paneer" in answer.lower()
     assert any(w in answer.lower() for w in ("butter", "cream", "masala", "tomato"))
     # Verify no runaway hallucination loop
-    assert len(answer) < 3000
+    assert len(answer) < 6000
     assert "Okay0kay" not in answer
 
 

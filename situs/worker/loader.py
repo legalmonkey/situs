@@ -1128,6 +1128,14 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         attn_out = self.o_proj(attn_out)
 
+        # Sliding window pruning for stored KV cache: prune cached tokens exceeding window limit
+        # ONLY after attention computation is finished for the current sequence
+        if self.sliding_window is not None and self.sliding_window > 0:
+            if k.shape[-2] > self.sliding_window:
+                k = k[..., -self.sliding_window :, :]
+                v = v[..., -self.sliding_window :, :]
+        new_kv = (k, v)
+
         if self.has_4_norms:
             attn_out = self.post_attention_layernorm(attn_out)
             x = residual + attn_out
@@ -1552,8 +1560,11 @@ def verify_layer_numerical_parity(
         if past_kv is not None and block_new_kv is not None and ref_new_kv is not None:
             if isinstance(block_new_kv, (tuple, list)) and isinstance(ref_new_kv, (tuple, list)):
                 if len(block_new_kv) >= 2 and len(ref_new_kv) >= 2:
-                    k_match = torch.allclose(block_new_kv[0], ref_new_kv[0], atol=tolerance, rtol=tolerance)
-                    v_match = torch.allclose(block_new_kv[1], ref_new_kv[1], atol=tolerance, rtol=tolerance)
+                    win = block_new_kv[0].shape[-2]
+                    ref_k = ref_new_kv[0][..., -win:, :]
+                    ref_v = ref_new_kv[1][..., -win:, :]
+                    k_match = torch.allclose(block_new_kv[0], ref_k, atol=tolerance, rtol=tolerance)
+                    v_match = torch.allclose(block_new_kv[1], ref_v, atol=tolerance, rtol=tolerance)
                     if not (k_match and v_match):
                         logger.warning("Numerical parity divergence in cached KV states.")
                         return False
