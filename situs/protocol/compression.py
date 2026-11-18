@@ -36,9 +36,6 @@ def compress_tensor(
         if norm in ("bf16", "bfloat16"):
             return tensor.to(torch.bfloat16).contiguous().cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
         elif norm in ("fp16", "float16"):
-            # If tensor is already bfloat16 or has values that exceed float16 max (65504), preserve as bf16 to avoid Inf/NaN collapse
-            if tensor.dtype == torch.bfloat16 or float(tensor.abs().max()) > 65500.0:
-                return tensor.to(torch.bfloat16).contiguous().cpu().view(torch.int16).numpy().tobytes(), 1.0, shape
             return tensor.to(torch.float16).contiguous().cpu().numpy().tobytes(), 1.0, shape
         elif norm in ("none", "fp32", "float32"):
             return tensor.to(torch.float32).contiguous().cpu().numpy().tobytes(), 1.0, shape
@@ -94,9 +91,6 @@ def decompress_tensor(
         return np.frombuffer(data, dtype=np.float16).reshape(shape).astype(np.float32)
 
     elif norm in ("fp16", "float16"):
-        if dtype == torch.bfloat16:
-            raw_int16 = np.frombuffer(data, dtype=np.int16).copy()
-            return torch.from_numpy(raw_int16).view(torch.bfloat16).reshape(shape).to(device=target_device, dtype=torch.bfloat16)
         arr = np.frombuffer(data, dtype=np.float16).reshape(shape)
         if HAS_TORCH:
             target_dtype = dtype or torch.float16

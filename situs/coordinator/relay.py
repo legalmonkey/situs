@@ -98,7 +98,13 @@ class RelayHub:
                 try:
                     pipeline = self.registry.get_pipeline_order()
                     if pipeline:
-                        target_worker = pipeline[0].worker_id
+                        if frame.type == MessageType.SPECULATIVE_VERIFIED:
+                            stages = pipeline[:-1] if len(pipeline) > 1 else pipeline
+                            for stage in stages:
+                                await self.send_to_worker(stage.worker_id, frame)
+                            return
+                        else:
+                            target_worker = pipeline[0].worker_id
                 except Exception:
                     pass
             if target_worker:

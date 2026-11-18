@@ -335,7 +335,8 @@ class StageExecutionEngine:
                     logger.debug(f"kv_cache_manager allocation note for {request_id}: {alloc_err}")
 
                 input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
-                h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
+                pos_ids = torch.arange(0, input_ids.shape[1], device=self.stage_model.device).unsqueeze(0)
+                h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None, position_ids=pos_ids)
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
 
@@ -366,7 +367,9 @@ class StageExecutionEngine:
                 )
 
                 if self.is_last_stage():
-                    # Single worker: worker holds all stages, process activation directly to emit first token
+                    if self.is_first_stage():
+                        # Single worker: worker holds all stages, emit first token directly from h
+                        return self._emit_terminal_token(request_id=request_id, step_index=0, hidden_states=h)
                     return self.process_forward_activation(forward_act)
 
                 return ProtocolFrame(
@@ -384,6 +387,217 @@ class StageExecutionEngine:
                 target="coordinator",
                 payload={"request_id": request_id, "error": str(e)},
             )
+
+    def _emit_terminal_token(
+        self,
+        request_id: str,
+        step_index: int,
+        hidden_states: "torch.Tensor",
+    ) -> ProtocolFrame:
+        """
+        Emits the terminal NEXT_TOKEN frame directly from final-layer hidden states.
+        Avoids duplicate layer execution and duplicate KV caching on single-node setups.
+        """
+        cfg = self.session_configs.get(request_id)
+        temperature = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
+        top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
+        seed = getattr(cfg, "seed", None)
+        max_new_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
+        top_k = getattr(cfg, "top_k", 50) if cfg else 50
+        repetition_penalty = getattr(cfg, "repetition_penalty", 1.1) if cfg else 1.1
+
+        stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
+        tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
+        if tok_stops:
+            for sid in tok_stops:
+                if sid not in stop_token_ids:
+                    stop_token_ids.append(int(sid))
+
+        if hasattr(self.stage_model, "compute_logits"):
+            logits = self.stage_model.compute_logits(hidden_states, compute_all_logits=False)
+        else:
+            h = hidden_states
+            if h.shape[1] > 1:
+                h = h[:, -1:, :]
+            if hasattr(self.stage_model, "norm") and self.stage_model.norm is not None:
+                h = self.stage_model.norm(h)
+            if hasattr(self.stage_model, "lm_head") and self.stage_model.lm_head is not None:
+                logits = self.stage_model.lm_head(h)
+            else:
+                logits = h
+
+        if HAS_TORCH and isinstance(logits, torch.Tensor):
+            if logits.dim() == 3:
+                last_logits = logits[0, -1, :]
+            elif logits.dim() == 2:
+                last_logits = logits[-1, :]
+            else:
+                last_logits = logits
+        else:
+            last_logits = logits
+
+        context_tokens = self.session_token_histories.get(request_id, [])
+
+        token_id = self.sampler.sample_next_token(
+            last_logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            context_tokens=context_tokens,
+            seed=seed,
+            step_index=step_index,
+        )
+
+        eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
+        is_eos = False
+        if stop_token_ids and token_id in stop_token_ids:
+            is_eos = True
+        elif eos_id is not None:
+            if isinstance(eos_id, (list, tuple, set)):
+                is_eos = token_id in eos_id
+            else:
+                is_eos = (token_id == eos_id)
+
+        raw_token_text = self.sampler.decode_token(token_id, skip_special_tokens=False)
+        stop_strs = ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+        if not is_eos and raw_token_text:
+            is_eos = raw_token_text.strip() in stop_strs
+
+        token_text = "" if is_eos else self.sampler.decode_token(token_id, skip_special_tokens=True)
+
+        is_finished = is_eos or (step_index + 1 >= max_new_tokens)
+        finish_reason = "stop" if is_eos else ("length" if is_finished else None)
+
+        if is_finished:
+            self.process_inference_finish(request_id)
+
+        next_token = NextToken(
+            request_id=request_id,
+            step_index=step_index + 1,
+            token_id=token_id,
+            token_text=token_text,
+            is_finished=is_finished,
+            finish_reason=finish_reason,
+            is_verified=True,
+            is_experimental=False,
+        )
+
+        target_first = getattr(self.assignment, "first_worker_id", None) or self.assignment.worker_id
+        return ProtocolFrame(
+            type=MessageType.NEXT_TOKEN,
+            source=self.assignment.worker_id,
+            target=target_first,
+            payload=next_token.model_dump(),
+        )
+
+    def _verify_and_emit_speculative(
+        self,
+        request_id: str,
+        step_index: int,
+        candidates: List[int],
+        hidden_states: "torch.Tensor",
+    ) -> ProtocolFrame:
+        """
+        Directly verifies speculative candidate tokens on single-node setups where
+        forward_first_stage has already computed all layer activations.
+        """
+        if hasattr(self.stage_model, "compute_logits"):
+            logits = self.stage_model.compute_logits(hidden_states, compute_all_logits=True)
+        else:
+            h = hidden_states
+            if hasattr(self.stage_model, "norm") and self.stage_model.norm is not None:
+                h = self.stage_model.norm(h)
+            if hasattr(self.stage_model, "lm_head") and self.stage_model.lm_head is not None:
+                logits = self.stage_model.lm_head(h)
+            else:
+                logits = h
+
+        cfg = self.session_configs.get(request_id)
+        temp = cfg.temperature if (cfg and cfg.temperature is not None) else 0.7
+        top_p = cfg.top_p if (cfg and cfg.top_p is not None) else 0.9
+        max_tokens = cfg.max_new_tokens if (cfg and cfg.max_new_tokens is not None) else 2048
+        top_k = getattr(cfg, "top_k", 50) if cfg else 50
+        repetition_penalty = getattr(cfg, "repetition_penalty", 1.1) if cfg else 1.1
+        context_tokens = self.session_token_histories.get(request_id, [])
+
+        accepted_drafts, correction = self.verifier.verify_candidates(
+            candidates,
+            logits,
+            temperature=temp,
+            top_p=top_p,
+        )
+        rejected_draft_count = max(0, len(candidates) - len(accepted_drafts))
+        accepted_tokens = list(accepted_drafts)
+        if correction is not None:
+            accepted_tokens.append(correction)
+        elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
+            target_logits = logits[0, -1, :] if logits.dim() == 3 else (logits[-1, :] if logits.dim() == 2 else logits)
+            sampled_tok = self.sampler.sample_next_token(
+                target_logits,
+                temperature=temp,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                context_tokens=context_tokens,
+                step_index=step_index,
+            )
+            accepted_tokens.append(sampled_tok)
+
+        eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
+        stop_token_ids = list(cfg.stop_token_ids or []) if cfg else []
+        tok_stops = getattr(self.sampler.tokenizer, "stop_token_ids", None)
+        if tok_stops:
+            for sid in tok_stops:
+                if sid not in stop_token_ids:
+                    stop_token_ids.append(int(sid))
+        stop_strs = ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+        is_eos = False
+        for idx, tok in enumerate(accepted_tokens):
+            raw_txt = self.sampler.decode_token(tok, skip_special_tokens=False)
+            if (stop_token_ids and tok in stop_token_ids) or (
+                eos_id is not None
+                and (
+                    (isinstance(eos_id, (list, tuple, set)) and tok in eos_id)
+                    or tok == eos_id
+                )
+            ) or (raw_txt and raw_txt.strip() in stop_strs):
+                accepted_tokens = accepted_tokens[: idx + 1]
+                is_eos = True
+                break
+
+        new_step_idx = step_index + len(accepted_tokens)
+        accepted_texts = [
+            "" if (is_eos and i == len(accepted_tokens) - 1)
+            else self.sampler.decode_token(t, skip_special_tokens=True)
+            for i, t in enumerate(accepted_tokens)
+        ]
+        is_finished = is_eos or (new_step_idx >= max_tokens)
+
+        if is_finished:
+            self.process_inference_finish(request_id)
+        elif rejected_draft_count > 0:
+            self._trim_kv_caches(request_id, rejected_draft_count)
+
+        verified = SpeculativeVerified(
+            request_id=request_id,
+            step_index=new_step_idx,
+            accepted_tokens=accepted_tokens,
+            accepted_texts=accepted_texts,
+            rejected_draft_count=rejected_draft_count,
+            is_finished=is_finished,
+            finish_reason="stop" if is_eos else ("length" if is_finished else None),
+            is_verified=True,
+            is_experimental=False,
+        )
+
+        target_upstream = getattr(self.assignment, "first_worker_id", None) or self.assignment.worker_id
+        return ProtocolFrame(
+            type=MessageType.SPECULATIVE_VERIFIED,
+            source=self.assignment.worker_id,
+            target=target_upstream,
+            payload=verified.model_dump(),
+        )
 
     def process_forward_activation(self, act_frame: ForwardActivation) -> Optional[ProtocolFrame]:
         """
@@ -431,8 +645,15 @@ class StageExecutionEngine:
                     except Exception as alloc_err:
                         logger.debug(f"kv_cache_manager allocation note for {request_id}: {alloc_err}")
 
+                pos_offset = getattr(act_frame, "position_offset", None)
+                if pos_offset is not None and HAS_TORCH and isinstance(hidden_states, torch.Tensor):
+                    seq_l = hidden_states.shape[1] if hidden_states.dim() >= 2 else 1
+                    pos_ids = torch.arange(pos_offset, pos_offset + seq_l, device=self.stage_model.device).unsqueeze(0)
+                else:
+                    pos_ids = None
+
                 past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
+                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs, position_ids=pos_ids)
                 del hidden_states
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
@@ -495,27 +716,34 @@ class StageExecutionEngine:
                         last_logits = out
 
                     top_k = getattr(cfg, "top_k", 50) if cfg else 50
+                    repetition_penalty = getattr(cfg, "repetition_penalty", 1.1) if cfg else 1.1
+                    context_tokens = self.session_token_histories.get(request_id, [])
                     token_id = self.sampler.sample_next_token(
                         last_logits,
                         temperature=temperature,
                         top_p=top_p,
                         top_k=top_k,
+                        repetition_penalty=repetition_penalty,
+                        context_tokens=context_tokens,
                         seed=seed,
                         step_index=step_idx,
                     )
-                    token_text = self.sampler.decode_token(token_id)
                     eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
-                    if stop_token_ids:
-                        is_eos = token_id in stop_token_ids
+                    is_eos = False
+                    if stop_token_ids and token_id in stop_token_ids:
+                        is_eos = True
                     elif eos_id is not None:
-                        is_eos = (token_id == eos_id)
-                    else:
-                        is_eos = False
+                        if isinstance(eos_id, (list, tuple, set)):
+                            is_eos = token_id in eos_id
+                        else:
+                            is_eos = (token_id == eos_id)
 
-                    if not is_eos and token_text:
-                        is_eos = token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
-                    if is_eos and token_text.strip() in ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>"):
-                        token_text = ""
+                    raw_text = self.sampler.decode_token(token_id, skip_special_tokens=False)
+                    stop_strs = ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
+                    if not is_eos and raw_text:
+                        is_eos = raw_text.strip() in stop_strs
+
+                    token_text = "" if is_eos else self.sampler.decode_token(token_id, skip_special_tokens=True)
 
                     is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
                     finish_reason = "stop" if is_eos else ("length" if is_finished else None)
@@ -636,7 +864,17 @@ class StageExecutionEngine:
         elif not accepted_tokens and HAS_TORCH and isinstance(logits, torch.Tensor):
             target_logits = logits[0, -1, :] if logits.dim() == 3 else (logits[-1, :] if logits.dim() == 2 else logits)
             top_k = getattr(cfg, "top_k", 50) if cfg else 50
-            sampled_tok = self.sampler.sample_next_token(target_logits, temperature=temp, top_p=top_p, top_k=top_k)
+            repetition_penalty = getattr(cfg, "repetition_penalty", 1.1) if cfg else 1.1
+            context_tokens = self.session_token_histories.get(request_id, [])
+            sampled_tok = self.sampler.sample_next_token(
+                target_logits,
+                temperature=temp,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                context_tokens=context_tokens,
+                step_index=cand_frame.step_index,
+            )
             accepted_tokens.append(sampled_tok)
 
         eos_id = getattr(self.sampler.tokenizer, "eos_token_id", None)
@@ -649,16 +887,22 @@ class StageExecutionEngine:
         stop_strs = ("<eos>", "<end_of_turn>", "</s>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
         is_eos = False
         for idx, tok in enumerate(accepted_tokens):
-            tok_txt = self.sampler.decode_token(tok)
-            if (stop_token_ids and tok in stop_token_ids) or (not stop_token_ids and eos_id is not None and tok == eos_id) or (tok_txt and tok_txt.strip() in stop_strs):
+            raw_txt = self.sampler.decode_token(tok, skip_special_tokens=False)
+            if (stop_token_ids and tok in stop_token_ids) or (
+                eos_id is not None
+                and (
+                    (isinstance(eos_id, (list, tuple, set)) and tok in eos_id)
+                    or tok == eos_id
+                )
+            ) or (raw_txt and raw_txt.strip() in stop_strs):
                 accepted_tokens = accepted_tokens[: idx + 1]
                 is_eos = True
                 break
 
         new_step_idx = cand_frame.step_index + len(accepted_tokens)
         accepted_texts = [
-            "" if (is_eos and i == len(accepted_tokens) - 1 and self.sampler.decode_token(t).strip() in stop_strs)
-            else self.sampler.decode_token(t)
+            "" if (is_eos and i == len(accepted_tokens) - 1)
+            else self.sampler.decode_token(t, skip_special_tokens=True)
             for i, t in enumerate(accepted_tokens)
         ]
         is_finished = is_eos or (new_step_idx >= max_tokens)
@@ -780,10 +1024,37 @@ class StageExecutionEngine:
                 candidates = self.prompt_drafter.draft_candidates(self.session_token_histories[request_id])
                 if candidates:
                     input_tensor = torch.tensor([[token_frame.token_id] + candidates], dtype=torch.long, device=self.stage_model.device)
+                    current_pos = len(self.session_token_histories[request_id]) - 1
+                    pos_ids = torch.arange(current_pos, current_pos + 1 + len(candidates), device=self.stage_model.device).unsqueeze(0)
                     past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-                    h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+                    h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs, position_ids=pos_ids)
                     self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                     self.session_kv_caches[request_id] = new_kvs
+
+                    if self.is_last_stage():
+                        if self.is_first_stage():
+                            # Single worker: forward_first_stage has already computed all layers.
+                            # Directly verify candidates from h without re-running forward_intermediate_stage!
+                            return self._verify_and_emit_speculative(
+                                request_id=request_id,
+                                step_index=token_frame.step_index,
+                                candidates=candidates,
+                                hidden_states=h,
+                            )
+                        comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
+                        b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+                        spec_cand = SpeculativeCandidates(
+                            request_id=request_id,
+                            step_index=token_frame.step_index,
+                            candidate_tokens=candidates,
+                            shape=list(shape),
+                            dtype=self.compression_dtype,
+                            scale=scale,
+                            payload_b64=b64_payload,
+                            is_verified=True,
+                            is_experimental=False,
+                        )
+                        return self.process_speculative_candidates(spec_cand)
 
                     comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
                     b64_payload = base64.b64encode(comp_bytes).decode("ascii")
@@ -800,8 +1071,6 @@ class StageExecutionEngine:
                         is_verified=True,
                         is_experimental=False,
                     )
-                    if self.is_last_stage():
-                        return self.process_speculative_candidates(spec_cand)
                     return ProtocolFrame(
                         type=MessageType.SPECULATIVE_CANDIDATES,
                         source=self.assignment.worker_id,
@@ -811,10 +1080,33 @@ class StageExecutionEngine:
 
                 # 2. Standard Single-Token Path
                 input_tensor = torch.tensor([[token_frame.token_id]], dtype=torch.long, device=self.stage_model.device)
+                current_pos = len(self.session_token_histories[request_id]) - 1
+                pos_ids = torch.tensor([[current_pos]], device=self.stage_model.device)
                 past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-                h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
+                h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs, position_ids=pos_ids)
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
+
+                if self.is_last_stage():
+                    if self.is_first_stage():
+                        # Single worker: emit terminal token directly from h without re-running forward_intermediate_stage!
+                        return self._emit_terminal_token(request_id=request_id, step_index=token_frame.step_index, hidden_states=h)
+                    comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
+                    b64_payload = base64.b64encode(comp_bytes).decode("ascii")
+                    forward_act = ForwardActivation(
+                        request_id=request_id,
+                        step_index=token_frame.step_index,
+                        shape=list(shape),
+                        dtype=self.compression_dtype,
+                        scale=scale,
+                        payload_b64=b64_payload,
+                        stage_index=self.assignment.layer_start,
+                        expected_next_stage=self.assignment.layer_end,
+                        position_offset=current_pos,
+                        is_verified=True,
+                        is_experimental=False,
+                    )
+                    return self.process_forward_activation(forward_act)
 
                 comp_bytes, scale, shape = compress_tensor(h, method=self.compression_dtype)
                 b64_payload = base64.b64encode(comp_bytes).decode("ascii")
@@ -829,13 +1121,10 @@ class StageExecutionEngine:
                     payload_b64=b64_payload,
                     stage_index=self.assignment.layer_start,
                     expected_next_stage=self.assignment.layer_end,
+                    position_offset=current_pos,
                     is_verified=True,
                     is_experimental=False,
                 )
-
-                if self.is_last_stage():
-                    # Single worker: worker holds all stages, process activation directly
-                    return self.process_forward_activation(forward_act)
 
                 return ProtocolFrame(
                     type=MessageType.FORWARD_ACTIVATION,

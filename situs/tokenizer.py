@@ -178,6 +178,48 @@ _tokenizers_cache: Dict[str, Any] = {}
 _tokenizer_lock = threading.Lock()
 
 
+def _ensure_stop_token_ids(tok: Any, model_name: Optional[str] = None) -> Any:
+    """Ensures stop_token_ids is populated with EOS and turn boundary token IDs."""
+    if tok is None:
+        return tok
+    stop_ids = list(getattr(tok, "stop_token_ids", None) or [])
+    eos_id = getattr(tok, "eos_token_id", None)
+    if eos_id is not None:
+        if isinstance(eos_id, (list, tuple, set)):
+            for e in eos_id:
+                if e is not None and int(e) not in stop_ids:
+                    stop_ids.append(int(e))
+        elif int(eos_id) not in stop_ids:
+            stop_ids.append(int(eos_id))
+
+    special_stop_names = ("<end_of_turn>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>", "</s>")
+    for s_name in special_stop_names:
+        try:
+            tid = None
+            if hasattr(tok, "convert_tokens_to_ids"):
+                tid = tok.convert_tokens_to_ids(s_name)
+            elif hasattr(tok, "vocab") and isinstance(tok.vocab, dict):
+                tid = tok.vocab.get(s_name)
+            elif hasattr(tok, "get_vocab") and callable(tok.get_vocab):
+                tid = tok.get_vocab().get(s_name)
+            unk_id = getattr(tok, "unk_token_id", None)
+            if tid is not None and (unk_id is None or tid != unk_id):
+                tid_int = int(tid)
+                if tid_int not in stop_ids:
+                    stop_ids.append(tid_int)
+        except Exception:
+            pass
+
+    # Explicit check for Gemma turn stop token ID 106 (<end_of_turn>)
+    m_name = (model_name or getattr(tok, "name_or_path", "") or "").lower()
+    if any(g in m_name for g in ("gemma", "gemma2", "gemma3")):
+        if 106 not in stop_ids:
+            stop_ids.append(106)
+
+    tok.stop_token_ids = stop_ids
+    return tok
+
+
 def _resolve_and_load_tokenizer(
     model_name: Optional[str],
     clean_name: str,
@@ -201,14 +243,14 @@ def _resolve_and_load_tokenizer(
             if _is_gguf(model_name):
                 tok = GGUFTokenizerAdapter(model_name, model_name=model_name)
                 logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {model_name}")
-                return tok
+                return _ensure_stop_token_ids(tok, model_name)
             from situs.worker.loader import find_local_weight_files
             wfiles = find_local_weight_files(model_name)
             for wf in wfiles:
                 if _is_gguf(wf):
                     tok = GGUFTokenizerAdapter(wf, model_name=model_name)
                     logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {wf}")
-                    return tok
+                    return _ensure_stop_token_ids(tok, model_name)
         except Exception as e:
             logger.debug(f"GGUF tokenizer construction skipped for '{model_name}': {e}")
 
@@ -298,7 +340,7 @@ def _resolve_and_load_tokenizer(
                 tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                 if tok is not None:
                     logger.info(f"Loaded verified tokenizer for '{model_name}' from {cand}")
-                    return tok
+                    return _ensure_stop_token_ids(tok, model_name)
             except Exception as e:
                 logger.debug(f"Failed loading local directory tokenizer from {cand}: {e}")
 
@@ -316,14 +358,14 @@ def _resolve_and_load_tokenizer(
                                 tok = AutoTokenizer.from_pretrained(s, local_files_only=True)
                                 if tok is not None:
                                     logger.info(f"Loaded cached snapshot tokenizer for '{model_name}' from {s}")
-                                    return tok
+                                    return _ensure_stop_token_ids(tok, model_name)
                             except Exception:
                                 pass
                 try:
                     tok = AutoTokenizer.from_pretrained(cand, local_files_only=True)
                     if tok is not None:
                         logger.info(f"Loaded cached tokenizer for '{model_name}' from {cand}")
-                        return tok
+                        return _ensure_stop_token_ids(tok, model_name)
                 except Exception:
                     pass
 
@@ -337,7 +379,7 @@ def _resolve_and_load_tokenizer(
                     tok = AutoTokenizer.from_pretrained(cand, token=token)
                     if tok is not None:
                         logger.info(f"Downloaded and loaded tokenizer for '{model_name}' from {cand}")
-                        return tok
+                        return _ensure_stop_token_ids(tok, model_name)
                 except Exception:
                     pass
 
@@ -361,16 +403,17 @@ def get_or_load_tokenizer(
     # 1. Fast path: check cache under lock
     with _tokenizer_lock:
         if cache_key in _tokenizers_cache:
-            return _tokenizers_cache[cache_key]
+            return _ensure_stop_token_ids(_tokenizers_cache[cache_key], model_name)
 
     # 2. Synchronized load: ensure only one thread performs heavy disk resolution
     with _tokenizer_lock:
         # Double-check inside lock
         if cache_key in _tokenizers_cache:
-            return _tokenizers_cache[cache_key]
+            return _ensure_stop_token_ids(_tokenizers_cache[cache_key], model_name)
 
         tok = _resolve_and_load_tokenizer(model_name, clean_name, local_files_only=local_files_only)
         if tok is not None:
+            tok = _ensure_stop_token_ids(tok, model_name)
             _tokenizers_cache[cache_key] = tok
             return tok
 

@@ -1035,7 +1035,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         )
 
         def _build_mask():
-            q_idx = torch.arange(past_len, past_len + seq_len, device=q.device).unsqueeze(1)
+            q_idx = torch.arange(total_kv_len - seq_len, total_kv_len, device=q.device).unsqueeze(1)
             k_idx = torch.arange(total_kv_len, device=q.device).unsqueeze(0)
             mask = k_idx <= q_idx
             if use_sliding:
@@ -1100,7 +1100,10 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
 
         # Apply Rotary Position Embeddings (RoPE)
         if hasattr(self, "rotary") and self.rotary is not None:
-            cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=past_len, position_ids=position_ids)
+            if position_ids is not None:
+                cos, sin = self.rotary(norm_x, position_ids=position_ids)
+            else:
+                cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=past_len)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # KV Cache concatenation for autoregressive steps
@@ -2045,19 +2048,30 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             new_kvs.append(new_kv)
 
         if self.is_last_stage:
-            # Autoregressive generation & prompt prefill only sample from the last sequence position.
-            # Slicing h to h[:, -1:, :] before norm & lm_head saves over 99.8% VRAM on 262k vocabularies (e.g. Gemma 3 4B).
-            # When compute_all_logits is True (e.g. small speculative candidate batch verification), compute all positions.
-            if not compute_all_logits and h.shape[1] > 1:
-                h = h[:, -1:, :]
-            h = self.norm(h)
-            logits = self.lm_head(h)
-            cap = getattr(self, "final_logit_softcapping", None)
-            if cap is not None and cap > 0:
-                logits = (torch.tanh(logits.float() / float(cap)) * float(cap)).to(logits.dtype)
-            return logits, new_kvs
+            return self.compute_logits(h, compute_all_logits=compute_all_logits), new_kvs
 
         return h, new_kvs
+
+    def compute_logits(
+        self,
+        h: "torch.Tensor",
+        compute_all_logits: bool = False,
+    ) -> "torch.Tensor":
+        """Applies stage_model.norm and stage_model.lm_head to hidden states to produce logits."""
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch is required for model inference")
+        if not compute_all_logits and h.shape[1] > 1:
+            h = h[:, -1:, :]
+        if hasattr(self, "norm") and self.norm is not None:
+            h = self.norm(h)
+        if hasattr(self, "lm_head") and self.lm_head is not None:
+            logits = self.lm_head(h)
+        else:
+            logits = h
+        cap = getattr(self, "final_logit_softcapping", None)
+        if cap is not None and cap > 0:
+            logits = (torch.tanh(logits.float() / float(cap)) * float(cap)).to(logits.dtype)
+        return logits
 
 
 def find_local_safetensors_files(model_name: str) -> List[str]:

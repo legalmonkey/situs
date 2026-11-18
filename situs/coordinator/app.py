@@ -634,6 +634,28 @@ async def list_models(request: Request):
 def _format_pipeline_prompt(messages: List[Any], tokenizer: Any, model_name: Optional[str] = None) -> str:
     """Format OpenAI-style chat messages using the verified tokenizer's chat template when available."""
     raw_msgs = [{"role": m.role, "content": m.content} for m in messages]
+    m_name = (model_name or getattr(tokenizer, "model_name", "") or "").lower()
+    is_gemma = any(g in m_name for g in ("gemma", "gemma2", "gemma3"))
+
+    if is_gemma:
+        # Gemma official template does not accept 'system' role turns directly; prepend into first user message
+        merged_msgs = []
+        pending_system = ""
+        for m in raw_msgs:
+            if m["role"] == "system":
+                pending_system = f"{pending_system}\n\n{m['content']}".strip() if pending_system else (m["content"] or "").strip()
+            elif m["role"] == "user":
+                if pending_system:
+                    merged_msgs.append({"role": "user", "content": f"{pending_system}\n\n{m['content']}".strip()})
+                    pending_system = ""
+                else:
+                    merged_msgs.append(m)
+            else:
+                merged_msgs.append(m)
+        if pending_system and not merged_msgs:
+            merged_msgs.append({"role": "user", "content": pending_system})
+        raw_msgs = merged_msgs
+
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             templated = tokenizer.apply_chat_template(
@@ -643,13 +665,13 @@ def _format_pipeline_prompt(messages: List[Any], tokenizer: Any, model_name: Opt
                 return templated
         except Exception:
             pass
+
     # Specific chat template fallback for Gemma and Llama instruction models
-    m_name = (model_name or getattr(tokenizer, "model_name", "") or "").lower()
-    if any(g in m_name for g in ("gemma", "gemma2", "gemma3")):
+    if is_gemma:
         parts = []
-        for m in messages:
-            role = "user" if getattr(m, "role", "user") == "user" else "model"
-            content = getattr(m, "content", "") or ""
+        for m in raw_msgs:
+            role = "user" if m.get("role") == "user" else "model"
+            content = m.get("content", "") or ""
             parts.append(f"<start_of_turn>{role}\n{content.strip()}<end_of_turn>\n")
         parts.append("<start_of_turn>model\n")
         return "".join(parts)
@@ -807,6 +829,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 last_worker = pipeline[-1]
 
                 stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
+                if tokenizer:
+                    eos = getattr(tokenizer, "eos_token_id", None)
+                    if eos is not None:
+                        if isinstance(eos, (list, tuple, set)):
+                            for e in eos:
+                                if e is not None and int(e) not in stop_ids:
+                                    stop_ids.append(int(e))
+                        elif int(eos) not in stop_ids:
+                            stop_ids.append(int(eos))
+                    for s_name in ("<end_of_turn>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>", "</s>"):
+                        try:
+                            tid = tokenizer.convert_tokens_to_ids(s_name) if hasattr(tokenizer, "convert_tokens_to_ids") else None
+                            if tid is not None and tid != getattr(tokenizer, "unk_token_id", None) and int(tid) not in stop_ids:
+                                stop_ids.append(int(tid))
+                        except Exception:
+                            pass
                 start_payload = InferenceStart(
                     request_id=request_id,
                     model_name=target_model,
@@ -1003,6 +1041,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 logger.info(f"Model '{target_model}' ({canonical}) not present locally. Pulling via native Hugging Face Hub...")
                 async for _ in stream_pull_model(canonical):
                     pass
+                try:
+                    await rebalance_and_assign_layers(target_model)
+                    await asyncio.sleep(0.05)
+                    pipeline = registry.get_pipeline_order()
+                except Exception as e:
+                    logger.error(f"Cluster rebalance after pull failed: {e}")
             try:
                 tokenizer = get_or_load_tokenizer(target_model)
                 if tokenizer is None:
@@ -1036,6 +1080,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             last_worker = pipeline[-1]
 
             stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
+            if tokenizer:
+                eos = getattr(tokenizer, "eos_token_id", None)
+                if eos is not None:
+                    if isinstance(eos, (list, tuple, set)):
+                        for e in eos:
+                            if e is not None and int(e) not in stop_ids:
+                                stop_ids.append(int(e))
+                    elif int(eos) not in stop_ids:
+                        stop_ids.append(int(eos))
+                for s_name in ("<end_of_turn>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>", "</s>"):
+                    try:
+                        tid = tokenizer.convert_tokens_to_ids(s_name) if hasattr(tokenizer, "convert_tokens_to_ids") else None
+                        if tid is not None and tid != getattr(tokenizer, "unk_token_id", None) and int(tid) not in stop_ids:
+                            stop_ids.append(int(tid))
+                    except Exception:
+                        pass
             start_payload = InferenceStart(
                 request_id=request_id,
                 model_name=target_model,

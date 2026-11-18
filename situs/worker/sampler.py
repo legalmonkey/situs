@@ -21,6 +21,8 @@ class TokenSampler:
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 50,
+        repetition_penalty: float = 1.1,
+        context_tokens: Optional[List[int]] = None,
         seed: Optional[int] = None,
         step_index: int = 0,
     ) -> int:
@@ -42,6 +44,19 @@ class TokenSampler:
             # If all logits are negative Inf (all masked) or all are zero (uninitialized weights) -> return EOS
             if torch.isneginf(logits).all() or torch.all(logits == 0):
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
+
+            logits = logits.clone()
+
+            # Apply repetition penalty across recent context tokens
+            if repetition_penalty is not None and repetition_penalty != 1.0 and context_tokens:
+                recent_tokens = set(context_tokens[-64:])
+                vocab_len = logits.shape[-1]
+                for tok in recent_tokens:
+                    if 0 <= tok < vocab_len:
+                        if logits[tok] < 0:
+                            logits[tok] = logits[tok] * repetition_penalty
+                        else:
+                            logits[tok] = logits[tok] / repetition_penalty
 
             if temperature <= 0.01:
                 return int(torch.argmax(logits).item())
@@ -109,7 +124,7 @@ class TokenSampler:
             return int(token.item())
         else:
             # NumPy fallback
-            arr = np.asarray(logits, dtype=np.float32)
+            arr = np.asarray(logits, dtype=np.float32).copy()
             if arr.ndim == 3:
                 arr = arr[0, -1, :]
             elif arr.ndim == 2:
@@ -122,6 +137,17 @@ class TokenSampler:
             # All masked (-inf) or uninitialized zeros -> return EOS
             if np.all(np.isneginf(arr)) or np.all(arr == 0):
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
+
+            # Apply repetition penalty across recent context tokens
+            if repetition_penalty is not None and repetition_penalty != 1.0 and context_tokens:
+                recent_tokens = set(context_tokens[-64:])
+                vocab_len = len(arr)
+                for tok in recent_tokens:
+                    if 0 <= tok < vocab_len:
+                        if arr[tok] < 0:
+                            arr[tok] = arr[tok] * repetition_penalty
+                        else:
+                            arr[tok] = arr[tok] / repetition_penalty
 
             if temperature <= 0.01:
                 return int(np.argmax(arr))
@@ -137,10 +163,13 @@ class TokenSampler:
             rng = np.random.RandomState(int(seed) + int(step_index)) if seed is not None else np.random
             return int(rng.choice(len(probs), p=probs))
 
-    def decode_token(self, token_id: int) -> str:
+    def decode_token(self, token_id: int, skip_special_tokens: bool = True) -> str:
         """Decodes token ID to text string using the verified tokenizer."""
         if self.tokenizer:
             try:
+                if not skip_special_tokens:
+                    text = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                    return text or ""
                 all_specials = getattr(self.tokenizer, "all_special_ids", [])
                 if token_id in all_specials:
                     return ""
