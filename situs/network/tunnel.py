@@ -196,8 +196,8 @@ class PublicTunnelManager:
                 f"http://127.0.0.1:{self.port}",
                 "--no-autoupdate",
             ]
-            # Use responsive timeout (max 8.0s) for quick tunnel to avoid long user hangs on 429 rate limit
-            quick_timeout = min(timeout, 8.0)
+            # Use responsive timeout (max 15.0s) for quick tunnel to avoid long user hangs on 429 rate limit
+            quick_timeout = min(timeout, 15.0)
             url = self._spawn_and_await_url(cmd, timeout=quick_timeout)
             if url:
                 return url
@@ -217,7 +217,9 @@ class PublicTunnelManager:
                 ssh_bin,
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=no",
-                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveInterval=10",
+                "-o", "ServerAliveCountMax=10",
+                "-o", "TCPKeepAlive=yes",
                 "-R", f"80:localhost:{self.port}",
                 "nokey@localhost.run",
             ]
@@ -234,7 +236,9 @@ class PublicTunnelManager:
                 ssh_bin,
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=no",
-                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveInterval=10",
+                "-o", "ServerAliveCountMax=10",
+                "-o", "TCPKeepAlive=yes",
                 "-p", "443",
                 "-R", f"0:localhost:{self.port}",
                 "a.pinggy.io",

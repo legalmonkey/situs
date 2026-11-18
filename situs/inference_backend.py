@@ -578,6 +578,22 @@ def ensure_model_available(target_model: str, progress_callback=None) -> bool:
         return False
 
 
+def format_stage_name(stage_name: str) -> str:
+    """Format download or pipeline stage status for UI display."""
+    s = (stage_name or "").lower()
+    if "writing" in s or "allocat" in s:
+        return "Allocating Local Storage"
+    if "manifest" in s:
+        return "Resolving Model Manifest"
+    if "download" in s or "stream" in s:
+        return "Streaming Model Weights"
+    if "verify" in s:
+        return "Verifying Checksum Integrity"
+    if "success" in s or "ready" in s:
+        return "Ready for Inference"
+    return stage_name.capitalize() if stage_name else "Processing"
+
+
 # -----------------------------------------------------------------------------
 # Backwards Compatibility Stubs (Clean no-ops for legacy test suites)
 # -----------------------------------------------------------------------------

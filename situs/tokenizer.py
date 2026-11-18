@@ -35,9 +35,11 @@ class EnglishFallbackTokenizer:
 class GGUFTokenizerAdapter:
     """Builds a verified HuggingFace `tokenizers.Tokenizer` directly from GGUF embedded vocabulary metadata."""
 
-    def __init__(self, gguf_path: str):
+    def __init__(self, gguf_path: str, model_name: Optional[str] = None):
         from tokenizers import Tokenizer, models, decoders, normalizers, pre_tokenizers, AddedToken
         from situs.worker.loader import FastGGUFFile
+
+        self.model_name: str = str(model_name or "")
 
         wanted_keys = {
             "tokenizer.ggml.tokens",
@@ -197,14 +199,14 @@ def _resolve_and_load_tokenizer(
                     return False
 
             if _is_gguf(model_name):
-                tok = GGUFTokenizerAdapter(model_name)
+                tok = GGUFTokenizerAdapter(model_name, model_name=model_name)
                 logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {model_name}")
                 return tok
             from situs.worker.loader import find_local_weight_files
             wfiles = find_local_weight_files(model_name)
             for wf in wfiles:
                 if _is_gguf(wf):
-                    tok = GGUFTokenizerAdapter(wf)
+                    tok = GGUFTokenizerAdapter(wf, model_name=model_name)
                     logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {wf}")
                     return tok
         except Exception as e:

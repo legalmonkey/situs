@@ -1110,12 +1110,6 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
                 k = torch.cat([past_k, k], dim=-2)
                 v = torch.cat([past_v, v], dim=-2)
 
-        # Sliding window pruning: prune tokens exceeding window limit to strictly bound KV cache memory
-        if self.sliding_window is not None and self.sliding_window > 0:
-            if k.shape[-2] > self.sliding_window:
-                k = k[..., -self.sliding_window :, :]
-                v = v[..., -self.sliding_window :, :]
-
         new_kv = (k, v)
 
         # Grouped-Query Attention head expansion if GQA is active
@@ -1687,7 +1681,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         self._layer_events: Dict[int, threading.Event] = {
             i: threading.Event() for i in range(layer_start, layer_end)
         }
-        if progressive:
+        if progressive or _lazy_alloc:
             self.ready_layers: Set[int] = set()
         else:
             self.ready_layers = set(range(layer_start, layer_end))
@@ -2357,6 +2351,12 @@ def load_hf_stage_model(
     )
 
     if not progressive and HAS_TORCH:
+        has_disk_weights = bool(sfiles or has_gguf_source)
+        if has_disk_weights:
+            stage.ready_layers.clear()
+            for ev in stage._layer_events.values():
+                ev.clear()
+
         from situs.worker.jit_streamer import is_layer_cached, load_layer_from_cache, save_layer_to_cache
         loaded_cached = 0
         if not has_gguf_source:
@@ -2679,6 +2679,13 @@ def load_hf_stage_model(
 
         if loaded_cached > 0:
             logger.info(f"Loaded {loaded_cached} layer weights from disk for stage [{layer_start}..{layer_end})")
+
+        missing = [l for l in range(layer_start, layer_end) if not stage.is_layer_ready(l)]
+        if missing and has_disk_weights:
+            logger.warning(
+                f"Stage [{layer_start}..{layer_end}) for model '{model_name}' has unready layers: {missing}. "
+                f"Verify that weight files contain all assigned transformer layers."
+            )
 
     logger.info(
         f"Initialized real stage [{layer_start}..{layer_end}) on {device}. "

@@ -408,7 +408,7 @@ def test_gemma2_numerical_parity_4norms_softcap_and_stage_scaling():
     toks = torch.tensor([[1, 3, 5, 7, 9, 11]])
     with torch.no_grad():
         h_mid, _ = stage.forward_first_stage(toks)
-        logits, _ = stage.forward_intermediate_stage(F.embedding(toks, embed_w) * math.sqrt(h))
+        logits, _ = stage.forward_intermediate_stage(F.embedding(toks, embed_w) * math.sqrt(h), compute_all_logits=True)
         # Exact reference calculation
         ref_h = F.embedding(toks, embed_w) * math.sqrt(h)
         ref_h, _ = ref_layer(ref_h)

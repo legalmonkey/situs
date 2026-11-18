@@ -631,7 +631,7 @@ async def list_models(request: Request):
     }
 
 
-def _format_pipeline_prompt(messages: List[Any], tokenizer: Any) -> str:
+def _format_pipeline_prompt(messages: List[Any], tokenizer: Any, model_name: Optional[str] = None) -> str:
     """Format OpenAI-style chat messages using the verified tokenizer's chat template when available."""
     raw_msgs = [{"role": m.role, "content": m.content} for m in messages]
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
@@ -644,7 +644,7 @@ def _format_pipeline_prompt(messages: List[Any], tokenizer: Any) -> str:
         except Exception:
             pass
     # Specific chat template fallback for Gemma and Llama instruction models
-    m_name = (getattr(tokenizer, "model_name", "") or "").lower()
+    m_name = (model_name or getattr(tokenizer, "model_name", "") or "").lower()
     if any(g in m_name for g in ("gemma", "gemma2", "gemma3")):
         parts = []
         for m in messages:
@@ -780,7 +780,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     tokenizer = get_or_load_tokenizer(target_model)
                     if tokenizer is None:
                         raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
-                    pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer)
+                    pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer, model_name=target_model)
                     input_ids = tokenizer.encode(pipeline_prompt)
                     if not input_ids:
                         raise ValueError("Tokenizer returned empty token list.")
@@ -1007,7 +1007,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 tokenizer = get_or_load_tokenizer(target_model)
                 if tokenizer is None:
                     raise ValueError(f"Could not load valid tokenizer for model '{target_model}'.")
-                pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer)
+                pipeline_prompt = _format_pipeline_prompt(req.messages, tokenizer, model_name=target_model)
                 input_ids = tokenizer.encode(pipeline_prompt)
                 if not input_ids:
                     raise ValueError("Tokenizer returned empty token list.")
