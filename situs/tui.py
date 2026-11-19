@@ -2506,12 +2506,12 @@ def execute_slash_command(
                     session_state["max_tokens"] = cnt
                     emit(f"[bold green]Maximum generation tokens set to {cnt}.[/bold green]", "Max Tokens")
             except ValueError:
-                emit("[yellow]Usage: /tokens <count> (e.g. /tokens 2048, /tokens 4096)[/yellow]", "Max Tokens")
+                emit("[yellow]Usage: /tokens <count> (e.g. /tokens 512, /tokens 1024, /tokens 2048)[/yellow]", "Max Tokens")
         else:
-            curr_tok = session_state.get("max_tokens", 2048)
+            curr_tok = session_state.get("max_tokens", 512)
             emit(
                 f"[bold white]Current max tokens:[/bold white] [bold green]{curr_tok}[/bold green]\n"
-                f"[dim]To change: [bold cyan]/tokens <count>[/bold cyan] (e.g. /tokens 4096)[/dim]",
+                f"[dim]To change: [bold cyan]/tokens <count>[/bold cyan] (e.g. /tokens 1024)[/dim]",
                 "Max Tokens"
             )
         return True
@@ -2647,6 +2647,7 @@ def run_opencode_tui(
         "gpu_name": gpu_name,
         "is_generating": False,
         "is_coordinator": is_init_coord,
+        "max_tokens": 512,
         "cluster_workers": [],
     }
 
@@ -3829,7 +3830,7 @@ def run_opencode_tui(
             hdr_line = f"← {stages_txt} · {disp_m} ({disp_layers} Layers)"
             history_entries.append(("stage", hdr_line, disp_m))
 
-            max_tokens_val = session_state.get("max_tokens", 2048)
+            max_tokens_val = session_state.get("max_tokens", 512)
             payload = {
                 "model": session_state.get("model", model),
                 "messages": messages,

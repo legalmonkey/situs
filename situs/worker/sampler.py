@@ -1,6 +1,7 @@
 """Token sampling and decoding utilities for the last pipeline stage."""
 
 import numpy as np
+from collections import Counter
 from typing import Optional, List, Tuple, Union, Any
 
 try:
@@ -47,16 +48,30 @@ class TokenSampler:
 
             logits = logits.clone()
 
-            # Apply repetition penalty across recent context tokens
+            # Apply frequency-aware repetition penalty and n-gram repeat suppression across context tokens
             if repetition_penalty is not None and repetition_penalty != 1.0 and context_tokens:
-                recent_tokens = set(context_tokens[-64:])
+                recent_tokens = context_tokens[-256:]
+                counts = Counter(recent_tokens)
                 vocab_len = logits.shape[-1]
-                for tok in recent_tokens:
+                for tok, count in counts.items():
                     if 0 <= tok < vocab_len:
+                        eff_penalty = float(repetition_penalty ** min(count, 4))
                         if logits[tok] < 0:
-                            logits[tok] = logits[tok] * repetition_penalty
+                            logits[tok] = logits[tok] * eff_penalty
                         else:
-                            logits[tok] = logits[tok] / repetition_penalty
+                            logits[tok] = logits[tok] / eff_penalty
+
+                # 2-gram phrase looping penalty: suppress immediate repeating bigrams/trigrams
+                if len(context_tokens) >= 2:
+                    last_bigram = (context_tokens[-2], context_tokens[-1])
+                    for i in range(len(context_tokens) - 3):
+                        if (context_tokens[i], context_tokens[i + 1]) == last_bigram:
+                            follow_tok = context_tokens[i + 2]
+                            if 0 <= follow_tok < vocab_len:
+                                if logits[follow_tok] < 0:
+                                    logits[follow_tok] = logits[follow_tok] * (repetition_penalty * 1.5)
+                                else:
+                                    logits[follow_tok] = logits[follow_tok] / (repetition_penalty * 1.5)
 
             if temperature <= 0.01:
                 return int(torch.argmax(logits).item())
@@ -138,16 +153,30 @@ class TokenSampler:
             if np.all(np.isneginf(arr)) or np.all(arr == 0):
                 return int(getattr(self.tokenizer, "eos_token_id", 0) or 0)
 
-            # Apply repetition penalty across recent context tokens
+            # Apply frequency-aware repetition penalty and n-gram repeat suppression across context tokens
             if repetition_penalty is not None and repetition_penalty != 1.0 and context_tokens:
-                recent_tokens = set(context_tokens[-64:])
+                recent_tokens = context_tokens[-256:]
+                counts = Counter(recent_tokens)
                 vocab_len = len(arr)
-                for tok in recent_tokens:
+                for tok, count in counts.items():
                     if 0 <= tok < vocab_len:
+                        eff_penalty = float(repetition_penalty ** min(count, 4))
                         if arr[tok] < 0:
-                            arr[tok] = arr[tok] * repetition_penalty
+                            arr[tok] = arr[tok] * eff_penalty
                         else:
-                            arr[tok] = arr[tok] / repetition_penalty
+                            arr[tok] = arr[tok] / eff_penalty
+
+                # 2-gram phrase looping penalty: suppress immediate repeating bigrams/trigrams
+                if len(context_tokens) >= 2:
+                    last_bigram = (context_tokens[-2], context_tokens[-1])
+                    for i in range(len(context_tokens) - 3):
+                        if (context_tokens[i], context_tokens[i + 1]) == last_bigram:
+                            follow_tok = context_tokens[i + 2]
+                            if 0 <= follow_tok < vocab_len:
+                                if arr[follow_tok] < 0:
+                                    arr[follow_tok] = arr[follow_tok] * (repetition_penalty * 1.5)
+                                else:
+                                    arr[follow_tok] = arr[follow_tok] / (repetition_penalty * 1.5)
 
             if temperature <= 0.01:
                 return int(np.argmax(arr))

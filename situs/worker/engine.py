@@ -336,7 +336,10 @@ class StageExecutionEngine:
 
                 input_ids = torch.tensor([start_msg.input_ids], dtype=torch.long, device=self.stage_model.device)
                 pos_ids = torch.arange(0, input_ids.shape[1], device=self.stage_model.device).unsqueeze(0)
-                h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None, position_ids=pos_ids)
+                try:
+                    h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None, position_ids=pos_ids)
+                except TypeError:
+                    h, new_kvs = self.stage_model.forward_first_stage(input_ids, past_kvs=None)
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
 
@@ -469,6 +472,10 @@ class StageExecutionEngine:
 
         token_text = "" if is_eos else self.sampler.decode_token(token_id, skip_special_tokens=True)
 
+        if request_id not in self.session_token_histories:
+            self.session_token_histories[request_id] = []
+        self.session_token_histories[request_id].append(token_id)
+
         is_finished = is_eos or (step_index + 1 >= max_new_tokens)
         finish_reason = "stop" if is_eos else ("length" if is_finished else None)
 
@@ -575,6 +582,10 @@ class StageExecutionEngine:
             else self.sampler.decode_token(t, skip_special_tokens=True)
             for i, t in enumerate(accepted_tokens)
         ]
+        if request_id not in self.session_token_histories:
+            self.session_token_histories[request_id] = []
+        self.session_token_histories[request_id].extend(accepted_tokens)
+
         is_finished = is_eos or (new_step_idx >= max_tokens)
 
         if is_finished:
@@ -656,7 +667,10 @@ class StageExecutionEngine:
                     pos_ids = None
 
                 past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-                out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs, position_ids=pos_ids)
+                try:
+                    out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs, position_ids=pos_ids)
+                except TypeError:
+                    out, new_kvs = self.stage_model.forward_intermediate_stage(hidden_states, past_kvs=past_kvs)
                 del hidden_states
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
@@ -747,6 +761,10 @@ class StageExecutionEngine:
                         is_eos = raw_text.strip() in stop_strs
 
                     token_text = "" if is_eos else self.sampler.decode_token(token_id, skip_special_tokens=True)
+
+                    if request_id not in self.session_token_histories:
+                        self.session_token_histories[request_id] = []
+                    self.session_token_histories[request_id].append(token_id)
 
                     is_finished = is_eos or (step_idx + 1 >= max_new_tokens)
                     finish_reason = "stop" if is_eos else ("length" if is_finished else None)
@@ -908,6 +926,10 @@ class StageExecutionEngine:
             else self.sampler.decode_token(t, skip_special_tokens=True)
             for i, t in enumerate(accepted_tokens)
         ]
+        if request_id not in self.session_token_histories:
+            self.session_token_histories[request_id] = []
+        self.session_token_histories[request_id].extend(accepted_tokens)
+
         is_finished = is_eos or (new_step_idx >= max_tokens)
 
         if is_finished:
@@ -1030,7 +1052,10 @@ class StageExecutionEngine:
                     current_pos = len(self.session_token_histories[request_id]) - 1
                     pos_ids = torch.arange(current_pos, current_pos + 1 + len(candidates), device=self.stage_model.device).unsqueeze(0)
                     past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-                    h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs, position_ids=pos_ids)
+                    try:
+                        h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs, position_ids=pos_ids)
+                    except TypeError:
+                        h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
                     self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                     self.session_kv_caches[request_id] = new_kvs
 
@@ -1086,7 +1111,10 @@ class StageExecutionEngine:
                 current_pos = len(self.session_token_histories[request_id]) - 1
                 pos_ids = torch.tensor([[current_pos]], device=self.stage_model.device)
                 past_kvs = self.kv_cache_manager.get_all_kvs(request_id) or self.session_kv_caches.get(request_id)
-                h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs, position_ids=pos_ids)
+                try:
+                    h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs, position_ids=pos_ids)
+                except TypeError:
+                    h, new_kvs = self.stage_model.forward_first_stage(input_tensor, past_kvs=past_kvs)
                 self.kv_cache_manager.set_all_kvs(request_id, new_kvs)
                 self.session_kv_caches[request_id] = new_kvs
 
