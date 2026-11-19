@@ -369,7 +369,10 @@ class StageExecutionEngine:
                 if self.is_last_stage():
                     if self.is_first_stage():
                         # Single worker: worker holds all stages, emit first token directly from h
-                        return self._emit_terminal_token(request_id=request_id, step_index=0, hidden_states=h)
+                        res = self._emit_terminal_token(request_id=request_id, step_index=0, hidden_states=h)
+                        if HAS_TORCH and torch.cuda.is_available() and "cuda" in str(self.stage_model.device):
+                            torch.cuda.empty_cache()
+                        return res
                     return self.process_forward_activation(forward_act)
 
                 return ProtocolFrame(
