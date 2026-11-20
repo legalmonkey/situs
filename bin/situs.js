@@ -67,9 +67,17 @@ function installSitus(pythonCmd) {
     installArgs.push(installTarget);
   }
 
-  const res = spawnSync(pythonCmd, installArgs, {
+  let res = spawnSync(pythonCmd, installArgs, {
     stdio: "inherit",
   });
+
+  // If pip install from PyPI fails (e.g. before PyPI release), fallback to GitHub test branch
+  if (res.status !== 0 && !isLocalRepo) {
+    console.log("\x1b[33m%s\x1b[0m", "🔄 Attempting install directly from GitHub repository (test branch)...");
+    res = spawnSync(pythonCmd, ["-m", "pip", "install", "git+https://github.com/legalmonkey/situs.git@test"], {
+      stdio: "inherit",
+    });
+  }
 
   if (res.status !== 0) {
     console.error("\x1b[31m%s\x1b[0m", "❌ Failed to install Situs dependencies via pip.");
