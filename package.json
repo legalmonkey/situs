@@ -1,0 +1,41 @@
+{
+  "name": "situs-cli",
+  "version": "0.1.0",
+  "description": "Distributed GPU pooling and LLM inference across residential internet",
+  "bin": {
+    "situs": "./bin/situs.js",
+    "situs-cli": "./bin/situs.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node ./bin/situs.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/legalmonkey/situs.git"
+  },
+  "homepage": "https://github.com/legalmonkey/situs#readme",
+  "bugs": {
+    "url": "https://github.com/legalmonkey/situs/issues"
+  },
+  "keywords": [
+    "situs",
+    "llm",
+    "distributed-gpu",
+    "gpu-pooling",
+    "gemma3",
+    "cuda",
+    "ai",
+    "inference",
+    "pipeline-parallelism",
+    "webrtc"
+  ],
+  "author": "legalmonkey",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
