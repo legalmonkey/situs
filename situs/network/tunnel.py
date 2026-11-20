@@ -30,8 +30,31 @@ SITUS_BIN_DIR = pathlib.Path(user_cache_dir("situs")) / "bin"
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 SSH_TUNNEL_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-.]+\.(?:lhr\.life|lhrtunnel\.link|pinggy\.link)")
 ALL_TUNNEL_URL_PATTERN = re.compile(
-    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com|https://[a-zA-Z0-9-.]+\.(?:lhr\.life|lhrtunnel\.link|pinggy\.link)"
+    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com|https://[a-zA-Z0-9-.]+\.(?:lhr\.life|lhrtunnel\.link|pinggy\.link|cfargotunnel\.com)"
 )
+TOKEN_CONN_PATTERN = re.compile(
+    r"Registered tunnel connection|Connection [a-f0-9-]+ registered|Route propagation done|Updated to new configuration"
+)
+
+
+def _extract_token_url(token: Optional[str]) -> str:
+    """Extracts or derives a representative public URL for authenticated Cloudflare tunnels."""
+    env_url = os.environ.get("CLOUDFLARE_TUNNEL_URL")
+    if env_url:
+        return env_url
+    if token:
+        try:
+            import base64
+            import json
+            padded = token + "=" * (-len(token) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8")
+            data = json.loads(decoded)
+            tunnel_id = data.get("t")
+            if tunnel_id:
+                return f"https://{tunnel_id}.cfargotunnel.com"
+        except Exception:
+            pass
+    return "https://cloudflare-token.tunnel"
 
 _GLOBAL_TUNNEL: Optional["PublicTunnelManager"] = None
 _GLOBAL_LOCK = threading.Lock()
@@ -176,6 +199,7 @@ class PublicTunnelManager:
         self._last_error = ""
 
         # Strategy 1: User-provided Cloudflare Tunnel Token (100% immune to quick-tunnel rate limits)
+        token_error = None
         if self.token and self.cloudflared_path:
             logger.info("Starting authenticated Cloudflare Tunnel with provided token...")
             self.tunnel_type = "cloudflare_token"
@@ -183,28 +207,55 @@ class PublicTunnelManager:
             url = self._spawn_and_await_url(cmd, timeout=timeout)
             if url:
                 return url
+            token_error = self._last_error
             self.stop()
 
-        # Strategy 2: Ephemeral Cloudflare Quick Tunnel
+        # Strategy 2: Ephemeral Cloudflare Quick Tunnel (with Regional Fallback)
         if self.cloudflared_path:
             logger.info(f"Attempting Cloudflare Quick Tunnel for port {self.port}...")
             self.tunnel_type = "cloudflare_quick"
+            quick_timeout = max(timeout, 15.0)
             cmd = [
                 self.cloudflared_path,
                 "tunnel",
                 "--url",
                 f"http://127.0.0.1:{self.port}",
                 "--no-autoupdate",
+                "--edge-ip-version",
+                "4",
             ]
-            # Use responsive timeout (max 8.0s) for quick tunnel to avoid long user hangs on 429 rate limit
-            quick_timeout = min(timeout, 8.0)
             url = self._spawn_and_await_url(cmd, timeout=quick_timeout)
             if url:
                 return url
+
+            # Regional retry if 429 rate limit or edge error encountered
+            if "1015" in self._last_error or "429" in self._last_error or "rate limited" in self._last_error.lower():
+                logger.info("Retrying Cloudflare Quick Tunnel with regional edge endpoint (--region us)...")
+                self.stop()
+                reg_cmd = [
+                    self.cloudflared_path,
+                    "tunnel",
+                    "--region",
+                    "us",
+                    "--url",
+                    f"http://127.0.0.1:{self.port}",
+                    "--no-autoupdate",
+                    "--edge-ip-version",
+                    "4",
+                ]
+                url = self._spawn_and_await_url(reg_cmd, timeout=quick_timeout)
+                if url:
+                    return url
+                if not self._last_error or "255" in self._last_error or "return code" in self._last_error or "connection or network failure" in self._last_error:
+                    self._last_error = rate_limit_error
+
+            cf_error = self._last_error
             logger.warning(f"Cloudflare Quick Tunnel failed or timed out ({self._last_error}). Falling back to OpenSSH reverse tunnel...")
             self.stop()
+        else:
+            cf_error = "cloudflared binary not available"
 
-        # Strategy 3: Zero-config OpenSSH Reverse Tunnel (localhost.run / Pinggy)
+        # Strategy 3: Zero-config OpenSSH Reverse Tunnel (localhost.run)
         # Built directly into Windows 10/11 (C:\Windows\System32\OpenSSH\ssh.exe) and Linux/macOS
         ssh_bin = shutil.which("ssh") or shutil.which("ssh.exe") or (
             r"C:\Windows\System32\OpenSSH\ssh.exe" if os.path.isfile(r"C:\Windows\System32\OpenSSH\ssh.exe") else None
@@ -225,24 +276,16 @@ class PublicTunnelManager:
             url = self._spawn_and_await_url(ssh_cmd, timeout=ssh_timeout)
             if url:
                 return url
-            logger.warning("OpenSSH localhost.run tunnel failed. Attempting Pinggy fallback...")
             self.stop()
 
-            # Optional fallback to Pinggy
-            self.tunnel_type = "openssh_pinggy"
-            pinggy_cmd = [
-                ssh_bin,
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ServerAliveInterval=15",
-                "-p", "443",
-                "-R", f"0:localhost:{self.port}",
-                "a.pinggy.io",
-            ]
-            url = self._spawn_and_await_url(pinggy_cmd, timeout=6.0)
-            if url:
-                return url
-            self.stop()
+        # If all strategies failed, retain the most informative error
+        if token_error and not ("255" in token_error or "return code" in token_error):
+            self._last_error = token_error
+        elif cf_error and not ("255" in cf_error or "return code" in cf_error or "connection or network failure" in cf_error):
+            self._last_error = cf_error
+
+        if not self._last_error or "255" in self._last_error or "return code" in self._last_error or "connection or network failure" in self._last_error:
+            self._last_error = "Public WAN tunnel failed to connect (all strategies exhausted)"
 
         logger.error(f"All public tunnel strategies exhausted. Last error: {self._last_error}")
         return None
@@ -277,23 +320,43 @@ class PublicTunnelManager:
             )
             self._reader_thread.start()
 
-            if self._url_event.wait(timeout=timeout):
+            # Responsive wait loop checking for URL, stop event, or process exit
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                wait_slice = min(0.1, max(0.01, deadline - time.time()))
+                if self._url_event.wait(timeout=wait_slice):
+                    break
+                if self._stop_event.is_set():
+                    break
+                if self.process and self.process.poll() is not None:
+                    # Allow reader thread to drain final output
+                    if self._reader_thread and self._reader_thread.is_alive():
+                        self._reader_thread.join(timeout=0.2)
+                    break
+
+            if self.public_url:
                 logger.info(f"Public tunnel [{self.tunnel_type}] successfully established: {self.public_url}")
                 return self.public_url
 
             if self.process and self.process.poll() is not None:
                 rc = self.process.returncode
-                self._last_error = f"Process terminated with return code {rc}"
+                if not self._last_error:
+                    if rc == 255:
+                        self._last_error = "Process terminated (connection or network failure)"
+                    else:
+                        self._last_error = f"Process terminated with return code {rc}"
             else:
-                self._last_error = f"Timed out waiting for tunnel URL after {timeout:.1f}s"
+                if not self._last_error:
+                    self._last_error = f"Timed out waiting for tunnel URL after {timeout:.1f}s"
             return None
         except Exception as e:
-            self._last_error = str(e)
+            if not self._last_error:
+                self._last_error = str(e)
             logger.error(f"Failed spawning tunnel command {cmd[0]}: {e}")
             return None
 
     def _read_output_loop(self):
-        """Reads output stream in real time until a valid HTTPS tunnel URL is found."""
+        """Reads output stream in real time until a valid HTTPS tunnel URL or connection is found."""
         if not self.process:
             return
 
@@ -328,8 +391,11 @@ class PublicTunnelManager:
                     self._url_event.set()
                     logger.debug(f"Captured tunnel URL: {self.public_url}")
 
-                if self.process and self.process.poll() is not None:
-                    break
+                if (self.tunnel_type == "cloudflare_token" or self.token) and TOKEN_CONN_PATTERN.search(line_str):
+                    if not self.public_url:
+                        self.public_url = _extract_token_url(self.token)
+                    self._url_event.set()
+                    logger.debug(f"Captured token tunnel connection: {self.public_url}")
         except Exception:
             pass
 
