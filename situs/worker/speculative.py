@@ -25,19 +25,20 @@ class PromptLookupDrafter:
         self.ngram_size = ngram_size
         self.max_draft_tokens = max_draft_tokens
 
-    def draft_candidates(self, token_history: List[int]) -> List[int]:
+    def draft_candidates(self, token_history: List[int], system_prompt_len: Optional[int] = None) -> List[int]:
         """
         Scans past token history for matches of the last `ngram_size` tokens
         and extracts subsequent tokens as speculative candidates.
-        Includes cycle breaking to prevent infinite n-gram repetition loops.
+        Includes cycle breaking up to 16 tokens to prevent infinite n-gram repetition loops,
+        and filters out candidate phrases originating exclusively from the system prompt.
         """
         if len(token_history) < self.ngram_size + 1:
             return []
 
-        # Anti-repetition check: break runaway loops immediately
+        # Anti-repetition check: break runaway loops immediately (single-token and cycles up to 16 tokens)
         if len(token_history) >= 3 and token_history[-1] == token_history[-2] == token_history[-3]:
             return []
-        for period in (2, 3, 4):
+        for period in range(2, 17):
             if len(token_history) >= period * 2 and token_history[-period:] == token_history[-period * 2 : -period]:
                 return []
 
@@ -49,6 +50,18 @@ class PromptLookupDrafter:
             if search_window[i : i + self.ngram_size] == pattern:
                 start_idx = i + self.ngram_size
                 candidates = search_window[start_idx : start_idx + self.max_draft_tokens]
+                # Filter out candidate phrases that only appear inside the system instruction prompt
+                # (prevents drafting system instruction phrases like "distributed GPU cluster")
+                if system_prompt_len is not None and system_prompt_len > 0:
+                    if start_idx + len(candidates) <= system_prompt_len:
+                        gen_window = token_history[system_prompt_len:]
+                        cand_sub = candidates[:min(len(candidates), self.ngram_size)]
+                        appears_in_gen = any(
+                            gen_window[j : j + len(cand_sub)] == cand_sub
+                            for j in range(len(gen_window) - len(cand_sub) + 1)
+                        ) if gen_window else False
+                        if not appears_in_gen:
+                            continue
                 # Reject candidates that immediately recreate the repeating loop
                 if candidates and candidates[:self.ngram_size] == pattern:
                     continue
@@ -136,6 +149,7 @@ class SpeculativeVerifier:
                 # Rejection: accept tokens up to this point and append the target model's correction
                 return accepted, target_token
 
-        # If all candidates accepted, sample one bonus token from the last position
-        bonus_token = self.sampler.sample_next_token(logits_sequence[0, -1, :], temperature=temperature, top_p=top_p)
+        # If all candidates accepted, sample one bonus token from position K
+        bonus_idx = num_candidates if logits_sequence.shape[1] > num_candidates else -1
+        bonus_token = self.sampler.sample_next_token(logits_sequence[0, bonus_idx, :], temperature=temperature, top_p=top_p)
         return accepted, bonus_token

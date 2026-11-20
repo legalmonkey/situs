@@ -33,6 +33,7 @@ class MessageType(str, Enum):
     # Progressive JIT Layer Streaming
     STREAM_LAYER_CHUNK = "stream_layer_chunk"
     STAGE_LAYER_ACK = "stage_layer_ack"
+    REQUEST_LAYER_STREAM = "request_layer_stream"
 
     # Error
     ERROR = "error"
@@ -96,6 +97,7 @@ class InferenceStart(BaseModel):
     top_k: Optional[int] = 50
     seed: Optional[int] = None
     stop_token_ids: List[int] = Field(default_factory=list)
+    system_prompt_len: Optional[int] = None
 
 
 class ForwardActivation(BaseModel):
@@ -127,6 +129,7 @@ class SpeculativeCandidates(BaseModel):
     request_id: str
     step_index: int
     candidate_tokens: List[int]
+    position_offset: Optional[int] = None
     shape: List[int]
     dtype: str = "int8"
     scale: float = 1.0
@@ -186,6 +189,14 @@ class StageLayerAck(BaseModel):
     status: str = "ready"  # 'ready', 'loading', 'error'
     ready_layer_count: int = 1
     total_assigned: int = 0
+
+
+class RequestLayerStream(BaseModel):
+    worker_id: str
+    model_name: str
+    layer_start: int
+    layer_end: int
+    priority_entrance_first: bool = True
 
 
 class InferenceAbort(BaseModel):

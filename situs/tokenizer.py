@@ -229,26 +229,18 @@ def _resolve_and_load_tokenizer(
     # Prefer embedded GGUF tokenizer if a direct GGUF file or cached GGUF model is available
     if model_name and model_name not in ("default", "gpt2"):
         try:
-            def _is_gguf(p: str) -> bool:
-                if not (os.path.isfile(p) and os.path.getsize(p) > 10 * 1024 * 1024):
-                    return False
-                if p.lower().endswith(".gguf"):
-                    return True
-                try:
-                    with open(p, "rb") as f:
-                        return f.read(4) == b"GGUF"
-                except Exception:
-                    return False
-
-            if _is_gguf(model_name):
+            from situs.inference_backend import _is_valid_gguf_file
+            if os.path.isfile(model_name) and (model_name.lower().endswith(".gguf") or _is_valid_gguf_file(model_name)):
                 tok = GGUFTokenizerAdapter(model_name, model_name=model_name)
                 logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {model_name}")
                 return _ensure_stop_token_ids(tok, model_name)
             from situs.worker.loader import find_local_weight_files
             wfiles = find_local_weight_files(model_name)
             for wf in wfiles:
-                if _is_gguf(wf):
+                if os.path.isfile(wf) and (wf.lower().endswith(".gguf") or _is_valid_gguf_file(wf)):
                     tok = GGUFTokenizerAdapter(wf, model_name=model_name)
+                    logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {wf}")
+                    return _ensure_stop_token_ids(tok, model_name)
                     logger.info(f"Loaded exact GGUF embedded tokenizer for '{model_name}' from {wf}")
                     return _ensure_stop_token_ids(tok, model_name)
         except Exception as e:

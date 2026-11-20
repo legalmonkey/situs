@@ -239,6 +239,75 @@ class ProgressiveJITStreamer:
         repeats = (size_bytes // len(h)) + 1
         return (h * repeats)[:size_bytes]
 
+    def extract_and_cache_layer(self, layer_index: int) -> Optional[pathlib.Path]:
+        """
+        Dynamically extracts a transformer layer from local verified model weights
+        (GGUF or Safetensors) and persists it to the layer cache for progressive streaming.
+        """
+        if is_layer_cached(self.model_name, layer_index, self.cache_dir):
+            return get_layer_cache_path(self.model_name, layer_index, self.cache_dir)
+
+        from situs.worker.loader import find_local_weight_files
+        wfiles = find_local_weight_files(self.model_name)
+        if not wfiles:
+            return None
+
+        # 1. Check GGUF files
+        gguf_files = [f for f in wfiles if f.endswith(".gguf") and os.path.isfile(f)]
+        if gguf_files and HAS_TORCH:
+            try:
+                import gguf
+                reader = gguf.GGUFReader(gguf_files[0])
+                prefix = f"blk.{layer_index}."
+                matched = [t for t in reader.tensors if t.name.startswith(prefix)]
+                if matched:
+                    from situs.worker.loader import _dequantize_gguf_tensor_fast
+                    layer_state = {}
+                    for t in matched:
+                        short_k = t.name[len(prefix):]
+                        layer_state[short_k] = _dequantize_gguf_tensor_fast(t, out_dtype=torch.float16, target_device="cpu")
+                    reader.close()
+
+                    try:
+                        import safetensors.torch
+                        data = safetensors.torch.save(layer_state, metadata={"layer_idx": str(layer_index)})
+                    except Exception:
+                        import io
+                        buf = io.BytesIO()
+                        torch.save(layer_state, buf)
+                        data = buf.getvalue()
+                    return save_layer_to_cache(self.model_name, layer_index, data, self.cache_dir)
+            except Exception as e:
+                logger.debug(f"GGUF layer extraction failed for layer {layer_index}: {e}")
+
+        # 2. Check Safetensors files
+        sf_files = [f for f in wfiles if f.endswith(".safetensors") and os.path.isfile(f)]
+        if sf_files and HAS_TORCH:
+            try:
+                import safetensors.torch
+                prefixes = (
+                    f"model.layers.{layer_index}.",
+                    f"language_model.model.layers.{layer_index}.",
+                    f"layers.{layer_index}.",
+                    f"blk.{layer_index}.",
+                )
+                layer_state = {}
+                for sf in sf_files:
+                    with safetensors.safe_open(sf, framework="pt", device="cpu") as f:
+                        for k in f.keys():
+                            for p in prefixes:
+                                if k.startswith(p):
+                                    short_k = k[len(p):]
+                                    layer_state[short_k] = f.get_tensor(k)
+                                    break
+                if layer_state:
+                    data = safetensors.torch.save(layer_state, metadata={"layer_idx": str(layer_index)})
+                    return save_layer_to_cache(self.model_name, layer_index, data, self.cache_dir)
+            except Exception as e:
+                logger.debug(f"Safetensors layer extraction failed for layer {layer_index}: {e}")
+
+        return None
+
     def create_layer_chunks(
         self,
         layer_index: int,
@@ -247,6 +316,7 @@ class ProgressiveJITStreamer:
         shape: Optional[List[int]] = None,
         scale: float = 1.0,
         dtype: str = "int8",
+        extract_from_disk: bool = False,
     ) -> List[StreamLayerChunk]:
         """
         Splits a single layer's serialized weights into `StreamLayerChunk` frames.
@@ -256,6 +326,10 @@ class ProgressiveJITStreamer:
         if payload_bytes is None:
             # Check local cache first
             cached = load_layer_from_cache(self.model_name, layer_index, self.cache_dir)
+            if cached is None and extract_from_disk:
+                self.extract_and_cache_layer(layer_index)
+                cached = load_layer_from_cache(self.model_name, layer_index, self.cache_dir)
+
             if cached is not None and (is_valid_layer_payload(cached) or not ("test" in self.model_name or self.allow_synthetic)):
                 payload_bytes = cached
             elif self.allow_synthetic or self.model_name.startswith("test") or "test" in self.model_name:
@@ -349,6 +423,7 @@ class ProgressiveJITStreamer:
         layer_start: int,
         layer_end: int,
         priority_entrance_first: bool = True,
+        extract_from_disk: bool = True,
     ) -> Iterator[StreamLayerChunk]:
         """
         Synchronous generator yielding StreamLayerChunk frames in prioritized order.
@@ -372,6 +447,7 @@ class ProgressiveJITStreamer:
             chunks = self.create_layer_chunks(
                 layer_index=layer_idx,
                 total_stage_layers=total_stage_layers,
+                extract_from_disk=extract_from_disk,
             )
             for chunk in chunks:
                 yield chunk
@@ -382,12 +458,18 @@ class ProgressiveJITStreamer:
         layer_end: int,
         priority_entrance_first: bool = True,
         inter_chunk_delay: float = 0.0,
+        extract_from_disk: bool = True,
     ) -> AsyncGenerator[StreamLayerChunk, None]:
         """
         Async generator yielding StreamLayerChunk frames, allowing cooperative
         event-loop scheduling and simulated/throttled wire streaming.
         """
-        for chunk in self.stream_stage_layers(layer_start, layer_end, priority_entrance_first):
+        for chunk in self.stream_stage_layers(
+            layer_start,
+            layer_end,
+            priority_entrance_first=priority_entrance_first,
+            extract_from_disk=extract_from_disk,
+        ):
             yield chunk
             if inter_chunk_delay > 0:
                 await asyncio.sleep(inter_chunk_delay)

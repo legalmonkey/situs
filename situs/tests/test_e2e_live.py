@@ -4,6 +4,7 @@ import pytest
 import asyncio
 import httpx
 import uvicorn
+from unittest.mock import patch
 from contextlib import asynccontextmanager
 from situs.config import WorkerConfig
 from situs.coordinator.app import app, registry
@@ -11,7 +12,8 @@ from situs.worker.client import WorkerDaemon
 
 
 @pytest.mark.asyncio
-async def test_live_websocket_cluster_e2e():
+@patch("situs.hardware.get_system_ram_and_cpu", return_value=(16 * 1024**3, 12 * 1024**3, "CPU"))
+async def test_live_websocket_cluster_e2e(mock_ram):
     registry.clear()
     port = 8765
     server_config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")

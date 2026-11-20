@@ -27,6 +27,7 @@ from situs.protocol.messages import (
     SpeculativeVerified,
     StreamLayerChunk,
     StageLayerAck,
+    RequestLayerStream,
     Heartbeat,
 )
 from situs.worker.loader import load_hf_stage_model
@@ -47,6 +48,7 @@ class WorkerDaemon:
         self.config = config
         self.worker_id = config.worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.engine: Optional[StageExecutionEngine] = None
+        self.assignment: Optional[AssignLayers] = None
         self.engine_ready_event = asyncio.Event()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.p2p_nodes: Dict[str, P2PDataChannelNode] = {}
@@ -58,6 +60,8 @@ class WorkerDaemon:
         self.last_error: Optional[str] = None
         self.engine_error: Optional[str] = None
         self._cached_hw = None
+        self.active_inference_tasks: Dict[str, asyncio.Task] = {}
+        self.native_server: Optional[Any] = None
 
     @property
     def running(self) -> bool:
@@ -83,6 +87,16 @@ class WorkerDaemon:
     def stop(self):
         """Signals the daemon to shut down and disconnects WebSocket and P2P direct channel."""
         self.is_running = False
+        if self.native_server is not None:
+            try:
+                self.native_server.stop()
+            except Exception:
+                pass
+            self.native_server = None
+        for task in list(self.active_inference_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self.active_inference_tasks.clear()
         loop = getattr(self, "_loop", None)
         if self.p2p_nodes and loop and loop.is_running():
             for node in list(self.p2p_nodes.values()):
@@ -116,6 +130,7 @@ class WorkerDaemon:
         try:
             frame = ProtocolFrame.model_validate_json(message)
             if frame.type in (
+                MessageType.INFERENCE_START,
                 MessageType.FORWARD_ACTIVATION,
                 MessageType.NEXT_TOKEN,
                 MessageType.SPECULATIVE_CANDIDATES,
@@ -139,30 +154,83 @@ class WorkerDaemon:
                 out_frame = await asyncio.to_thread(self.engine.process_forward_activation, act_frame)
                 if out_frame:
                     await self.send_frame_out(out_frame)
-            elif frame.type == MessageType.SPECULATIVE_CANDIDATES and self.engine:
+            elif frame.type == MessageType.SPECULATIVE_CANDIDATES:
+                if not self.engine:
+                    cand_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                    await self._emit_inference_error(
+                        cand_req,
+                        self.engine_error or f"Worker '{self.worker_id}' has no active pipeline engine loaded.",
+                    )
+                    return
                 cand_frame = SpeculativeCandidates.model_validate(frame.payload)
                 out_frame = await asyncio.to_thread(self.engine.process_speculative_candidates, cand_frame)
                 if out_frame:
                     await self.send_frame_out(out_frame)
-            elif frame.type == MessageType.SPECULATIVE_VERIFIED and self.engine:
+            elif frame.type == MessageType.SPECULATIVE_VERIFIED:
+                if not self.engine:
+                    ver_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                    await self._emit_inference_error(
+                        ver_req,
+                        self.engine_error or f"Worker '{self.worker_id}' has no active pipeline engine loaded.",
+                    )
+                    return
                 ver_frame = SpeculativeVerified.model_validate(frame.payload)
                 out_frame = await asyncio.to_thread(self.engine.process_speculative_verified, ver_frame)
                 if out_frame:
                     await self.send_frame_out(out_frame)
-            elif frame.type == MessageType.NEXT_TOKEN and self.engine:
+            elif frame.type == MessageType.NEXT_TOKEN:
+                if not self.engine:
+                    tok_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                    await self._emit_inference_error(
+                        tok_req,
+                        self.engine_error or f"Worker '{self.worker_id}' has no active pipeline engine loaded.",
+                    )
+                    return
                 tok_frame = NextToken.model_validate(frame.payload)
                 out_frame = await asyncio.to_thread(self.engine.process_next_token, tok_frame)
                 if out_frame:
                     await self.send_frame_out(out_frame)
+            elif frame.type == MessageType.INFERENCE_START:
+                if not self.engine:
+                    start_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                    await self._emit_inference_error(
+                        start_req,
+                        self.engine_error or f"Worker '{self.worker_id}' has no active pipeline engine loaded.",
+                    )
+                    return
+                start_msg = InferenceStart.model_validate(frame.payload)
+                if self.engine.is_first_stage() and self.engine.is_last_stage():
+                    t = asyncio.create_task(self._run_single_worker_loop(start_msg))
+                    self.active_inference_tasks[start_msg.request_id] = t
+                elif self.engine.is_first_stage():
+                    out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
+                    if out_frame:
+                        await self.send_frame_out(out_frame)
+                else:
+                    self.engine.session_configs[start_msg.request_id] = start_msg
+                    self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
+                    self.engine.session_step_counts[start_msg.request_id] = len(start_msg.input_ids)
             elif frame.type == MessageType.STREAM_LAYER_CHUNK and self.engine:
                 chunk = StreamLayerChunk.model_validate(frame.payload)
                 out_frame = await asyncio.to_thread(self.engine.process_layer_chunk, chunk, frame.source)
                 if out_frame:
                     await self.send_frame_out(out_frame)
+            elif frame.type == MessageType.REQUEST_LAYER_STREAM:
+                req = RequestLayerStream.model_validate(frame.payload)
+                asyncio.create_task(self._stream_layers_to_peer(req, frame.source))
+            elif frame.type == MessageType.STAGE_LAYER_ACK:
+                ack = StageLayerAck.model_validate(frame.payload)
+                logger.info(
+                    f"Stream ACK from '{frame.source}': Layer {ack.layer_index} {ack.status} "
+                    f"({ack.ready_layer_count}/{ack.total_assigned} ready)"
+                )
             elif frame.type == MessageType.INFERENCE_ABORT and self.engine:
                 req_id = frame.payload.get("request_id")
                 if req_id:
                     self.engine.abort_inference(req_id)
+                    task = self.active_inference_tasks.pop(req_id, None)
+                    if task and not task.done():
+                        task.cancel()
             elif frame.type == MessageType.INFERENCE_FINISH and self.engine:
                 req_id = frame.payload.get("request_id")
                 if req_id:
@@ -182,7 +250,13 @@ class WorkerDaemon:
         # but if already delivered via direct P2P, mark target="coordinator" so the
         # Coordinator RelayHub does NOT re-route or reflect the frame back to the worker!
         if sent_p2p:
-            if out_frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED, MessageType.INFERENCE_FINISH, MessageType.ERROR):
+            should_send_to_coordinator = False
+            if out_frame.type == MessageType.SPECULATIVE_VERIFIED:
+                should_send_to_coordinator = bool(self.engine and self.engine.is_last_stage())
+            elif out_frame.type in (MessageType.NEXT_TOKEN, MessageType.INFERENCE_FINISH, MessageType.ERROR):
+                should_send_to_coordinator = True
+
+            if should_send_to_coordinator:
                 coord_frame = out_frame.model_copy()
                 coord_frame.target = "coordinator"
                 if self.ws:
@@ -196,6 +270,39 @@ class WorkerDaemon:
                     await self.ws.send(frame_json)
                 except Exception as e:
                     logger.debug(f"Failed to send frame: {e}")
+
+    async def _stream_layers_to_peer(self, req: RequestLayerStream, target_peer: str):
+        """Streams assigned layer chunks asynchronously across P2P / Relay to a downstream worker."""
+        try:
+            from situs.worker.jit_streamer import ProgressiveJITStreamer
+            streamer = ProgressiveJITStreamer(
+                model_name=req.model_name,
+                allow_synthetic=False,
+            )
+            logger.info(
+                f"Starting wire streaming to '{target_peer}' for '{req.model_name}' "
+                f"stage [{req.layer_start}..{req.layer_end}) (entrance first={req.priority_entrance_first})..."
+            )
+            async for chunk in streamer.stream_stage_layers_async(
+                layer_start=req.layer_start,
+                layer_end=req.layer_end,
+                priority_entrance_first=req.priority_entrance_first,
+                extract_from_disk=True,
+            ):
+                if not self.is_running:
+                    break
+                chunk_frame = ProtocolFrame(
+                    type=MessageType.STREAM_LAYER_CHUNK,
+                    source=self.worker_id,
+                    target=target_peer,
+                    payload=chunk.model_dump(),
+                )
+                await self.send_frame_out(chunk_frame)
+            logger.info(
+                f"Completed wire streaming to '{target_peer}' for stage [{req.layer_start}..{req.layer_end})."
+            )
+        except Exception as e:
+            logger.error(f"Error streaming layers to peer '{target_peer}': {e}", exc_info=True)
 
     def query_gpu_info(self):
         try:
@@ -276,6 +383,86 @@ class WorkerDaemon:
                 await self.ws.send(err_frame.model_dump_json())
             except Exception as send_err:
                 logger.debug(f"Failed sending ERROR frame to coordinator: {send_err}")
+
+    async def _run_single_worker_loop(self, start_msg: InferenceStart):
+        """Short-circuits the single-worker token generation loop in-memory without WebSocket roundtrips."""
+        req_id = start_msg.request_id
+        try:
+            if self.assignment and self.assignment.is_first_stage and self.assignment.is_last_stage:
+                if self.native_server is None:
+                    from situs.inference_backend import NativeInferenceServer, find_gguf_file
+                    gguf_file = find_gguf_file(self.assignment.model_name)
+                    if gguf_file:
+                        self.native_server = NativeInferenceServer()
+                        await asyncio.to_thread(self.native_server.start, self.assignment.model_name, gguf_file)
+                elif not self.native_server.is_ready():
+                    logger.info(f"Native server inactive; auto-restarting for model '{self.assignment.model_name}'...")
+                    await asyncio.to_thread(self.native_server.start, self.assignment.model_name)
+
+            if self.native_server and self.native_server.is_ready():
+                step_idx = 0
+                async for tok in self.native_server.stream_inference(start_msg):
+                    if not self.is_running or (self.engine and self.engine.cancellation_tokens.is_cancelled(req_id)):
+                        break
+                    tok.step_index = step_idx
+                    step_idx += 1
+                    coord_frame = ProtocolFrame(
+                        type=MessageType.NEXT_TOKEN,
+                        source=self.worker_id,
+                        target="coordinator",
+                        payload=tok.model_dump(),
+                    )
+                    await self.send_frame_out(coord_frame)
+                    if tok.is_finished:
+                        break
+                return
+
+            if not self.engine:
+                await self._emit_inference_error(
+                    req_id,
+                    self.engine_error or f"Worker '{self.worker_id}' has no active pipeline engine loaded.",
+                )
+                return
+
+            out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
+            curr_frame = out_frame
+
+            while self.is_running and curr_frame is not None:
+                if not self.engine:
+                    break
+                if self.engine.cancellation_tokens.is_cancelled(req_id) or req_id in self.engine.finished_sessions:
+                    break
+
+                if curr_frame.type == MessageType.ERROR:
+                    await self.send_frame_out(curr_frame)
+                    break
+
+                # Route frame to coordinator for SSE streaming with target="coordinator"
+                # so the coordinator relay streams to client without reflecting back into the pipeline ring.
+                coord_frame = curr_frame.model_copy()
+                coord_frame.target = "coordinator"
+                await self.send_frame_out(coord_frame)
+
+                payload = curr_frame.payload
+                is_finished = payload.get("is_finished", False) if isinstance(payload, dict) else False
+                if is_finished:
+                    break
+
+                if curr_frame.type == MessageType.NEXT_TOKEN:
+                    tok = NextToken.model_validate(payload)
+                    curr_frame = await asyncio.to_thread(self.engine.process_next_token, tok)
+                elif curr_frame.type == MessageType.SPECULATIVE_VERIFIED:
+                    ver = SpeculativeVerified.model_validate(payload)
+                    curr_frame = await asyncio.to_thread(self.engine.process_speculative_verified, ver)
+                else:
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in single-worker token loop for request {req_id}: {e}", exc_info=True)
+            await self._emit_inference_error(req_id, str(e))
+        finally:
+            self.active_inference_tasks.pop(req_id, None)
 
     async def send_heartbeat_once(self):
         """Send a single immediate telemetry heartbeat (e.g. right after loading model weights)."""
@@ -418,10 +605,52 @@ class WorkerDaemon:
                                         if HAS_TORCH and torch.cuda.is_available():
                                             torch.cuda.empty_cache()
                                     assign = AssignLayers.model_validate(frame.payload)
+                                    self.assignment = assign
                                     logger.info(
                                         f"Assigned layers [{assign.layer_start}..{assign.layer_end}) of {assign.model_name}. "
                                         f"First={assign.is_first_stage}, Last={assign.is_last_stage}"
                                     )
+
+                                    # 1. Native Fused Server Acceleration for Single-Node Full Allocation
+                                    is_single_node = (assign.is_first_stage and assign.is_last_stage)
+                                    if not is_single_node and self.native_server:
+                                        logger.info(f"Worker '{self.worker_id}' transitioned to multi-node pipeline; stopping native server.")
+                                        try:
+                                            self.native_server.stop()
+                                        except Exception:
+                                            pass
+                                        self.native_server = None
+
+                                    if is_single_node:
+                                        from situs.inference_backend import NativeInferenceServer, find_gguf_file
+                                        gguf_file = find_gguf_file(assign.model_name)
+                                        if gguf_file:
+                                            if self.native_server is None:
+                                                self.native_server = NativeInferenceServer()
+                                            if not self.native_server.is_ready() or self.native_server.model_name != assign.model_name:
+                                                started = await asyncio.to_thread(self.native_server.start, assign.model_name, gguf_file)
+                                                if started:
+                                                    logger.info(
+                                                        f"Worker '{self.worker_id}' single-node accelerated by native server on "
+                                                        f"{self.native_server.base_url} (fused GPU kernels, ~30-40 t/s)."
+                                                    )
+                                                    self.engine = None
+                                                    self.engine_ready_event.set()
+                                                    try:
+                                                        await self.send_heartbeat_once()
+                                                    except Exception:
+                                                        pass
+                                                    continue
+                                                else:
+                                                    logger.warning(
+                                                        f"Could not start native server for '{assign.model_name}'; "
+                                                        f"falling back to PyTorch stage model execution."
+                                                    )
+                                                    try:
+                                                        self.native_server.stop()
+                                                    except Exception:
+                                                        pass
+                                                    self.native_server = None
                                     from situs.coordinator.registry import resolve_model_metadata
                                     from situs.worker.loader import is_architecture_supported, find_local_weight_files
                                     try:
@@ -534,6 +763,12 @@ class WorkerDaemon:
                                 logger.info(f"Worker '{self.worker_id}': Received UNLOAD_MODEL signal. Freeing GPU memory...")
                                 self.engine_ready_event.clear()
                                 self.engine_error = None
+                                if self.native_server is not None:
+                                    try:
+                                        self.native_server.stop()
+                                    except Exception:
+                                        pass
+                                    self.native_server = None
                                 if self.engine is not None:
                                     self.engine = None
                                 import gc
@@ -574,19 +809,24 @@ class WorkerDaemon:
                                 except asyncio.TimeoutError:
                                     logger.error(f"Worker {self.worker_id}: Engine not ready for INFERENCE_START within {eng_timeout}s")
                                 start_msg = InferenceStart.model_validate(frame.payload)
-                                if not self.engine:
+                                has_native = bool(self.native_server and self.native_server.is_ready())
+                                if not self.engine and not has_native:
                                     await self._emit_inference_error(
                                         start_msg.request_id,
                                         self.engine_error or f"Worker '{self.worker_id}' has no loaded model engine for '{start_msg.model_name}'.",
                                     )
                                     continue
-                                if self.engine.is_first_stage():
+                                if has_native or (self.engine and self.engine.is_first_stage() and self.engine.is_last_stage()):
+                                    t = asyncio.create_task(self._run_single_worker_loop(start_msg))
+                                    self.active_inference_tasks[start_msg.request_id] = t
+                                elif self.engine and self.engine.is_first_stage():
                                     out_frame = await asyncio.to_thread(self.engine.start_inference, start_msg)
                                     if out_frame:
                                         await self.send_frame_out(out_frame)
-                                else:
+                                elif self.engine:
                                     self.engine.session_configs[start_msg.request_id] = start_msg
                                     self.engine.session_token_histories[start_msg.request_id] = list(start_msg.input_ids)
+                                    self.engine.session_step_counts[start_msg.request_id] = len(start_msg.input_ids)
     
                             elif frame.type == MessageType.FORWARD_ACTIVATION:
                                 eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
@@ -606,25 +846,58 @@ class WorkerDaemon:
                                     await self.send_frame_out(out_frame)
     
                             elif frame.type == MessageType.SPECULATIVE_CANDIDATES:
-                                if self.engine:
-                                    cand_frame = SpeculativeCandidates.model_validate(frame.payload)
-                                    out_frame = await asyncio.to_thread(self.engine.process_speculative_candidates, cand_frame)
-                                    if out_frame:
-                                        await self.send_frame_out(out_frame)
+                                eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
+                                try:
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=eng_timeout)
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for SPECULATIVE_CANDIDATES within {eng_timeout}s")
+                                cand_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                                if not self.engine:
+                                    await self._emit_inference_error(
+                                        cand_req,
+                                        self.engine_error or f"Worker '{self.worker_id}' has no loaded pipeline stage to process speculative candidates.",
+                                    )
+                                    continue
+                                cand_frame = SpeculativeCandidates.model_validate(frame.payload)
+                                out_frame = await asyncio.to_thread(self.engine.process_speculative_candidates, cand_frame)
+                                if out_frame:
+                                    await self.send_frame_out(out_frame)
     
                             elif frame.type == MessageType.SPECULATIVE_VERIFIED:
-                                if self.engine:
-                                    ver_frame = SpeculativeVerified.model_validate(frame.payload)
-                                    out_frame = await asyncio.to_thread(self.engine.process_speculative_verified, ver_frame)
-                                    if out_frame:
-                                        await self.send_frame_out(out_frame)
+                                eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
+                                try:
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=eng_timeout)
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for SPECULATIVE_VERIFIED within {eng_timeout}s")
+                                ver_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                                if not self.engine:
+                                    await self._emit_inference_error(
+                                        ver_req,
+                                        self.engine_error or f"Worker '{self.worker_id}' has no loaded pipeline stage to process speculative verified.",
+                                    )
+                                    continue
+                                ver_frame = SpeculativeVerified.model_validate(frame.payload)
+                                out_frame = await asyncio.to_thread(self.engine.process_speculative_verified, ver_frame)
+                                if out_frame:
+                                    await self.send_frame_out(out_frame)
     
                             elif frame.type == MessageType.NEXT_TOKEN:
-                                if self.engine:
-                                    tok_frame = NextToken.model_validate(frame.payload)
-                                    out_frame = await asyncio.to_thread(self.engine.process_next_token, tok_frame)
-                                    if out_frame:
-                                        await self.send_frame_out(out_frame)
+                                eng_timeout = getattr(self.config, "engine_ready_timeout_s", 120.0)
+                                try:
+                                    await asyncio.wait_for(self.engine_ready_event.wait(), timeout=eng_timeout)
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Worker {self.worker_id}: Engine not ready for NEXT_TOKEN within {eng_timeout}s")
+                                tok_req = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                                if not self.engine:
+                                    await self._emit_inference_error(
+                                        tok_req,
+                                        self.engine_error or f"Worker '{self.worker_id}' has no loaded pipeline stage to process next token.",
+                                    )
+                                    continue
+                                tok_frame = NextToken.model_validate(frame.payload)
+                                out_frame = await asyncio.to_thread(self.engine.process_next_token, tok_frame)
+                                if out_frame:
+                                    await self.send_frame_out(out_frame)
     
                             elif frame.type == MessageType.STREAM_LAYER_CHUNK:
                                 if self.engine:
@@ -632,18 +905,31 @@ class WorkerDaemon:
                                     out_frame = await asyncio.to_thread(self.engine.process_layer_chunk, chunk, frame.source)
                                     if out_frame:
                                         await self.send_frame_out(out_frame)
+
+                            elif frame.type == MessageType.REQUEST_LAYER_STREAM:
+                                req = RequestLayerStream.model_validate(frame.payload)
+                                asyncio.create_task(self._stream_layers_to_peer(req, frame.source))
+
+                            elif frame.type == MessageType.STAGE_LAYER_ACK:
+                                ack = StageLayerAck.model_validate(frame.payload)
+                                logger.info(
+                                    f"Stream ACK from '{frame.source}': Layer {ack.layer_index} {ack.status} "
+                                    f"({ack.ready_layer_count}/{ack.total_assigned} ready)"
+                                )
     
                             elif frame.type == MessageType.INFERENCE_ABORT:
-                                if self.engine:
-                                    req_id = frame.payload.get("request_id")
-                                    if req_id:
+                                req_id = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                                if req_id:
+                                    if self.engine:
                                         self.engine.abort_inference(req_id)
+                                    task = self.active_inference_tasks.pop(req_id, None)
+                                    if task and not task.done():
+                                        task.cancel()
 
                             elif frame.type == MessageType.INFERENCE_FINISH:
-                                if self.engine:
-                                    req_id = frame.payload.get("request_id")
-                                    if req_id:
-                                        self.engine.process_inference_finish(req_id)
+                                req_id = frame.payload.get("request_id") if isinstance(frame.payload, dict) else None
+                                if req_id and self.engine:
+                                    self.engine.process_inference_finish(req_id)
 
                             elif frame.type == MessageType.WORKER_REMOVED:
                                 logger.info(f"Worker '{self.worker_id}' received WORKER_REMOVED from coordinator. Terminating daemon cleanly.")

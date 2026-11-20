@@ -233,18 +233,21 @@ def resolve_model_metadata(model_name: str) -> Dict[str, Any]:
     def _apply_inferred_precision(res: Dict[str, Any]) -> Dict[str, Any]:
         model_name_lower = model_name.lower()
         tag = model_name_lower.split(":", 1)[1] if ":" in model_name_lower else model_name_lower
+        from situs.inference_backend import HF_MODEL_REGISTRY_MAP
+        canon = HF_MODEL_REGISTRY_MAP.get(model_name_lower, model_name_lower).lower()
+        search_corpus = f"{model_name_lower} {tag} {canon}"
         inferred = None
-        if any(q in tag for q in ("q8", "int8", "fp8", "8bit")):
+        if any(q in search_corpus for q in ("q8", "int8", "fp8", "8bit")):
             inferred = "int8"
-        elif any(q in tag for q in ("q6", "int6", "6bit")):
+        elif any(q in search_corpus for q in ("q6", "int6", "6bit")):
             inferred = "int6"
-        elif any(q in tag for q in ("q5", "int5", "5bit")):
+        elif any(q in search_corpus for q in ("q5", "int5", "5bit")):
             inferred = "int5"
-        elif any(q in tag for q in ("q4", "int4", "4bit")):
+        elif any(q in search_corpus for q in ("q4", "int4", "4bit", "qat-q4", "q4_0", "q4_k")):
             inferred = "int4"
-        elif any(q in tag for q in ("fp16", "bf16", "16bit", "half")):
+        elif any(q in search_corpus for q in ("fp16", "bf16", "16bit", "half")):
             inferred = "bfloat16"
-        elif any(q in tag for q in ("fp32", "32bit")):
+        elif any(q in search_corpus for q in ("fp32", "32bit")):
             inferred = "float32"
 
         if inferred:
@@ -664,6 +667,7 @@ class WorkerRegistry:
         self.workers: Dict[str, WorkerNode] = {}
         self.active_model: Optional[str] = None
         self.total_layers: int = 0
+        self.progressive_mode: bool = False
 
     def clear(self):
         """Clears all registered workers and resets state."""
