@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Distributed GPU pooling and LLM inference across residential internet",
   "bin": {
-    "situs": "./bin/situs.js",
-    "situs-cli": "./bin/situs.js"
+    "situs": "bin/situs.js",
+    "situs-cli": "bin/situs.js"
   },
   "files": [
     "bin",
@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/legalmonkey/situs.git"
+    "url": "git+https://github.com/legalmonkey/situs.git"
   },
   "homepage": "https://github.com/legalmonkey/situs#readme",
   "bugs": {
