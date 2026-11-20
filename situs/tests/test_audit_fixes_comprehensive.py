@@ -103,22 +103,23 @@ def test_worker_query_gpu_info_accounts_for_external_vram():
 
     with patch("situs.worker.client.HAS_TORCH", True):
         with patch("torch.cuda.is_available", return_value=True):
-            with patch("torch.cuda.mem_get_info", return_value=(free_b, total_b)):
-                with patch("torch.cuda.memory_allocated", return_value=alloc_b):
-                    with patch("situs.hardware.detect_hardware") as mock_det:
-                        mock_det.return_value = MagicMock(
-                            device="cuda:0",
-                            device_name="NVIDIA GeForce RTX 4070",
-                            total_memory_bytes=total_b,
-                            free_memory_bytes=free_b,
-                            device_type="cuda",
-                            used_memory_bytes=total_b - free_b,
-                        )
-                        name, tot, free, dev_t, used = worker.query_gpu_info()
+            with patch("situs.hardware.get_live_gpu_vram", return_value=(0, 0, 0)):
+                with patch("torch.cuda.mem_get_info", return_value=(free_b, total_b)):
+                    with patch("torch.cuda.memory_allocated", return_value=alloc_b):
+                        with patch("situs.hardware.detect_hardware") as mock_det:
+                            mock_det.return_value = MagicMock(
+                                device="cuda:0",
+                                device_name="NVIDIA GeForce RTX 4070",
+                                total_memory_bytes=total_b,
+                                free_memory_bytes=free_b,
+                                device_type="cuda",
+                                used_memory_bytes=total_b - free_b,
+                            )
+                            name, tot, free, dev_t, used = worker.query_gpu_info()
 
-                        # used should be 3 GB (total - free), NOT 0 bytes
-                        assert used == total_b - free_b
-                        assert used == 3 * 1024**3
+                            # used should be 3 GB (total - free), NOT 0 bytes
+                            assert used == total_b - free_b
+                            assert used == 3 * 1024**3
 
 
 @pytest.mark.asyncio

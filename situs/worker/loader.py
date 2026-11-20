@@ -312,8 +312,8 @@ def _resolve_layer_sliding_and_rope(
     rope_local_base_freq: Optional[float] = None,
     sliding_window: Optional[int] = None,
     sliding_window_pattern: Optional[int] = None,
-) -> Tuple[float, Optional[int]]:
-    """Compute per-layer RoPE base frequency and active sliding window size."""
+) -> Tuple[float, Optional[int], float]:
+    """Compute per-layer RoPE base frequency, active sliding window size, and linear RoPE scaling factor."""
     base_theta = float(rope_theta if rope_theta is not None else spec["rope_theta"])
     local_theta = float(
         rope_local_base_freq
@@ -322,17 +322,20 @@ def _resolve_layer_sliding_and_rope(
     )
     sw = sliding_window if sliding_window is not None else spec["sliding_window"]
     rule = spec.get("sliding_rule", "none")
+    is_gemma3 = str(spec.get("family", "")).lower() == "gemma3"
+
     if rule == "even":
         # Gemma2 alternates sliding attention on even layers and full attention on odd layers.
-        return base_theta, (sw if (layer_idx % 2 == 0) else None)
+        return base_theta, (sw if (layer_idx % 2 == 0) else None), 1.0
     if rule == "pattern":
         # Gemma3 uses local sliding attention except on every N-th (typically 6th) full layer.
         pattern = sliding_window_pattern if sliding_window_pattern is not None else (spec["sliding_window_pattern"] or 6)
         is_sliding = ((layer_idx + 1) % pattern) != 0
-        return (local_theta if is_sliding else base_theta), (sw if is_sliding else None)
+        scale = 1.0 if is_sliding else (8.0 if is_gemma3 else 1.0)
+        return (local_theta if is_sliding else base_theta), (sw if is_sliding else None), scale
     if rule == "all":
-        return base_theta, sw
-    return base_theta, sw
+        return base_theta, sw, 1.0
+    return base_theta, sw, (8.0 if (is_gemma3 and sw is None) else 1.0)
 
 
 class RMSNorm(nn.Module if HAS_TORCH else object):
@@ -360,13 +363,16 @@ class RMSNorm(nn.Module if HAS_TORCH else object):
 
 class RotaryEmbedding(nn.Module if HAS_TORCH else object):
     """Rotary Position Embedding (RoPE) for relative attention."""
-    def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0):
+    def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0, scaling_factor: float = 1.0):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
+        self.scaling_factor = float(scaling_factor) if scaling_factor is not None else 1.0
         if HAS_TORCH:
             inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+            if self.scaling_factor != 1.0 and self.scaling_factor > 0:
+                inv_freq = inv_freq / self.scaling_factor
             self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
@@ -484,6 +490,7 @@ class Int8WeightLinear(nn.Module if HAS_TORCH else object):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self._cached_weight: Optional[Any] = None
         if HAS_TORCH:
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
@@ -500,6 +507,8 @@ class Int8WeightLinear(nn.Module if HAS_TORCH else object):
         return cls(weight_tensor.shape[1], weight_tensor.shape[0], q, scale, b)
 
     def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+
         if self.out_features > 32768:
             chunk_size = 16384
             out_chunks = []
@@ -510,28 +519,8 @@ class Int8WeightLinear(nn.Module if HAS_TORCH else object):
                 out_chunks.append(F.linear(x, w_chunk, b_chunk))
                 del w_chunk
             return torch.cat(out_chunks, dim=-1)
-        elif self.out_features >= 2048 and (self.weight.numel() > 1024 * 1024 or self.out_features > 4096):
-            chunk_size = 2048
-            out_chunks = []
-            for start_idx in range(0, self.out_features, chunk_size):
-                end_idx = min(start_idx + chunk_size, self.out_features)
-                try:
-                    w_chunk = self.weight[start_idx:end_idx].to(dtype=x.dtype) * self.weight_scale[start_idx:end_idx].to(dtype=x.dtype)
-                except torch.OutOfMemoryError:
-                    if HAS_TORCH and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    w_chunk = self.weight[start_idx:end_idx].to(dtype=x.dtype) * self.weight_scale[start_idx:end_idx].to(dtype=x.dtype)
-                b_chunk = self.bias[start_idx:end_idx].to(dtype=x.dtype) if self.bias is not None else None
-                out_chunks.append(F.linear(x, w_chunk, b_chunk))
-                del w_chunk
-            return torch.cat(out_chunks, dim=-1)
-        try:
-            w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
-        except torch.OutOfMemoryError:
-            if HAS_TORCH and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
-        b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+
+        w = self.weight.to(dtype=x.dtype) * self.weight_scale.to(dtype=x.dtype)
         res = F.linear(x, w, b)
         del w
         return res
@@ -587,6 +576,71 @@ def set_norm_unit_offset(module: Any, is_gemma_offset: bool) -> None:
             child.is_gemma = is_gemma_offset
 
 
+class Int4WeightLinear(nn.Module if HAS_TORCH else object):
+    """Compact symmetric per-block-32 INT4 linear layer cutting GPU VRAM 4x vs float16."""
+    def __init__(self, in_features: int, out_features: int, packed_weight: Any, weight_scale: Any, bias: Optional[Any] = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self._cached_weight: Optional[Any] = None
+        if HAS_TORCH:
+            self.packed_weight = nn.Parameter(packed_weight, requires_grad=False)
+            self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+            self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
+
+    @classmethod
+    def from_float(cls, weight_tensor: "torch.Tensor", bias_tensor: Optional["torch.Tensor"] = None, block_size: int = 32) -> "Int4WeightLinear":
+        out_f, in_f = weight_tensor.shape
+        pad = (block_size - (in_f % block_size)) % block_size
+        if pad > 0:
+            w_work = F.pad(weight_tensor.float(), (0, pad))
+        else:
+            w_work = weight_tensor.float()
+        nb = w_work.shape[1] // block_size
+        w_blk = w_work.view(out_f, nb, block_size)
+        scale = (w_blk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 7.0).to(
+            dtype=weight_tensor.dtype if weight_tensor.dtype in (torch.float16, torch.bfloat16) else torch.float32
+        )
+        q = torch.round(w_blk / scale.float()).clamp(-8, 7).to(torch.int8)
+        q_flat = q.view(out_f, -1)
+        q_u8 = (q_flat + 8).to(torch.uint8)
+        low = q_u8[:, 0::2] & 0x0F
+        high = (q_u8[:, 1::2] & 0x0F) << 4
+        packed = low | high
+        b = bias_tensor.to(dtype=scale.dtype, device=weight_tensor.device) if bias_tensor is not None else None
+        return cls(in_f, out_f, packed, scale, b)
+
+    def unpack_weight(self, target_dtype: Any) -> "torch.Tensor":
+        pw = self.packed_weight
+        q0 = (pw & 0x0F).to(torch.int8) - 8
+        q1 = ((pw >> 4) & 0x0F).to(torch.int8) - 8
+        nb = self.weight_scale.shape[1]
+        bs = 32
+        # Fast contiguous vectorized unpack avoiding slow strided slice allocations
+        out = torch.stack([q0.to(target_dtype), q1.to(target_dtype)], dim=-1).view(self.out_features, -1)
+        out = (out.view(self.out_features, nb, bs) * self.weight_scale.to(dtype=target_dtype)).view(self.out_features, -1)
+        if out.shape[1] > self.in_features:
+            out = out[:, :self.in_features]
+        return out
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        b = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        w = self.unpack_weight(x.dtype)
+        res = F.linear(x, w, b)
+        del w
+        return res
+
+
+def quantize_block_to_4bit(block: "RealTransformerBlock") -> None:
+    """Converts all 2D linear projections in a loaded RealTransformerBlock to Int4WeightLinear."""
+    if not HAS_TORCH:
+        return
+    for attr in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "c_fc", "c_proj"):
+        mod = getattr(block, attr, None)
+        if isinstance(mod, nn.Linear):
+            setattr(block, attr, Int4WeightLinear.from_float(mod.weight.data, mod.bias.data if mod.bias is not None else None))
+
+
 def quantize_block_to_int8(block: "RealTransformerBlock") -> None:
     """Converts all 2D linear projections in a loaded RealTransformerBlock to Int8WeightLinear."""
     if not HAS_TORCH:
@@ -610,8 +664,15 @@ def _dequantize_gguf_raw_chunk(raw_arr: Any, qtype_int: int, n_rows: int, target
         u16 = torch.from_numpy(np.array(raw_arr, dtype=np.uint16, copy=True)).to(device=target_device)
         return u16.view(torch.bfloat16).to(dtype=out_dtype)
 
-    if qtype_int in (8, 12, 14):
+    if qtype_int in (2, 8, 12, 14):
         u8 = torch.from_numpy(np.array(raw_arr, dtype=np.uint8, copy=True)).to(device=target_device)
+        if qtype_int == 2:  # Q4_0: 18 bytes per 32 weights
+            blocks = u8.view(-1, 18)
+            nb = blocks.shape[0]
+            d = blocks[:, :2].contiguous().view(torch.float16).float()
+            qs = blocks[:, 2:].reshape(nb, 1, 16) >> torch.tensor([0, 4], device=target_device, dtype=torch.uint8).reshape(1, 2, 1)
+            qs = ((qs & 0x0F).to(torch.int8) - 8).reshape(nb, 32).float()
+            return (d * qs).reshape(n_rows, -1).to(dtype=out_dtype)
         if qtype_int == 8:  # Q8_0: 34 bytes per 32 weights
             blocks = u8.view(-1, 34)
             d = blocks[:, :2].contiguous().view(torch.float16).float()
@@ -912,6 +973,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         o_bias: Optional[bool] = None,
         mlp_bias: Optional[bool] = None,
         hidden_act: Optional[str] = None,
+        rope_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
         if not is_architecture_supported(architecture):
@@ -955,12 +1017,19 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         norm_eps = float(eps if eps is not None else spec["norm_eps"])
 
         if sliding_window is _UNSET:
-            layer_rope_theta, layer_sw = _resolve_layer_sliding_and_rope(
+            layer_rope_theta, layer_sw, layer_scale = _resolve_layer_sliding_and_rope(
                 spec, layer_idx, rope_theta=rope_theta
             )
         else:
             layer_rope_theta = float(rope_theta if rope_theta is not None else spec["rope_theta"])
             layer_sw = sliding_window
+            is_gemma3 = ("gemma3" in str(architecture).lower()) or (spec.get("family") == "gemma3")
+            layer_scale = 8.0 if (is_gemma3 and layer_sw is None) else 1.0
+
+        if rope_scaling_factor is not None:
+            layer_scale = float(rope_scaling_factor)
+
+        self.rope_scaling_factor = layer_scale
         self.rope_theta = layer_rope_theta
         self.sliding_window = layer_sw
 
@@ -1014,7 +1083,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
                 self.act_fn = nn.SiLU()
 
         # Rotary Embeddings
-        self.rotary = RotaryEmbedding(self.head_dim, base=layer_rope_theta)
+        self.rotary = RotaryEmbedding(self.head_dim, base=layer_rope_theta, scaling_factor=self.rope_scaling_factor)
 
     def _compute_mlp(self, norm_mlp: torch.Tensor) -> torch.Tensor:
         if self.mlp_type == "gelu_2layer":
@@ -1030,15 +1099,17 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         past_len: int,
     ) -> torch.Tensor:
         total_kv_len = k_exp.shape[-2]
-        use_sliding = self.sliding_window is not None and self.sliding_window > 0 and (
-            seq_len > 1 or total_kv_len > self.sliding_window
-        )
+        use_sliding = self.sliding_window is not None and self.sliding_window > 0
 
         def _build_mask():
+            k_start = (past_len + seq_len) - total_kv_len
             q_idx = torch.arange(past_len, past_len + seq_len, device=q.device).unsqueeze(1)
-            k_idx = torch.arange(total_kv_len, device=q.device).unsqueeze(0)
+            k_idx = torch.arange(k_start, past_len + seq_len, device=q.device).unsqueeze(0)
             mask = k_idx <= q_idx
-            if use_sliding:
+            # Only apply sliding window mask during multi-token prefill.
+            # In autoregressive generation (seq_len == 1), the KV cache is already physically
+            # pruned to sliding_window, so applying (k_idx > q_idx - sliding_window) would double-mask.
+            if use_sliding and seq_len > 1:
                 mask = mask & (k_idx > (q_idx - self.sliding_window))
             return mask
 
@@ -1046,7 +1117,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             cap = float(self.attn_logit_softcapping)
             attn_weights = torch.matmul(q.float(), k_exp.float().transpose(-2, -1)) * self.attn_scale
             attn_weights = torch.tanh(attn_weights / cap) * cap
-            if seq_len > 1 or use_sliding:
+            if seq_len > 1 or (use_sliding and seq_len > 1):
                 mask = _build_mask()
                 attn_weights = attn_weights.masked_fill(~mask, torch.finfo(attn_weights.dtype).min)
             attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -1054,7 +1125,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
 
         sdpa_scale = self.attn_scale if self.query_pre_attn_scalar is not None else None
         enable_gqa = (k_exp.shape[1] < q.shape[1])
-        if use_sliding:
+        if use_sliding and seq_len > 1:
             return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=_build_mask(), scale=sdpa_scale, enable_gqa=enable_gqa)
         if seq_len > 1:
             if past_len > 0:
@@ -1067,6 +1138,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
         x,
         past_kv: Optional[Tuple[Any, Any]] = None,
         position_ids: Optional[Any] = None,
+        position_offset: Optional[int] = None,
     ):
         if not HAS_TORCH:
             raise RuntimeError("PyTorch is required for model inference")
@@ -1098,9 +1170,12 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             if isinstance(past_k, torch.Tensor):
                 past_len = past_k.shape[-2]
 
+        # Use true monotonic position_offset if provided (prevents sliding-window freeze)
+        rope_offset = position_offset if position_offset is not None else past_len
+
         # Apply Rotary Position Embeddings (RoPE)
         if hasattr(self, "rotary") and self.rotary is not None:
-            cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=past_len, position_ids=position_ids)
+            cos, sin = self.rotary(norm_x, seq_len=seq_len, offset=rope_offset, position_ids=position_ids)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # KV Cache concatenation for autoregressive steps
@@ -1110,13 +1185,16 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
                 k = torch.cat([past_k, k], dim=-2)
                 v = torch.cat([past_v, v], dim=-2)
 
-        # Sliding window pruning: prune tokens exceeding window limit to strictly bound KV cache memory
-        if self.sliding_window is not None and self.sliding_window > 0:
+        # Sliding window pruning: during autoregression (seq_len == 1), prune tokens exceeding window limit
+        if self.sliding_window is not None and self.sliding_window > 0 and seq_len == 1:
             if k.shape[-2] > self.sliding_window:
                 k = k[..., -self.sliding_window :, :]
                 v = v[..., -self.sliding_window :, :]
 
-        new_kv = (k, v)
+        if self.sliding_window is not None and self.sliding_window > 0 and k.shape[-2] > self.sliding_window:
+            new_kv = (k[..., -self.sliding_window :, :], v[..., -self.sliding_window :, :])
+        else:
+            new_kv = (k, v)
 
         # Grouped-Query Attention head expansion if GQA is active
         # PyTorch >= 2.4 supports native enable_gqa=True in scaled_dot_product_attention without physical memory replication.
@@ -1130,7 +1208,7 @@ class RealTransformerBlock(nn.Module if HAS_TORCH else object):
             k_exp = k
             v_exp = v
 
-        attn_out = self._compute_attention(q, k_exp, v_exp, seq_len=seq_len, past_len=past_len)
+        attn_out = self._compute_attention(q, k_exp, v_exp, seq_len=seq_len, past_len=rope_offset)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         attn_out = self.o_proj(attn_out)
 
@@ -1333,6 +1411,7 @@ def deserialize_and_validate_layer_weights(
     mlp_bias: Optional[bool] = None,
     hidden_act: Optional[str] = None,
     dtype: Optional[Any] = None,
+    rope_scaling_factor: Optional[float] = None,
 ) -> RealTransformerBlock:
     """
     Deserializes raw wire weights (Safetensors or PyTorch bytes), maps tensor names,
@@ -1466,6 +1545,7 @@ def deserialize_and_validate_layer_weights(
         o_bias=detected_o_bias,
         mlp_bias=detected_mlp_bias,
         hidden_act=hidden_act,
+        rope_scaling_factor=rope_scaling_factor,
     )
 
     # Load and validate tensors (raises ValueError if incomplete, non-finite, or invalid)
@@ -1558,8 +1638,14 @@ def verify_layer_numerical_parity(
         if past_kv is not None and block_new_kv is not None and ref_new_kv is not None:
             if isinstance(block_new_kv, (tuple, list)) and isinstance(ref_new_kv, (tuple, list)):
                 if len(block_new_kv) >= 2 and len(ref_new_kv) >= 2:
-                    k_match = torch.allclose(block_new_kv[0], ref_new_kv[0], atol=tolerance, rtol=tolerance)
-                    v_match = torch.allclose(block_new_kv[1], ref_new_kv[1], atol=tolerance, rtol=tolerance)
+                    k_ref = ref_new_kv[0]
+                    v_ref = ref_new_kv[1]
+                    if getattr(block, "sliding_window", None) and k_ref.shape != block_new_kv[0].shape:
+                        if k_ref.shape[-2] > block_new_kv[0].shape[-2]:
+                            k_ref = k_ref[..., -block_new_kv[0].shape[-2] :, :]
+                            v_ref = v_ref[..., -block_new_kv[1].shape[-2] :, :]
+                    k_match = torch.allclose(block_new_kv[0], k_ref, atol=tolerance, rtol=tolerance)
+                    v_match = torch.allclose(block_new_kv[1], v_ref, atol=tolerance, rtol=tolerance)
                     if not (k_match and v_match):
                         logger.warning("Numerical parity divergence in cached KV states.")
                         return False
@@ -1687,7 +1773,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         self._layer_events: Dict[int, threading.Event] = {
             i: threading.Event() for i in range(layer_start, layer_end)
         }
-        if progressive:
+        if progressive or _lazy_alloc:
             self.ready_layers: Set[int] = set()
         else:
             self.ready_layers = set(range(layer_start, layer_end))
@@ -1735,7 +1821,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         layers_list = []
         for i in range(num_layers):
             layer_idx = layer_start + i
-            layer_rope, layer_sw = _resolve_layer_sliding_and_rope(
+            layer_rope, layer_sw, layer_scale = _resolve_layer_sliding_and_rope(
                 self.spec,
                 layer_idx,
                 rope_theta=self.rope_theta,
@@ -1757,6 +1843,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                     dtype=self.dtype,
                     rope_theta=layer_rope,
                     sliding_window=layer_sw,
+                    rope_scaling_factor=layer_scale,
                     query_pre_attn_scalar=self.query_pre_attn_scalar,
                     attn_logit_softcapping=self.attn_logit_softcapping,
                     qkv_bias=self.qkv_bias,
@@ -1793,7 +1880,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
 
     def load_embedding_weights(self, weights: Any):
         """Loads verified pre-trained token embedding weights into the first stage."""
-        if not self.is_first_stage or self.embed_tokens is None:
+        if not self.is_first_stage:
             return
         if not HAS_TORCH:
             return
@@ -1803,12 +1890,34 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 f"Incompatible weights are rejected."
             )
         with torch.no_grad():
-            target_shape = self.embed_tokens.weight.shape
             src = weights.to(device=self.device)
+            if self.embed_tokens is None:
+                if src.dim() == 2 and src.shape[1] != self.hidden_dim:
+                    if src.shape[0] == self.hidden_dim:
+                        src = src.T
+                    else:
+                        raise ValueError(
+                            f"Embedding weight shape mismatch: expected hidden_dim={self.hidden_dim}, got {tuple(src.shape)}. "
+                            f"Partial copying is rejected."
+                        )
+                self.vocab_size = src.shape[0]
+                emb_dtype = self.dtype if self.dtype is not None else src.dtype
+                self.embed_tokens = nn.Embedding.from_pretrained(
+                    src.to(dtype=emb_dtype), freeze=False
+                ).to(device=self.device)
+                logger.info(f"Loaded verified embedding weights {tuple(src.shape)} into first stage.")
+                return
+
+            target_shape = self.embed_tokens.weight.shape
             if src.shape != target_shape:
                 if src.dim() == 2 and src.T.shape == target_shape:
                     src = src.T
-                elif src.dim() == 2 and src.shape[1] == target_shape[1]:
+                elif (
+                    src.dim() == 2
+                    and src.shape[1] == target_shape[1]
+                    and (getattr(self, "architecture", "").startswith("gemma") or self.spec.get("norm_unit_offset", False))
+                    and src.shape[0] >= target_shape[0]
+                ):
                     logger.info(f"Dynamically adapting embedding table from {tuple(target_shape)} to {tuple(src.shape)}.")
                     self.vocab_size = src.shape[0]
                     self.embed_tokens = nn.Embedding.from_pretrained(
@@ -1838,7 +1947,16 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if not HAS_TORCH:
             return
         with torch.no_grad():
-            if norm_weight is not None and self.norm is not None:
+            if norm_weight is not None:
+                if self.norm is None:
+                    self.norm = _build_norm(
+                        self.hidden_dim,
+                        eps=self.rms_norm_eps,
+                        norm_type=self.spec["norm_type"],
+                        is_gemma=self.spec["norm_unit_offset"],
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
                 norm_label = "LayerNorm" if isinstance(self.norm, nn.LayerNorm) else "RMSNorm"
                 if not isinstance(norm_weight, torch.Tensor):
                     raise ValueError(
@@ -1863,28 +1981,51 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                         f"Partial copying is rejected."
                     )
                 self.norm.bias.copy_(b_src.to(dtype=self.norm.bias.dtype))
-            if lm_head_weight is not None and self.lm_head is not None:
+            if lm_head_weight is not None:
                 if not isinstance(lm_head_weight, torch.Tensor):
                     raise ValueError(
                         f"Expected torch.Tensor for LM Head weights, got {type(lm_head_weight).__name__}."
                     )
                 h_src = lm_head_weight.to(device=self.device)
-                target_shape = self.lm_head.weight.shape
-                if h_src.shape != target_shape:
-                    if h_src.dim() == 2 and h_src.T.shape == target_shape:
-                        h_src = h_src.T
-                    elif h_src.dim() == 2 and h_src.shape[1] == self.lm_head.in_features:
-                        logger.info(f"Dynamically adapting lm_head out_features from {self.lm_head.out_features} to {h_src.shape[0]}.")
-                        self.lm_head = nn.Linear(
-                            self.lm_head.in_features, h_src.shape[0], bias=False, device=self.device, dtype=self.lm_head.weight.dtype
-                        )
-                    else:
-                        raise ValueError(
-                            f"LM Head weight shape mismatch: expected {tuple(target_shape)}, got {tuple(h_src.shape)}. "
-                            f"Partial copying is rejected."
-                        )
-                self.lm_head.weight.copy_(h_src.to(dtype=self.lm_head.weight.dtype))
-                logger.info(f"Loaded verified LM Head weights into last stage.")
+                if self.lm_head is None:
+                    if h_src.dim() == 2 and h_src.shape[1] != self.hidden_dim:
+                        if h_src.shape[0] == self.hidden_dim:
+                            h_src = h_src.T
+                        else:
+                            raise ValueError(
+                                f"LM Head weight shape mismatch: expected in_features={self.hidden_dim}, got {tuple(h_src.shape)}. "
+                                f"Partial copying is rejected."
+                            )
+                    out_features = h_src.shape[0] if h_src.dim() == 2 else self.vocab_size
+                    head_dtype = self.dtype if self.dtype is not None else h_src.dtype
+                    lm_mod = _fast_linear(self.hidden_dim, out_features, device=self.device, dtype=head_dtype, bias=False)
+                    with torch.no_grad():
+                        lm_mod.weight.copy_(h_src.to(dtype=lm_mod.weight.dtype))
+                    self.lm_head = lm_mod
+                    logger.info(f"Loaded verified LM Head weights into last stage.")
+                else:
+                    target_shape = self.lm_head.weight.shape
+                    if h_src.shape != target_shape:
+                        if h_src.dim() == 2 and h_src.T.shape == target_shape:
+                            h_src = h_src.T
+                        elif (
+                            h_src.dim() == 2
+                            and h_src.shape[1] == self.lm_head.in_features
+                            and (getattr(self, "architecture", "").startswith("gemma") or self.spec.get("norm_unit_offset", False))
+                            and h_src.shape[0] >= target_shape[0]
+                        ):
+                            logger.info(f"Dynamically adapting lm_head out_features from {self.lm_head.out_features} to {h_src.shape[0]}.")
+                            self.vocab_size = h_src.shape[0]
+                            self.lm_head = nn.Linear(
+                                self.lm_head.in_features, h_src.shape[0], bias=False, device=self.device, dtype=self.lm_head.weight.dtype
+                            )
+                        else:
+                            raise ValueError(
+                                f"LM Head weight shape mismatch: expected {tuple(target_shape)}, got {tuple(h_src.shape)}. "
+                                f"Partial copying is rejected."
+                            )
+                    self.lm_head.weight.copy_(h_src.to(dtype=self.lm_head.weight.dtype))
+                    logger.info(f"Loaded verified LM Head weights into last stage.")
 
     def hot_swap_layer(self, layer_index: int, weights: Optional[Any] = None, new_block: Optional[Any] = None):
         """
@@ -1900,7 +2041,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         if new_block is not None:
             installed_block = new_block.to(self.device)
         elif weights is not None:
-            layer_rope, layer_sw = _resolve_layer_sliding_and_rope(
+            layer_rope, layer_sw, layer_scale = _resolve_layer_sliding_and_rope(
                 self.spec,
                 layer_index,
                 rope_theta=self.rope_theta,
@@ -1921,6 +2062,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
                 eps=self.rms_norm_eps,
                 rope_theta=layer_rope,
                 sliding_window=layer_sw,
+                rope_scaling_factor=layer_scale,
                 query_pre_attn_scalar=self.query_pre_attn_scalar,
                 attn_logit_softcapping=self.attn_logit_softcapping,
                 qkv_bias=self.qkv_bias,
@@ -1973,6 +2115,7 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         input_ids: "torch.Tensor",
         past_kvs: Optional[List[Any]] = None,
         position_ids: Optional[Any] = None,
+        position_offset: Optional[int] = None,
     ):
         """First stage: input_ids -> embeddings -> assigned layers -> intermediate activation."""
         if not HAS_TORCH:
@@ -2004,17 +2147,36 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if not self.wait_layer_ready(layer_idx):
                 raise RuntimeError(f"Layer {layer_idx} is not ready or failed validation before forward execution")
             layer_past_kv = past_kvs[i] if past_kvs else None
-            h, new_kv = layer(h, layer_past_kv, position_ids=position_ids)
+            h, new_kv = layer(h, layer_past_kv, position_ids=position_ids, position_offset=position_offset)
             new_kvs.append(new_kv)
 
         return h, new_kvs
+
+    def compute_logits(self, h: "torch.Tensor", compute_all_logits: Optional[bool] = None) -> "torch.Tensor":
+        """Projects final hidden states to vocabulary logits via norm and LM head."""
+        if not self.is_last_stage:
+            return h
+        should_slice = (compute_all_logits is False) or (compute_all_logits is None and h.shape[1] > 16)
+        if should_slice and h.shape[1] > 1:
+            h = h[:, -1:, :]
+        if self.norm is not None:
+            h = self.norm(h)
+        if self.lm_head is not None:
+            logits = self.lm_head(h)
+        else:
+            logits = h
+        cap = getattr(self, "final_logit_softcapping", None)
+        if cap is not None and cap > 0:
+            logits = (torch.tanh(logits.float() / float(cap)) * float(cap)).to(logits.dtype)
+        return logits
 
     def forward_intermediate_stage(
         self,
         hidden_states: "torch.Tensor",
         past_kvs: Optional[List[Any]] = None,
         position_ids: Optional[Any] = None,
-        compute_all_logits: bool = False,
+        position_offset: Optional[int] = None,
+        compute_all_logits: Optional[bool] = None,
     ):
         """Middle or last stage: incoming activations -> assigned layers."""
         if not HAS_TORCH:
@@ -2026,21 +2188,11 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
             if not self.wait_layer_ready(layer_idx):
                 raise RuntimeError(f"Layer {layer_idx} is not ready or failed validation before forward execution")
             layer_past_kv = past_kvs[i] if past_kvs else None
-            h, new_kv = layer(h, layer_past_kv, position_ids=position_ids)
+            h, new_kv = layer(h, layer_past_kv, position_ids=position_ids, position_offset=position_offset)
             new_kvs.append(new_kv)
 
         if self.is_last_stage:
-            # Autoregressive generation & prompt prefill only sample from the last sequence position.
-            # Slicing h to h[:, -1:, :] before norm & lm_head saves over 99.8% VRAM on 262k vocabularies (e.g. Gemma 3 4B).
-            # When compute_all_logits is True (e.g. small speculative candidate batch verification), compute all positions.
-            if not compute_all_logits and h.shape[1] > 1:
-                h = h[:, -1:, :]
-            h = self.norm(h)
-            logits = self.lm_head(h)
-            cap = getattr(self, "final_logit_softcapping", None)
-            if cap is not None and cap > 0:
-                logits = (torch.tanh(logits.float() / float(cap)) * float(cap)).to(logits.dtype)
-            return logits, new_kvs
+            return self.compute_logits(h, compute_all_logits=compute_all_logits), new_kvs
 
         return h, new_kvs
 
@@ -2049,6 +2201,9 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
     """Finds genuine safetensors or PyTorch checkpoint files on disk for the given model name."""
     import glob
     import os
+    import re
+    import pathlib
+    from situs.inference_backend import _is_snapshot_complete
     candidates = []
 
     # 1. Direct path
@@ -2071,23 +2226,27 @@ def find_local_safetensors_files(model_name: str) -> List[str]:
         except Exception:
             canonical = model_name
 
+        base_canonical = re.sub(r"-qat-q\d+_\d+.*|-gguf.*", "", canonical, flags=re.IGNORECASE)
+        base_model_name = re.sub(r"-qat-q\d+_\d+.*|-gguf.*", "", model_name, flags=re.IGNORECASE)
+
         names_to_check = {
             model_name.replace("/", "--").replace(":", "--").lower(),
             canonical.replace("/", "--").replace(":", "--").lower(),
+            base_canonical.replace("/", "--").replace(":", "--").lower(),
+            base_model_name.replace("/", "--").replace(":", "--").lower(),
             f"models--{canonical.replace('/', '--').lower()}",
+            f"models--{base_canonical.replace('/', '--').lower()}",
             f"models--{model_name.replace('/', '--').lower()}",
+            f"models--{base_model_name.replace('/', '--').lower()}",
         }
-        prefix = canonical.split(":")[0].split("/")[0].lower()
-        sub_prefix = canonical.split("/")[-1].split(":")[0].lower()
-        known_prefixes = ("gemma", "qwen", "llama", "mistral", "deepseek", "starcoder2")
         for d in os.listdir(hub_dir):
             d_lower = d.lower()
-            if any(n in d_lower for n in names_to_check) or any(kp in d_lower and (kp in prefix or kp in sub_prefix) for kp in known_prefixes):
+            if any(n in d_lower for n in names_to_check):
                 snapshots_dir = os.path.join(hub_dir, d, "snapshots")
                 if os.path.isdir(snapshots_dir):
                     for snap in os.listdir(snapshots_dir):
                         snap_path = os.path.join(snapshots_dir, snap)
-                        if os.path.isdir(snap_path):
+                        if os.path.isdir(snap_path) and _is_snapshot_complete(pathlib.Path(snap_path)):
                             candidates.append(snap_path)
 
     # Search candidates for .safetensors or .bin files (genuine unquantized PyTorch weights)
@@ -2185,13 +2344,18 @@ def find_local_weight_files(model_name: str) -> List[str]:
     if os.path.isfile(model_name) and model_name.lower().endswith(".gguf"):
         return [model_name]
 
-    # 2. Check Hugging Face hub cache for .gguf files
-    hub_dir = (
-        os.environ.get("HF_HUB_CACHE")
-        or os.environ.get("HUGGINGFACE_HUB_CACHE")
-        or os.path.expanduser("~/.cache/huggingface/hub")
-    )
-    if os.path.isdir(hub_dir):
+    # 2. Check 4-bit GGUF sources: Hugging Face hub cache and Ollama blob cache
+    def _check_ollama() -> Optional[str]:
+        return find_local_ollama_gguf_file(model_name)
+
+    def _check_hf_gguf() -> List[str]:
+        hub_dir = (
+            os.environ.get("HF_HUB_CACHE")
+            or os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or os.path.expanduser("~/.cache/huggingface/hub")
+        )
+        if not os.path.isdir(hub_dir):
+            return []
         try:
             from situs.inference_backend import normalize_model_name
             canonical = normalize_model_name(model_name)
@@ -2214,19 +2378,30 @@ def find_local_weight_files(model_name: str) -> List[str]:
                         if os.path.isdir(snap_path):
                             gguf_files = sorted(glob.glob(os.path.join(snap_path, "*.gguf")))
                             if gguf_files:
-                                # Return non-mmproj llm weights first
                                 llm_ggufs = [g for g in gguf_files if not os.path.basename(g).lower().startswith("mmproj")]
                                 return llm_ggufs or gguf_files
+        return []
 
-    # 3. Check Hugging Face safetensors/bin files
+    # Prioritize explicitly configured OLLAMA_MODELS; otherwise prioritize HF Hub GGUF cache
+    if os.environ.get("OLLAMA_MODELS"):
+        gguf_blob = _check_ollama()
+        if gguf_blob:
+            return [gguf_blob]
+        hf_ggufs = _check_hf_gguf()
+        if hf_ggufs:
+            return hf_ggufs
+    else:
+        hf_ggufs = _check_hf_gguf()
+        if hf_ggufs:
+            return hf_ggufs
+        gguf_blob = _check_ollama()
+        if gguf_blob:
+            return [gguf_blob]
+
+    # 3. Check Hugging Face safetensors/bin files (only if no GGUF was found)
     sfiles = find_local_safetensors_files(model_name)
     if sfiles:
         return sfiles
-
-    # 4. Check Ollama blob cache
-    gguf_blob = find_local_ollama_gguf_file(model_name)
-    if gguf_blob:
-        return [gguf_blob]
 
     return []
 
@@ -2343,7 +2518,7 @@ def load_hf_stage_model(
         o_bias=o_bias_cfg,
         mlp_bias=mlp_bias_cfg,
         hidden_act=meta.get("hidden_act"),
-        _lazy_alloc=(has_gguf_source and not progressive),
+        _lazy_alloc=not progressive,
     )
 
     if not progressive and HAS_TORCH:
@@ -2435,7 +2610,8 @@ def load_hf_stage_model(
                     reader = fast_gguf_files.get(sf) or FastGGUFFile(sf)
                     try:
                         tensor_by_name = {t.name: t for t in reader.tensors}
-                        use_int8 = bool(load_in_8bit and any(t.tensor_type not in (0, 1, 30) for t in reader.tensors))
+                        use_4bit = bool(any(t.tensor_type in (2, 3, 12, 20, 23) for t in reader.tensors))
+                        use_int8 = bool(load_in_8bit and not use_4bit and any(t.tensor_type not in (0, 1, 30) for t in reader.tensors))
 
                         # Stage 1: Token embeddings
                         emb_entry = tensor_by_name.get("token_embd.weight") or tensor_by_name.get("model.embed_tokens.weight")
@@ -2443,7 +2619,7 @@ def load_hf_stage_model(
                             n_vocab = int(emb_entry.shape[1]) if len(emb_entry.shape) == 2 else stage.vocab_size
                             stage.vocab_size = n_vocab
                             chunks = _iter_dequantized_gguf_chunks(emb_entry, out_dtype=stage.dtype, target_device=stage.device)
-                            if use_int8:
+                            if use_int8 or use_4bit:
                                 stage.embed_tokens = Int8WeightEmbedding.from_float_chunked(
                                     chunks, num_embeddings=n_vocab, embedding_dim=hidden_dim, device=stage.device, scale_dtype=stage.dtype
                                 )
@@ -2455,7 +2631,7 @@ def load_hf_stage_model(
                                         emb_mod.weight[offset : offset + c.shape[0]].copy_(c)
                                         offset += c.shape[0]
                                 stage.embed_tokens = emb_mod
-                            logger.info(f"Loaded GGUF embedding table {(n_vocab, hidden_dim)} ({'int8' if use_int8 else stage.dtype}) onto {stage.device}.")
+                            logger.info(f"Loaded GGUF embedding table {(n_vocab, hidden_dim)} ({'int8' if (use_int8 or use_4bit) else stage.dtype}) onto {stage.device}.")
 
                         # Stage N: Final norm & LM head
                         if is_last_stage:
@@ -2482,11 +2658,11 @@ def load_hf_stage_model(
                             head_entry = tensor_by_name.get("output.weight") or tensor_by_name.get("lm_head.weight") or emb_entry
                             if head_entry is not None:
                                 n_vocab = int(head_entry.shape[1]) if len(head_entry.shape) == 2 else stage.vocab_size
-                                if use_int8 and head_entry is emb_entry and isinstance(stage.embed_tokens, Int8WeightEmbedding):
+                                if (use_int8 or use_4bit) and head_entry is emb_entry and isinstance(stage.embed_tokens, Int8WeightEmbedding):
                                     stage.lm_head = Int8WeightLinear(
                                         hidden_dim, n_vocab, stage.embed_tokens.weight, stage.embed_tokens.weight_scale, None
                                     )
-                                elif use_int8:
+                                elif use_int8 or use_4bit:
                                     h_chunks = _iter_dequantized_gguf_chunks(head_entry, out_dtype=stage.dtype, target_device=stage.device)
                                     tmp_emb = Int8WeightEmbedding.from_float_chunked(
                                         h_chunks, num_embeddings=n_vocab, embedding_dim=hidden_dim, device=stage.device, scale_dtype=stage.dtype
@@ -2500,7 +2676,7 @@ def load_hf_stage_model(
                                             lm_mod.weight[offset : offset + c.shape[0]].copy_(c)
                                             offset += c.shape[0]
                                     stage.lm_head = lm_mod
-                                logger.info(f"Loaded GGUF LM head {(n_vocab, hidden_dim)} ({'int8' if use_int8 else stage.dtype}) onto {stage.device}.")
+                                logger.info(f"Loaded GGUF LM head {(n_vocab, hidden_dim)} ({'int8' if (use_int8 or use_4bit) else stage.dtype}) onto {stage.device}.")
 
                         # Transformer layers [layer_start..layer_end)
                         for l_idx in range(layer_start, layer_end):
@@ -2509,7 +2685,7 @@ def load_hf_stage_model(
                             if not matched:
                                 raise RuntimeError(f"GGUF file '{sf}' is missing assigned transformer layer {l_idx}.")
 
-                            layer_rope, layer_sw = _resolve_layer_sliding_and_rope(
+                            layer_rope, layer_sw, layer_scale = _resolve_layer_sliding_and_rope(
                                 stage.spec,
                                 l_idx,
                                 rope_theta=stage.rope_theta,
@@ -2537,6 +2713,7 @@ def load_hf_stage_model(
                                 dtype=stage.dtype,
                                 rope_theta=layer_rope,
                                 sliding_window=layer_sw,
+                                rope_scaling_factor=layer_scale,
                                 query_pre_attn_scalar=stage.query_pre_attn_scalar,
                                 attn_logit_softcapping=stage.attn_logit_softcapping,
                                 qkv_bias=stage.qkv_bias,
@@ -2547,7 +2724,9 @@ def load_hf_stage_model(
                             set_norm_unit_offset(block, False)
                             block.load_layer_weights(layer_state)
                             del layer_state
-                            if use_int8:
+                            if use_4bit:
+                                quantize_block_to_4bit(block)
+                            elif use_int8:
                                 quantize_block_to_int8(block)
 
                             local_idx = l_idx - layer_start
@@ -2669,6 +2848,13 @@ def load_hf_stage_model(
 
         if loaded_cached > 0:
             logger.info(f"Loaded {loaded_cached} layer weights from disk for stage [{layer_start}..{layer_end})")
+
+    if not progressive:
+        # Guarantee all stage layers are marked ready for non-progressive pipeline execution
+        for l_idx in range(layer_start, layer_end):
+            stage.ready_layers.add(l_idx)
+            if l_idx in stage._layer_events:
+                stage._layer_events[l_idx].set()
 
     logger.info(
         f"Initialized real stage [{layer_start}..{layer_end}) on {device}. "

@@ -191,7 +191,7 @@ class ChatCompletionRequest(BaseModel):
 async def rebalance_and_assign_layers(
     model_name: Optional[str] = None,
     total_layers: Optional[int] = None,
-    progressive: bool = False,
+    progressive: Optional[bool] = None,
     codec: str = "zstd",
     wait_for_in_flight: bool = True,
 ) -> List[AssignLayers]:
@@ -199,6 +199,7 @@ async def rebalance_and_assign_layers(
     Rebalances and partitions the active model across all currently connected alive workers,
     and transmits verified ASSIGN_LAYERS protocol frames to each worker stage.
     """
+    effective_prog = getattr(registry, "progressive_mode", False) if progressive is None else progressive
     if wait_for_in_flight and relay.response_streams:
         logger.info(
             f"rebalance_and_assign_layers deferred: {len(relay.response_streams)} active request stream(s) in flight. "
@@ -229,7 +230,7 @@ async def rebalance_and_assign_layers(
             )
 
     assignments = registry.partition_model(
-        target, total_layers=resolved_layers, progressive=progressive, codec=codec
+        target, total_layers=resolved_layers, progressive=effective_prog, codec=codec
     )
     failed_workers = []
     for assign in assignments:
@@ -359,8 +360,35 @@ async def worker_websocket(websocket: WebSocket, worker_id: str):
                 )
                 await relay.send_to_worker(worker_id, ack)
 
+            elif frame.type == MessageType.REQUEST_LAYER_STREAM and frame.target in (None, "coordinator"):
+                try:
+                    from situs.protocol.messages import RequestLayerStream
+                    req_stream = RequestLayerStream.model_validate(frame.payload)
+                    async def _coord_stream(req_item, dest_id):
+                        try:
+                            from situs.worker.jit_streamer import ProgressiveJITStreamer
+                            streamer = ProgressiveJITStreamer(model_name=req_item.model_name, allow_synthetic=False)
+                            async for chunk in streamer.stream_stage_layers_async(
+                                layer_start=req_item.layer_start,
+                                layer_end=req_item.layer_end,
+                                priority_entrance_first=req_item.priority_entrance_first,
+                                extract_from_disk=True,
+                            ):
+                                chunk_frame = ProtocolFrame(
+                                    type=MessageType.STREAM_LAYER_CHUNK,
+                                    source="coordinator",
+                                    target=dest_id,
+                                    payload=chunk.model_dump(),
+                                )
+                                await relay.send_to_worker(dest_id, chunk_frame)
+                        except Exception as err:
+                            logger.warning(f"Coordinator stream layers to '{dest_id}' failed: {err}")
+                    asyncio.create_task(_coord_stream(req_stream, worker_id))
+                except Exception as e:
+                    logger.debug(f"Failed to parse REQUEST_LAYER_STREAM at coordinator: {e}")
+
             else:
-                # Forward activations, tokens, errors
+                # Forward activations, tokens, errors, and P2P frames
                 await relay.route_frame(frame)
 
     except WebSocketDisconnect:
@@ -465,6 +493,42 @@ async def trigger_partition(
         return {"status": "success", "partitions": [a.model_dump() for a in assignments]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/cluster/mode")
+async def get_transfer_mode():
+    is_prog = getattr(registry, "progressive_mode", False)
+    return {
+        "status": "success",
+        "mode": "progressive" if is_prog else "auto_pull",
+        "description": "Progressive Wire Streaming (Option B)" if is_prog else "Distributed Auto-Pull (Option A)",
+    }
+
+
+@app.post("/api/cluster/mode")
+async def set_transfer_mode(request: Request, mode: Optional[str] = None):
+    req_mode = mode
+    if req_mode is None:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                req_mode = body.get("mode")
+        except Exception:
+            pass
+    if req_mode in ("progressive", "stream", "b", "option_b", "wire", "true", "True", "1"):
+        registry.progressive_mode = True
+    else:
+        registry.progressive_mode = False
+
+    target_m = registry.active_model or getattr(config, "default_model", "gemma3:4b")
+    if registry.get_alive_workers():
+        await rebalance_and_assign_layers(model_name=target_m, progressive=registry.progressive_mode)
+    is_prog = registry.progressive_mode
+    return {
+        "status": "success",
+        "mode": "progressive" if is_prog else "auto_pull",
+        "description": "Progressive Wire Streaming (Option B)" if is_prog else "Distributed Auto-Pull (Option A)",
+    }
 
 
 @app.post("/admin/pull")
@@ -717,7 +781,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 created_ts = int(time.time())
 
                 # Check if model needs downloading from online registry
-                if not is_model_downloaded(target_model):
+                if not is_model_downloaded(target_model) and not (pipeline and all(w.is_alive for w in pipeline)):
                     canonical = normalize_model_name(target_model)
                     logger.info(f"Model '{target_model}' ({canonical}) not present locally. Streaming download via SSE...")
                     async for progress in stream_pull_model(canonical):
@@ -789,6 +853,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 last_worker = pipeline[-1]
 
                 stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
+                sys_msgs = [m for m in req.messages if getattr(m, "role", "") == "system"]
+                sys_tokens = tokenizer.encode("\n".join((m.content or "") for m in sys_msgs)) if sys_msgs else []
+                sys_len = len(sys_tokens) if sys_tokens else None
                 start_payload = InferenceStart(
                     request_id=request_id,
                     model_name=target_model,
@@ -801,36 +868,32 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     top_k=getattr(req, "top_k", 50),
                     stop_token_ids=stop_ids,
                     seed=req.seed,
+                    system_prompt_len=sys_len,
                 )
-                start_frame = ProtocolFrame(
-                    type=MessageType.INFERENCE_START,
-                    source="coordinator",
-                    target=first_worker.worker_id,
-                    payload=start_payload.model_dump(),
-                )
-                sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
-                if not sent:
+                # Broadcast INFERENCE_START to all cluster stages (not just first and last)
+                dispatch_failed = False
+                for worker_node in pipeline:
+                    cfg_frame = ProtocolFrame(
+                        type=MessageType.INFERENCE_START,
+                        source="coordinator",
+                        target=worker_node.worker_id,
+                        payload=start_payload.model_dump(),
+                    )
+                    sent_worker = await relay.send_to_worker(worker_node.worker_id, cfg_frame)
+                    if not sent_worker and worker_node.worker_id == first_worker.worker_id:
+                        dispatch_failed = True
+                        break
+
+                if dispatch_failed:
                     err_chunk = {"error": "Failed to dispatch inference to first pipeline stage."}
                     yield f"data: {json.dumps(err_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
-                if last_worker.worker_id != first_worker.worker_id:
-                    cfg_frame = ProtocolFrame(
-                        type=MessageType.INFERENCE_START,
-                        source="coordinator",
-                        target=last_worker.worker_id,
-                        payload=start_payload.model_dump(),
-                    )
-                    sent_last = await relay.send_to_worker(last_worker.worker_id, cfg_frame)
-                    if not sent_last:
-                        err_chunk = {"error": f"Failed to dispatch inference to last pipeline stage on worker '{last_worker.worker_id}'."}
-                        yield f"data: {json.dumps(err_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-
-                # Stream token frames from workers to client with cancellation handling
-                deadline = time.time() + config.request_timeout_s
+                # Stream token frames from workers to client with cancellation handling.
+                # Use inter-token idle timeout (20.0s) so active streaming requests never time out mid-generation while tokens arrive.
+                idle_timeout_s = 20.0
+                last_token_time = time.time()
                 done_yielded = False
                 while True:
                     # Circuit breaker: detect worker drops mid-generation (Item 4)
@@ -858,15 +921,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         await relay.route_frame(abort_frame)
                         break
 
-                    if time.time() > deadline:
-                        logger.error(f"Streaming request {request_id} timed out after {config.request_timeout_s}s")
+                    if time.time() - last_token_time > idle_timeout_s:
+                        logger.error(f"Streaming request {request_id} idle timed out after {idle_timeout_s}s with no incoming tokens")
                         abort_frame = ProtocolFrame(
                             type=MessageType.INFERENCE_ABORT,
                             source="coordinator",
                             payload={"request_id": request_id},
                         )
                         await relay.route_frame(abort_frame)
-                        err_chunk = {"error": f"Inference request timed out after {config.request_timeout_s} seconds."}
+                        err_chunk = {"error": f"Inference pipeline idle timed out after {idle_timeout_s} seconds with no new tokens."}
                         yield f"data: {json.dumps(err_chunk)}\n\n"
                         break
 
@@ -875,6 +938,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     except asyncio.TimeoutError:
                         yield ": keepalive\n\n"
                         continue
+
+                    last_token_time = time.time()
 
                     if frame.type == MessageType.NEXT_TOKEN:
                         token_info = NextToken.model_validate(frame.payload)
@@ -969,7 +1034,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     else:
         # Non-streaming request flow
         try:
-            if not model_is_local:
+            if not model_is_local and not (pipeline and all(w.is_alive for w in pipeline)):
                 from situs.inference_backend import stream_pull_model, normalize_model_name
                 canonical = normalize_model_name(target_model)
                 logger.info(f"Model '{target_model}' ({canonical}) not present locally. Pulling via native Hugging Face Hub...")
@@ -1008,6 +1073,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             last_worker = pipeline[-1]
 
             stop_ids = [int(s) for s in (getattr(tokenizer, "stop_token_ids", None) or [])]
+            sys_msgs = [m for m in req.messages if getattr(m, "role", "") == "system"]
+            sys_tokens = tokenizer.encode("\n".join((m.content or "") for m in sys_msgs)) if sys_msgs else []
+            sys_len = len(sys_tokens) if sys_tokens else None
             start_payload = InferenceStart(
                 request_id=request_id,
                 model_name=target_model,
@@ -1020,28 +1088,28 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 top_k=getattr(req, "top_k", 50),
                 stop_token_ids=stop_ids,
                 seed=req.seed,
+                system_prompt_len=sys_len,
             )
-            start_frame = ProtocolFrame(
-                type=MessageType.INFERENCE_START,
-                source="coordinator",
-                target=first_worker.worker_id,
-                payload=start_payload.model_dump(),
-            )
-            sent = await relay.send_to_worker(first_worker.worker_id, start_frame)
-            if not sent:
-                raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
-
-            if last_worker.worker_id != first_worker.worker_id:
+            # Broadcast INFERENCE_START to all cluster stages (not just first and last)
+            dispatch_failed = False
+            for worker_node in pipeline:
                 cfg_frame = ProtocolFrame(
                     type=MessageType.INFERENCE_START,
                     source="coordinator",
-                    target=last_worker.worker_id,
+                    target=worker_node.worker_id,
                     payload=start_payload.model_dump(),
                 )
-                await relay.send_to_worker(last_worker.worker_id, cfg_frame)
+                sent_worker = await relay.send_to_worker(worker_node.worker_id, cfg_frame)
+                if not sent_worker and worker_node.worker_id == first_worker.worker_id:
+                    dispatch_failed = True
+                    break
 
-            # Enforce bounded deadline for completion to prevent hanging indefinite waits
-            deadline = time.time() + config.request_timeout_s
+            if dispatch_failed:
+                raise HTTPException(status_code=500, detail="Failed to dispatch inference to first pipeline stage.")
+
+            # Enforce inter-token idle timeout (20.0s) to prevent hanging indefinite waits
+            idle_timeout_s = 20.0
+            last_token_time = time.time()
             generated_text = ""
             finish_reason = "stop"
             has_unverified_draft = False
@@ -1072,13 +1140,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     await relay.route_frame(abort_frame)
                     raise HTTPException(status_code=499, detail="Client Closed Request")
 
-                remaining = max(0.01, deadline - time.time())
+                remaining = max(0.01, idle_timeout_s - (time.time() - last_token_time))
                 wait_slice = min(remaining, 2.0)
                 try:
                     frame: ProtocolFrame = await asyncio.wait_for(stream_queue.get(), timeout=wait_slice)
                 except asyncio.TimeoutError:
-                    if time.time() >= deadline:
-                        logger.error(f"Request {request_id} timed out after {config.request_timeout_s}s")
+                    if (time.time() - last_token_time) >= idle_timeout_s:
+                        logger.error(f"Request {request_id} idle timed out after {idle_timeout_s}s with no incoming tokens")
                         abort_frame = ProtocolFrame(
                             type=MessageType.INFERENCE_ABORT,
                             source="coordinator",
@@ -1087,9 +1155,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         await relay.route_frame(abort_frame)
                         raise HTTPException(
                             status_code=504,
-                            detail=f"Inference request timed out after {config.request_timeout_s} seconds.",
+                            detail=f"Inference pipeline idle timed out after {idle_timeout_s} seconds with no new tokens.",
                         )
                     continue
+
+                last_token_time = time.time()
 
                 if frame.type == MessageType.NEXT_TOKEN:
                     token_info = NextToken.model_validate(frame.payload)
@@ -1164,28 +1234,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         finally:
             relay.cleanup_response_stream(request_id)
             sem.release()
-
-        resp_dict = {
-            "id": request_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": target_model or req.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": generated_text},
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": len(input_ids),
-                "completion_tokens": len(generated_text.split()),
-                "total_tokens": len(input_ids) + len(generated_text.split()),
-            },
-            "is_verified": not has_unverified_draft,
-            "unverified_draft": has_unverified_draft,
-        }
-        return resp_dict
 
 
 def main():

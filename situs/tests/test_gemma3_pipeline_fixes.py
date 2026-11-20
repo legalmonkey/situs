@@ -84,6 +84,7 @@ def test_worker_caching_allocator_vram_telemetry():
     torch_reserved = 5800 * (1024 ** 2)  # 5.8 GB reserved by caching allocator
 
     with mock.patch("torch.cuda.is_available", return_value=True), \
+         mock.patch("situs.hardware.get_live_gpu_vram", return_value=(0, 0, 0)), \
          mock.patch("torch.cuda.mem_get_info", return_value=(os_free, total_mem)), \
          mock.patch("torch.cuda.memory_allocated", return_value=torch_alloc), \
          mock.patch("torch.cuda.memory_reserved", return_value=torch_reserved):

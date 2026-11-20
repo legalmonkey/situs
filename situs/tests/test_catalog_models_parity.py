@@ -32,8 +32,10 @@ def _rope_apply_ref(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: to
     return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
 
 
-def _rope_cos_sin_ref(head_dim: int, seq_len: int, offset: int, base: float, device, dtype):
+def _rope_cos_sin_ref(head_dim: int, seq_len: int, offset: int, base: float, device, dtype, scaling_factor: float = 1.0):
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    if scaling_factor != 1.0 and scaling_factor > 0:
+        inv_freq = inv_freq / scaling_factor
     pos = torch.arange(offset, offset + seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(pos, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
@@ -160,7 +162,7 @@ class Gemma2ReferenceLayer(nn.Module):
 class Gemma3ReferenceLayer(nn.Module):
     def __init__(
         self, hidden_dim, num_heads, num_kv_heads, intermediate_size, head_dim,
-        query_pre_attn_scalar=256.0, sliding_window=None, rope_theta=10000.0
+        query_pre_attn_scalar=256.0, sliding_window=None, rope_theta=10000.0, rope_scaling_factor=None
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -169,6 +171,7 @@ class Gemma3ReferenceLayer(nn.Module):
         self.scale = query_pre_attn_scalar ** -0.5
         self.sliding_window = sliding_window
         self.rope_theta = rope_theta
+        self.rope_scaling_factor = rope_scaling_factor if rope_scaling_factor is not None else (8.0 if sliding_window is None else 1.0)
         self.input_layernorm = GemmaRMSNormRef(hidden_dim, eps=1e-6)
         self.q_proj = nn.Linear(hidden_dim, num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
@@ -191,7 +194,7 @@ class Gemma3ReferenceLayer(nn.Module):
         k = self.k_norm(self.k_proj(nx).view(bsz, slen, self.num_kv_heads, self.head_dim).transpose(1, 2))
         v = self.v_proj(nx).view(bsz, slen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         past_len = past_kv[0].shape[-2] if past_kv is not None else 0
-        cos, sin = _rope_cos_sin_ref(self.head_dim, slen, past_len, self.rope_theta, x.device, q.dtype)
+        cos, sin = _rope_cos_sin_ref(self.head_dim, slen, past_len, self.rope_theta, x.device, q.dtype, scaling_factor=self.rope_scaling_factor)
         q, k = _rope_apply_ref(q, k, cos, sin)
         if past_kv is not None:
             k = torch.cat([past_kv[0], k], dim=-2)

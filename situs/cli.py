@@ -1015,7 +1015,7 @@ def interactive_chat(
     coordinator: str = typer.Option("http://localhost:8000", "--coordinator", "-c", envvar="SITUS_COORDINATOR", help="Coordinator URL"),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Model name"),
     temperature: float = typer.Option(0.7, "--temp", "-t", help="Sampling temperature"),
-    system: str = typer.Option("You are a helpful AI assistant running on a distributed GPU cluster.", "--system", "-s", help="System prompt"),
+    system: str = typer.Option("", "--system", "-s", help="System prompt"),
 ):
     """Launch the OpenCode interactive streaming terminal interface."""
     try:

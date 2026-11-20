@@ -72,7 +72,21 @@ class RelayHub:
         
         # If this frame carries a token or completion, push to the waiting HTTP response stream
         if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED, MessageType.INFERENCE_FINISH, MessageType.ERROR):
-            if request_id and request_id in self.response_streams:
+            should_stream = True
+            # For multi-stage reverse token / speculative routing over relay, only the originating
+            # last stage (or explicit coordinator target) pushes to client response streams.
+            # Forwarding intermediate workers must NEVER push duplicate copies to response streams.
+            if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED) and frame.target != "coordinator":
+                if self.registry:
+                    try:
+                        pipeline = self.registry.get_pipeline_order()
+                        if pipeline and len(pipeline) > 1:
+                            last_worker_id = pipeline[-1].worker_id
+                            if frame.source != last_worker_id:
+                                should_stream = False
+                    except Exception:
+                        pass
+            if should_stream and request_id and request_id in self.response_streams:
                 await self.response_streams[request_id].put(frame)
 
         # Broadcast INFERENCE_FINISH to all active workers when a request completes or finishes
@@ -94,7 +108,7 @@ class RelayHub:
             if frame.target == "coordinator":
                 return  # Delivered for HTTP SSE client streaming only; do not reflect back into pipeline ring
             target_worker = frame.target
-            if self.registry:
+            if not target_worker and self.registry:
                 try:
                     pipeline = self.registry.get_pipeline_order()
                     if pipeline:

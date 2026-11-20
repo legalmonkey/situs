@@ -460,6 +460,8 @@ class OpenCodeSlashCompleter(Completer):
         ("/pull", "Pull / download a model from Hugging Face Hub: /pull <model> or /pull <1-N>"),
         ("/hf", "View or set Hugging Face token for gated models: /hf [token]"),
         ("/p2p", "Toggle WebRTC P2P direct hole-punching vs Relay"),
+        ("/mode", "Toggle or switch transfer mode: Option A (Auto-Pull) vs Option B (Wire Stream)"),
+        ("/transfer", "Switch cluster layer transfer mode (/transfer auto or /transfer stream)"),
         ("/speculative", "Toggle prompt-lookup speculative candidate drafting"),
         ("/tokens", "View or set maximum generation tokens: /tokens [count] (default: 2048)"),
         ("/unload", "Unload active model from GPU VRAM to return memory to 0 MB"),
@@ -1610,7 +1612,9 @@ def execute_slash_command(
 
     elif root_cmd in ("/clear", "clear", "cls"):
         messages.clear()
-        messages.append({"role": "system", "content": session_state.get("system_prompt", "You are a helpful AI assistant.")})
+        sys_p = session_state.get("system_prompt", "")
+        if sys_p:
+            messages.append({"role": "system", "content": sys_p})
         if log_output_fn is not None:
             log_output_fn("CLEAR", None)
         else:
@@ -2130,6 +2134,39 @@ def execute_slash_command(
         emit(f"[cyan]Direct P2P transport is now:[/cyan] [bold green]{status_text}[/bold green]", "P2P Transport")
         return True
 
+    elif root_cmd in ("/mode", "mode", "/transfer", "transfer"):
+        parts = raw.split()
+        args_str = " ".join(parts[1:]).strip().lower() if len(parts) > 1 else ""
+        if args_str in ("stream", "progressive", "b", "option_b", "wire"):
+            session_state["transfer_mode"] = "progressive"
+        elif args_str in ("auto", "pull", "a", "option_a", "download"):
+            session_state["transfer_mode"] = "auto_pull"
+        else:
+            curr = session_state.get("transfer_mode", "auto_pull")
+            session_state["transfer_mode"] = "progressive" if curr == "auto_pull" else "auto_pull"
+
+        is_prog = (session_state["transfer_mode"] == "progressive")
+        mode_label = "Option B: Progressive Wire Streaming" if is_prog else "Option A: Distributed Auto-Pull"
+        mode_desc = (
+            "Upstream workers dynamically stream layer chunks across P2P / Relay just-in-time."
+            if is_prog
+            else "Workers download model snapshots directly from Hugging Face Hub."
+        )
+        style_color = "bold #f59e0b" if is_prog else "bold #22c55e"
+        emit(
+            f"[bold cyan]Cluster Transfer Mode:[/bold cyan] [{style_color}]{mode_label}[/{style_color}]\n"
+            f"[dim]{mode_desc}[/dim]",
+            "Transfer Mode",
+        )
+        try:
+            from situs.coordinator.app import registry, rebalance_and_assign_layers
+            registry.progressive_mode = is_prog
+            if registry.get_alive_workers():
+                asyncio.create_task(rebalance_and_assign_layers(progressive=is_prog))
+        except Exception:
+            pass
+        return True
+
     elif root_cmd in ("/vram", "vram", "/gpu", "gpu"):
         coord_url = session_state.get("coordinator_url", coordinator_url)
         normalized = normalize_fast_url(coord_url)
@@ -2488,12 +2525,30 @@ def execute_slash_command(
 
     elif root_cmd in ("/system", "system"):
         if len(parts) > 1:
-            new_sys = " ".join(parts[1:])
+            new_sys = " ".join(parts[1:]).strip()
+            # Strip matching surrounding quotes if provided (e.g. /system "You are a poet" or /system "")
+            if (new_sys.startswith('"') and new_sys.endswith('"') and len(new_sys) >= 2) or \
+               (new_sys.startswith("'") and new_sys.endswith("'") and len(new_sys) >= 2):
+                new_sys = new_sys[1:-1].strip()
+            if new_sys.lower() in ("clear", "reset", "none", "off", "empty", '""', "''"):
+                new_sys = ""
             session_state["system_prompt"] = new_sys
-            messages[0] = {"role": "system", "content": new_sys}
-            emit(f"[green]System prompt updated:[/green] {new_sys}", "System Prompt")
+            if new_sys:
+                has_sys = False
+                for m in messages:
+                    if m.get("role") == "system":
+                        m["content"] = new_sys
+                        has_sys = True
+                        break
+                if not has_sys:
+                    messages.insert(0, {"role": "system", "content": new_sys})
+                emit(f"[green]System prompt updated:[/green] {new_sys}", "System Prompt")
+            else:
+                messages[:] = [m for m in messages if m.get("role") != "system"]
+                emit("[green]System prompt cleared.[/green]", "System Prompt")
         else:
-            emit(f"[cyan]Current system prompt:[/cyan] {session_state.get('system_prompt')}", "System Prompt")
+            curr_p = session_state.get("system_prompt", "")
+            emit(f"[cyan]Current system prompt:[/cyan] {curr_p or '(none)'}", "System Prompt")
         return True
 
     elif root_cmd in ("/tokens", "tokens", "/max_tokens", "max_tokens"):
@@ -2560,7 +2615,7 @@ def run_opencode_tui(
     coordinator_url: str = "http://localhost:8000",
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
-    system_prompt: str = "You are a helpful AI assistant running on a distributed GPU cluster.",
+    system_prompt: str = "",
     app_input: Optional[Any] = None,
     app_output: Optional[Any] = None,
     full_screen: Optional[bool] = None,
@@ -2627,6 +2682,7 @@ def run_opencode_tui(
         "last_query": "",
         "speculative": True,
         "p2p": True,
+        "transfer_mode": "auto_pull",
         "system_prompt": system_prompt,
         "model": model,
         "coordinator_url": coordinator_url,
@@ -2656,7 +2712,9 @@ def run_opencode_tui(
     if not is_init_coord and meta.get("model"):
         session_state["model"] = meta.get("model")
 
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
     session_history = InMemoryHistory()
     cancel_event = threading.Event()
     scroll_offset = [0]
@@ -3344,6 +3402,12 @@ def run_opencode_tui(
         spec_text = "Speculative" if session_state.get("speculative", True) else "Disabled"
         frags.append(("#94a3b8", "Acceleration: "))
         frags.append(("bold #22c55e", f"{spec_text}\n"))
+        curr_mode = session_state.get("transfer_mode", "auto_pull")
+        is_wire = (curr_mode == "progressive")
+        mode_tag = "Wire Stream (Opt B)" if is_wire else "Auto-Pull (Opt A)"
+        mode_color = "bold #f59e0b" if is_wire else "bold #22c55e"
+        frags.append(("#94a3b8", "Transfer:     "))
+        frags.append((mode_color, f"{mode_tag} [F3]\n"))
         frags.append(("#27272a", "────────────────────────────────────\n\n"))
 
         # SECTION 3: WORKER NODES & STAGES
@@ -3484,9 +3548,11 @@ def run_opencode_tui(
     def get_startup_shortcuts_formatted():
         is_coord = session_state.get("is_coordinator", True)
         f2_part = '<style color="#ffffff"><b>f2</b></style> <style color="#71717a">models</style>   ' if is_coord else ''
+        f3_part = '<style color="#ffffff"><b>f3</b></style> <style color="#71717a">mode</style>   '
         return to_formatted_text(HTML(
             f'<style color="#ffffff"><b>tab</b></style> <style color="#71717a">nodes</style>   '
             f'{f2_part}'
+            f'{f3_part}'
             f'<style color="#ffffff"><b>ctrl+p</b></style> <style color="#71717a">commands</style>'
         ))
 
@@ -4162,6 +4228,20 @@ def run_opencode_tui(
     @kb.add("f2")
     def on_f2(event):
         toggle_model_menu()
+
+    @kb.add("f3")
+    def on_f3(event):
+        curr = session_state.get("transfer_mode", "auto_pull")
+        new_mode = "progressive" if curr == "auto_pull" else "auto_pull"
+        session_state["transfer_mode"] = new_mode
+        try:
+            from situs.coordinator.app import registry, rebalance_and_assign_layers
+            registry.progressive_mode = (new_mode == "progressive")
+            if registry.get_alive_workers():
+                asyncio.create_task(rebalance_and_assign_layers(progressive=registry.progressive_mode))
+        except Exception:
+            pass
+        event.app.invalidate()
 
     @kb.add("escape", "m")
     def on_alt_m(event):
