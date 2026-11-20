@@ -223,11 +223,12 @@ def test_detect_llama_server_cuda_device():
 
 def test_find_gguf_file():
     """Verify find_gguf_file locates cached GGUF model files."""
+    from situs.inference_backend import _is_valid_gguf_file
     # Test with standard gemma3 tag
     gguf_path = find_gguf_file("gemma3:4b")
     if gguf_path:
         assert os.path.isfile(gguf_path)
-        assert gguf_path.lower().endswith(".gguf")
+        assert gguf_path.lower().endswith(".gguf") or _is_valid_gguf_file(gguf_path)
 
 
 def test_find_free_port():

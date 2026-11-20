@@ -331,14 +331,6 @@ class WorkerDaemon:
                 if live_tot > 0:
                     if HAS_TORCH and torch.cuda.is_available():
                         try:
-                            t_free, t_tot = torch.cuda.mem_get_info(dev_idx)
-                            t_used = max(0, t_tot - t_free)
-                            if t_used > live_used:
-                                live_used = t_used
-                                live_free = max(0, live_tot - live_used)
-                        except Exception:
-                            pass
-                        try:
                             alloc_b = torch.cuda.memory_allocated(dev_idx)
                             if alloc_b > live_used:
                                 live_used = alloc_b
@@ -392,9 +384,8 @@ class WorkerDaemon:
                 if self.native_server is None:
                     from situs.inference_backend import NativeInferenceServer, find_gguf_file
                     gguf_file = find_gguf_file(self.assignment.model_name)
-                    if gguf_file:
-                        self.native_server = NativeInferenceServer()
-                        await asyncio.to_thread(self.native_server.start, self.assignment.model_name, gguf_file)
+                    self.native_server = NativeInferenceServer()
+                    await asyncio.to_thread(self.native_server.start, self.assignment.model_name, gguf_file)
                 elif not self.native_server.is_ready():
                     logger.info(f"Native server inactive; auto-restarting for model '{self.assignment.model_name}'...")
                     await asyncio.to_thread(self.native_server.start, self.assignment.model_name)
@@ -624,33 +615,32 @@ class WorkerDaemon:
                                     if is_single_node:
                                         from situs.inference_backend import NativeInferenceServer, find_gguf_file
                                         gguf_file = find_gguf_file(assign.model_name)
-                                        if gguf_file:
-                                            if self.native_server is None:
-                                                self.native_server = NativeInferenceServer()
-                                            if not self.native_server.is_ready() or self.native_server.model_name != assign.model_name:
-                                                started = await asyncio.to_thread(self.native_server.start, assign.model_name, gguf_file)
-                                                if started:
-                                                    logger.info(
-                                                        f"Worker '{self.worker_id}' single-node accelerated by native server on "
-                                                        f"{self.native_server.base_url} (fused GPU kernels, ~30-40 t/s)."
-                                                    )
-                                                    self.engine = None
-                                                    self.engine_ready_event.set()
-                                                    try:
-                                                        await self.send_heartbeat_once()
-                                                    except Exception:
-                                                        pass
-                                                    continue
-                                                else:
-                                                    logger.warning(
-                                                        f"Could not start native server for '{assign.model_name}'; "
-                                                        f"falling back to PyTorch stage model execution."
-                                                    )
-                                                    try:
-                                                        self.native_server.stop()
-                                                    except Exception:
-                                                        pass
-                                                    self.native_server = None
+                                        if self.native_server is None:
+                                            self.native_server = NativeInferenceServer()
+                                        if not self.native_server.is_ready() or self.native_server.model_name != assign.model_name:
+                                            started = await asyncio.to_thread(self.native_server.start, assign.model_name, gguf_file)
+                                            if started:
+                                                logger.info(
+                                                    f"Worker '{self.worker_id}' single-node accelerated by native server on "
+                                                    f"{self.native_server.base_url} (backend: {self.native_server.backend_type}, ~35-60+ t/s)."
+                                                )
+                                                self.engine = None
+                                                self.engine_ready_event.set()
+                                                try:
+                                                    await self.send_heartbeat_once()
+                                                except Exception:
+                                                    pass
+                                                continue
+                                            else:
+                                                logger.warning(
+                                                    f"Could not start native server for '{assign.model_name}'; "
+                                                    f"falling back to PyTorch stage model execution."
+                                                )
+                                                try:
+                                                    self.native_server.stop()
+                                                except Exception:
+                                                    pass
+                                                self.native_server = None
                                     from situs.coordinator.registry import resolve_model_metadata
                                     from situs.worker.loader import is_architecture_supported, find_local_weight_files
                                     try:

@@ -2224,6 +2224,24 @@ class DistributedStageModel(nn.Module if HAS_TORCH else object):
         """Applies stage_model.norm and stage_model.lm_head to hidden states to produce logits."""
         if not HAS_TORCH:
             raise RuntimeError("PyTorch is required for model inference")
+        if not isinstance(h, torch.Tensor):
+            return h
+
+        # Idempotence guard: if h is already logits (feature dimension matches vocab_size,
+        # and vocab_size != hidden_dim), do not re-apply norm or lm_head!
+        if (
+            hasattr(self, "lm_head")
+            and self.lm_head is not None
+            and getattr(self, "vocab_size", None) is not None
+            and getattr(self, "hidden_dim", None) is not None
+            and self.vocab_size != self.hidden_dim
+            and h.dim() >= 2
+            and h.shape[-1] == self.vocab_size
+        ):
+            if not compute_all_logits and h.shape[1] > 1:
+                return h[:, -1:, :]
+            return h
+
         if not compute_all_logits and h.shape[1] > 1:
             h = h[:, -1:, :]
         if hasattr(self, "norm") and self.norm is not None:
@@ -2677,11 +2695,14 @@ def load_hf_stage_model(
                             except Exception:
                                 free_vram = 0
 
-                        # If free VRAM has at least 1.0 GB headroom above the native BF16 stage requirement, use native BF16!
-                        if free_vram > (est_stage_vram + 1024 * 1024 * 1024):
+                        # If free VRAM has at least 512 MB headroom above the native stage requirement, use native FP16/BF16 Tensor Cores!
+                        if free_vram > (est_stage_vram + 512 * 1024 * 1024):
                             use_int8 = False
+                            use_4bit = False
                             if torch.cuda.is_bf16_supported():
                                 stage.dtype = torch.bfloat16
+                            elif stage.device != "cpu":
+                                stage.dtype = torch.float16
                             logger.info(
                                 f"Dynamic Stage Precision: Assigned {num_assigned} layers ({est_stage_vram / (1024**3):.2f} GB) "
                                 f"fits in free VRAM ({free_vram / (1024**3):.2f} GB). Running in native {stage.dtype} for maximum Tensor Core throughput."

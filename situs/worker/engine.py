@@ -648,14 +648,26 @@ class StageExecutionEngine:
             logits = self.stage_model.compute_logits(hidden_states, compute_all_logits=False)
         else:
             h = hidden_states
-            if h.shape[1] > 1:
-                h = h[:, -1:, :]
-            if hasattr(self.stage_model, "norm") and self.stage_model.norm is not None:
-                h = self.stage_model.norm(h)
-            if hasattr(self.stage_model, "lm_head") and self.stage_model.lm_head is not None:
-                logits = self.stage_model.lm_head(h)
+            # If h is already logits, do not re-project
+            if (
+                getattr(self.stage_model, "vocab_size", None)
+                and getattr(self.stage_model, "hidden_dim", None)
+                and self.stage_model.vocab_size != self.stage_model.hidden_dim
+                and HAS_TORCH
+                and isinstance(h, torch.Tensor)
+                and h.dim() >= 2
+                and h.shape[-1] == self.stage_model.vocab_size
+            ):
+                logits = h[:, -1:, :] if h.shape[1] > 1 else h
             else:
-                logits = h
+                if HAS_TORCH and isinstance(h, torch.Tensor) and h.shape[1] > 1:
+                    h = h[:, -1:, :]
+                if hasattr(self.stage_model, "norm") and self.stage_model.norm is not None:
+                    h = self.stage_model.norm(h)
+                if hasattr(self.stage_model, "lm_head") and self.stage_model.lm_head is not None:
+                    logits = self.stage_model.lm_head(h)
+                else:
+                    logits = h
 
         if HAS_TORCH and isinstance(logits, torch.Tensor):
             if logits.dim() == 3:

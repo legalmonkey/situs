@@ -808,21 +808,21 @@ def find_gguf_file(model_name: str) -> Optional[str]:
     """
     Finds the cached .gguf weight file for model_name:
     1. Direct file path if valid
-    2. Local weight files via find_local_weight_files
+    2. Local weight files via find_local_weight_files (including Ollama sha256 GGUF blobs)
     3. Hugging Face Hub cache directory (~/.cache/huggingface/hub)
     4. Situs cache directory (~/.cache/situs/models)
     """
     if not model_name:
         return None
 
-    if os.path.isfile(model_name) and model_name.lower().endswith(".gguf") and _is_valid_gguf_file(model_name):
+    if os.path.isfile(model_name) and (model_name.lower().endswith(".gguf") or _is_valid_gguf_file(model_name)):
         return str(pathlib.Path(model_name).resolve())
 
     try:
         from situs.worker.loader import find_local_weight_files
         wfiles = find_local_weight_files(model_name)
         for wf in wfiles:
-            if wf.lower().endswith(".gguf") and _is_valid_gguf_file(wf):
+            if _is_valid_gguf_file(wf) or (wf.lower().endswith(".gguf") and os.path.isfile(wf)):
                 return str(pathlib.Path(wf).resolve())
     except Exception:
         pass
@@ -893,18 +893,28 @@ class NativeInferenceServer:
     def start(self, model_name: str, gguf_path: Optional[str] = None) -> bool:
         """
         Starts native server for model_name and gguf_path.
-        Prioritizes native llama-server with fused GPU kernels; falls back to Ollama.
+        Prioritizes GPU-accelerated backend (Ollama with CUDA or native llama-server with GPU).
+        Avoids launching slow CPU-only llama-server when local GPU Ollama is online.
         """
         self.stop()
         self.model_name = model_name
         self.gguf_path = gguf_path or find_gguf_file(model_name)
 
-        # 1. Try native llama-server
         exe = find_native_llama_server()
+        gpu_dev = detect_llama_server_gpu_device(exe) if exe else None
+        self.gpu_device = gpu_dev
+        ollama_avail = is_local_ollama_available()
+
+        # 1. If local Ollama is online and llama-server has NO GPU support, prioritize Ollama (CUDA GPU)
+        if ollama_avail and gpu_dev is None:
+            self.base_url = "http://127.0.0.1:11434"
+            self.backend_type = "ollama"
+            logger.info(f"Local GPU Ollama active on {self.base_url} for '{model_name}'.")
+            return True
+
+        # 2. Try native llama-server (with GPU or fallback if Ollama offline)
         if exe and self.gguf_path and os.path.isfile(self.gguf_path):
             port = find_free_port()
-            gpu_dev = detect_llama_server_gpu_device(exe)
-            self.gpu_device = gpu_dev
             args = [
                 exe,
                 "-m", self.gguf_path,
@@ -960,8 +970,8 @@ class NativeInferenceServer:
                 logger.warning(f"Could not launch native llama-server: {ex}")
                 self.stop()
 
-        # 2. Try local Ollama if available
-        if is_local_ollama_available():
+        # 3. Fall back to local Ollama if available
+        if ollama_avail:
             self.base_url = "http://127.0.0.1:11434"
             self.backend_type = "ollama"
             logger.info(f"Local Ollama online on {self.base_url} for '{model_name}'.")
@@ -1087,8 +1097,14 @@ class NativeInferenceServer:
                 )
 
         elif self.backend_type == "ollama":
+            target_model = getattr(start_msg, "model_name", "gemma3:4b") or "gemma3:4b"
+            ollama_target = target_model
+            for short_tag, repo_id in HF_MODEL_REGISTRY_MAP.items():
+                if target_model.lower() == repo_id.lower() or target_model.lower() == short_tag.lower():
+                    ollama_target = short_tag
+                    break
             payload = {
-                "model": getattr(start_msg, "model_name", "gemma3:4b"),
+                "model": ollama_target,
                 "prompt": prompt_text,
                 "stream": True,
                 "options": {

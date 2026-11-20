@@ -104,7 +104,27 @@ class RelayHub:
                         await self.send_to_worker(w_id, finish_broadcast)
 
         # For tokens/speculative verification, route to worker ONLY if not already delivered via direct P2P
-        if frame.type in (MessageType.NEXT_TOKEN, MessageType.SPECULATIVE_VERIFIED):
+        if frame.type == MessageType.SPECULATIVE_VERIFIED:
+            if frame.target == "coordinator":
+                return
+            upstream_targets = []
+            if self.registry:
+                try:
+                    pipeline = self.registry.get_pipeline_order()
+                    if pipeline:
+                        for w in pipeline:
+                            if w.worker_id == frame.source:
+                                break
+                            upstream_targets.append(w.worker_id)
+                except Exception:
+                    pass
+            if not upstream_targets and frame.target:
+                upstream_targets = [frame.target]
+            for t_worker in upstream_targets:
+                await self.send_to_worker(t_worker, frame)
+            return
+
+        if frame.type == MessageType.NEXT_TOKEN:
             if frame.target == "coordinator":
                 return  # Delivered for HTTP SSE client streaming only; do not reflect back into pipeline ring
             target_worker = frame.target
